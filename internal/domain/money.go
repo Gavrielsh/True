@@ -1,0 +1,102 @@
+// Package domain holds the pure business rules for the seamless wallet
+// engine: Money arithmetic, currency typing, wallet entities, and the bet/
+// win allocation algorithms.
+//
+// This package is I/O-free. No file in it may import database/sql, redis,
+// net/http, log/slog, or any driver. All inputs arrive as values; all
+// outputs are values or errors. The repository layer (STEP 3) is the only
+// place that talks to Postgres or Redis, and it calls into here exclusively
+// inside the `SELECT ... FOR UPDATE` window — which means everything in
+// this file must be allocation-light and predictable.
+package domain
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/shopspring/decimal"
+)
+
+// MoneyScale is the fixed decimal precision used throughout the engine.
+// It matches the DB column type NUMERIC(18,4) exactly so that a Money
+// value can round-trip Postgres without truncation.
+const MoneyScale int32 = 4
+
+// ErrMoneyScaleExceeded is returned when an input decimal carries more than
+// MoneyScale fractional digits. Silently truncating sub-cent fractions would
+// violate the financial-precision invariant, so we reject instead.
+var ErrMoneyScaleExceeded = errors.New("money: scale exceeds 4 decimal places")
+
+// Money is a fixed-precision currency value. The zero value is the additive
+// identity (0.0000) and is safe to use without construction. All arithmetic
+// methods return new Money values; Money is immutable.
+//
+// Money has no nil/invalid state — once constructed it is always a valid
+// decimal at scale 4. Comparisons across currencies are the caller's
+// responsibility; Money carries amount, not unit.
+type Money struct {
+	v decimal.Decimal
+}
+
+// NewMoney constructs a Money from a decimal.Decimal, rejecting any value
+// whose precision is finer than MoneyScale.
+//
+// We deliberately do NOT round. Silent rounding here would be a financial
+// bug — the caller would think they bet 1.00005 SC, but the engine would
+// debit 1.0000 SC and pocket the 0.00005 mismatch into rounding error over
+// millions of spins. Force the caller to choose an explicit policy upstream
+// (typically at the JSON-decode boundary).
+func NewMoney(d decimal.Decimal) (Money, error) {
+	if d.Exponent() < -MoneyScale {
+		return Money{}, fmt.Errorf("%w: got %s", ErrMoneyScaleExceeded, d.String())
+	}
+	// Truncate stamps the canonical exponent (-4) without changing the value,
+	// so that Equal and String are deterministic across construction paths.
+	return Money{v: d.Truncate(MoneyScale)}, nil
+}
+
+// MoneyFromString parses a decimal string ("12.3400") into Money.
+// Convenience wrapper over decimal.NewFromString + NewMoney.
+func MoneyFromString(s string) (Money, error) {
+	d, err := decimal.NewFromString(s)
+	if err != nil {
+		return Money{}, fmt.Errorf("money: parse %q: %w", s, err)
+	}
+	return NewMoney(d)
+}
+
+// MoneyFromInt constructs a Money from a whole-unit integer (e.g. 5 → 5.0000).
+// Used by the repository layer to convert DB INTEGER columns or by tests.
+func MoneyFromInt(n int64) Money {
+	return Money{v: decimal.NewFromInt(n)}
+}
+
+// ZeroMoney is the additive identity. Equivalent to the zero value.
+func ZeroMoney() Money { return Money{} }
+
+// Decimal returns the underlying value at the canonical 4-decimal scale.
+// Used by the repository layer to bind into pgx parameters.
+func (m Money) Decimal() decimal.Decimal { return m.v.Truncate(MoneyScale) }
+
+// String renders the value at fixed 4-decimal precision: "12.3400".
+func (m Money) String() string { return m.v.StringFixed(MoneyScale) }
+
+func (m Money) Add(o Money) Money         { return Money{v: m.v.Add(o.v)} }
+func (m Money) Sub(o Money) Money         { return Money{v: m.v.Sub(o.v)} }
+func (m Money) IsZero() bool              { return m.v.IsZero() }
+func (m Money) IsPositive() bool          { return m.v.Sign() > 0 }
+func (m Money) IsNegative() bool          { return m.v.Sign() < 0 }
+func (m Money) Equal(o Money) bool        { return m.v.Equal(o.v) }
+func (m Money) LessThan(o Money) bool     { return m.v.LessThan(o.v) }
+func (m Money) GreaterThan(o Money) bool  { return m.v.GreaterThan(o.v) }
+func (m Money) GTE(o Money) bool          { return m.v.GreaterThanOrEqual(o.v) }
+func (m Money) LTE(o Money) bool          { return m.v.LessThanOrEqual(o.v) }
+
+// MinMoney returns the smaller of a and b. Used by the SC allocator to
+// clamp the SC_UNPLAYED draw to the available unplayed balance.
+func MinMoney(a, b Money) Money {
+	if a.LessThan(b) {
+		return a
+	}
+	return b
+}
