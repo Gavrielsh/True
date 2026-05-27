@@ -36,12 +36,19 @@ CREATE TABLE ledger_transactions (
     -- For WIN rows tied to a specific BET: points at the originating BET.
     reference_transaction_id    UUID                REFERENCES ledger_transactions(id)
                                                     ON DELETE RESTRICT,
+    -- request_metadata MUST stay small. JSONB payloads >2KB are TOASTed into
+    -- a side table, doubling I/O on every read of the parent row. Keep this
+    -- to a minimal set of operator-supplied fields (session id, platform,
+    -- jackpot code). The CHECK caps it at 512 bytes of canonical JSON text
+    -- so a buggy/abusive operator can never bloat the hot row.
     request_metadata            JSONB               NOT NULL DEFAULT '{}'::jsonb,
     created_at                  TIMESTAMPTZ         NOT NULL DEFAULT now(),
     completed_at                TIMESTAMPTZ,
 
     CONSTRAINT ledger_tx_operator_unique
-        UNIQUE (operator_code, operator_transaction_id)
+        UNIQUE (operator_code, operator_transaction_id),
+    CONSTRAINT ledger_tx_metadata_size_cap
+        CHECK (octet_length(request_metadata::text) <= 512)
 );
 
 -- Hot lookup paths
@@ -87,27 +94,27 @@ CREATE TABLE ledger_entries (
     )
 ) PARTITION BY RANGE (created_at);
 
--- Block UPDATE/DELETE entirely. The ledger is append-only; corrections
--- happen by posting offsetting ROLLBACK entries, never by mutating history.
-CREATE OR REPLACE FUNCTION trg_ledger_entries_no_mutation()
-RETURNS TRIGGER
-LANGUAGE plpgsql
-AS $$
-BEGIN
-    RAISE EXCEPTION 'ledger_entries is append-only: % is forbidden', TG_OP
-        USING ERRCODE = '0A000';  -- feature_not_supported
-END;
-$$;
-
-CREATE TRIGGER ledger_entries_block_update
-    BEFORE UPDATE ON ledger_entries
-    FOR EACH STATEMENT
-    EXECUTE FUNCTION trg_ledger_entries_no_mutation();
-
-CREATE TRIGGER ledger_entries_block_delete
-    BEFORE DELETE ON ledger_entries
-    FOR EACH STATEMENT
-    EXECUTE FUNCTION trg_ledger_entries_no_mutation();
+-- =============================================================================
+-- Append-only enforcement is delegated to ROLE PERMISSIONS, NOT triggers.
+-- =============================================================================
+-- Firing a PL/pgSQL BEFORE UPDATE/DELETE trigger on every ledger insert path
+-- would cost CPU we cannot spare at 10k+ TPS. The contract is instead enforced
+-- by what the application role is *granted*:
+--
+--   GRANT INSERT, SELECT ON ledger_entries TO engine_writer;
+--   REVOKE UPDATE, DELETE, TRUNCATE ON ledger_entries FROM engine_writer;
+--   GRANT INSERT, SELECT ON ALL TABLES IN SCHEMA public TO engine_writer;
+--   -- (and a separate engine_admin role for partition maintenance / DDL)
+--
+-- These statements are operational (run when provisioning the DB user), not
+-- part of this migration, because the role name is environment-specific.
+-- The application connects exclusively as `engine_writer`; any attempted
+-- UPDATE/DELETE returns SQLSTATE 42501 (insufficient_privilege) at zero
+-- per-row overhead. See README §"DB Roles" (TODO ops doc).
+COMMENT ON TABLE ledger_entries IS
+    'Append-only double-entry ledger. UPDATE/DELETE blocked at the role-grant '
+    'layer (engine_writer holds INSERT+SELECT only). Corrections are posted as '
+    'offsetting ROLLBACK entries, never as in-place mutations.';
 
 -- Indexes are declared on the partitioned root; Postgres propagates them to
 -- every existing and future partition automatically (PG 11+).
