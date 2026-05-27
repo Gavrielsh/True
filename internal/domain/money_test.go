@@ -248,6 +248,63 @@ func TestMinMoney(t *testing.T) {
 
 // --------------------------- Decimal round-trip -----------------------------
 
+// --------------------------- JSON round-trip --------------------------------
+
+func TestMoneyJSON(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		money   string
+		jsonOut string
+	}{
+		{"zero",            "0.0000", `"0.0000"`},
+		{"positive",        "1.2345", `"1.2345"`},
+		{"negative",        "-5.0000", `"-5.0000"`},
+		{"trailing_zeros",  "100.1000", `"100.1000"`},
+		{"max_18_4",        "99999999999999.9999", `"99999999999999.9999"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m, err := MoneyFromString(tt.money)
+			if err != nil { t.Fatalf("parse: %v", err) }
+			got, err := m.MarshalJSON()
+			if err != nil { t.Fatalf("marshal: %v", err) }
+			if string(got) != tt.jsonOut {
+				t.Errorf("MarshalJSON: got %s, want %s", got, tt.jsonOut)
+			}
+
+			var back Money
+			if err := back.UnmarshalJSON(got); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if !back.Equal(m) {
+				t.Errorf("round-trip: got %s, want %s", back, m)
+			}
+		})
+	}
+}
+
+func TestMoneyUnmarshalJSON_Rejects(t *testing.T) {
+	t.Parallel()
+	cases := []string{
+		`123`,            // not a string
+		`"abc"`,          // not a number
+		``,               // empty
+		`"1.00001"`,      // too much precision
+		`"`,              // unbalanced quote
+	}
+	for _, c := range cases {
+		t.Run(c, func(t *testing.T) {
+			t.Parallel()
+			var m Money
+			if err := m.UnmarshalJSON([]byte(c)); err == nil {
+				t.Errorf("expected error for %q", c)
+			}
+		})
+	}
+}
+
 func TestMoneyDecimalRoundTrip(t *testing.T) {
 	t.Parallel()
 	cases := []string{"0.0000", "1.2345", "100.0000", "-50.0001", "99999999999999.9999"}

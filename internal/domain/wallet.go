@@ -29,6 +29,22 @@ func (w Wallet) SCTotal() Money {
 	return w.SCUnplayed.Add(w.SCRedeemable)
 }
 
+// BalanceFor returns the wallet column matching the given currency. Used by
+// the repository to fill `balance_after` on per-currency ledger entries.
+// Returns ZeroMoney for unrecognised currencies (callers should validate
+// upstream via Currency.Valid()).
+func (w Wallet) BalanceFor(c Currency) Money {
+	switch c {
+	case CurrencyGC:
+		return w.GC
+	case CurrencySCUnplayed:
+		return w.SCUnplayed
+	case CurrencySCRedeemable:
+		return w.SCRedeemable
+	}
+	return ZeroMoney()
+}
+
 // ----------------------------------------------------------------------------
 // Bet allocation
 // ----------------------------------------------------------------------------
