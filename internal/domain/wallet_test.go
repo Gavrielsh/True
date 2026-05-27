@@ -410,6 +410,33 @@ func TestApplyWin(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
+// BalanceFor
+// ----------------------------------------------------------------------------
+
+func TestBalanceFor(t *testing.T) {
+	t.Parallel()
+	w := mkWallet(t, "100.0000", "30.0000", "5.0000")
+	tests := []struct {
+		c    Currency
+		want string
+	}{
+		{CurrencyGC,           "100.0000"},
+		{CurrencySCUnplayed,   "30.0000"},
+		{CurrencySCRedeemable, "5.0000"},
+		{Currency("USD"),      "0.0000"}, // unknown currency falls through to zero
+		{Currency(""),         "0.0000"},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.c), func(t *testing.T) {
+			t.Parallel()
+			if got := w.BalanceFor(tt.c).String(); got != tt.want {
+				t.Errorf("BalanceFor(%s) = %s, want %s", tt.c, got, tt.want)
+			}
+		})
+	}
+}
+
+// ----------------------------------------------------------------------------
 // Helper
 // ----------------------------------------------------------------------------
 

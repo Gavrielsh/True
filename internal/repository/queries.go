@@ -1,0 +1,82 @@
+package repository
+
+// All SQL is raw and parameterised. No string interpolation of user input.
+// Statements deliberately use $N positional args so pgx can prepare-and-cache
+// them; renaming a placeholder forces a re-prepare and a connection-pool
+// stall under high load.
+
+const (
+	// SELECT ... FOR UPDATE: blocks any concurrent spin for this player.
+	// Held until COMMIT/ROLLBACK. Returns ErrNoRows if the wallet does not
+	// exist (player unknown / not yet provisioned).
+	sqlSelectWalletForUpdate = `
+		SELECT gc_balance, sc_unplayed_balance, sc_redeemable_balance
+		FROM wallets
+		WHERE player_id = $1
+		FOR UPDATE
+	`
+
+	// Non-locking snapshot read for /session.
+	sqlSelectWalletBalances = `
+		SELECT gc_balance, sc_unplayed_balance, sc_redeemable_balance
+		FROM wallets
+		WHERE player_id = $1
+	`
+
+	// UPDATE wallets: precise per-column assignment of the post-state values
+	// the domain layer just computed. updated_at is bumped by the trigger.
+	sqlUpdateWallet = `
+		UPDATE wallets
+		SET gc_balance            = $1,
+		    sc_unplayed_balance   = $2,
+		    sc_redeemable_balance = $3
+		WHERE player_id = $4
+	`
+
+	// INSERT into ledger_transactions: this is the idempotency anchor.
+	// The (operator_code, operator_transaction_id) UNIQUE constraint raises
+	// SQLSTATE 23505 on duplicate webhook delivery; the engine intercepts
+	// that error code for Ghost-Spin recovery.
+	//
+	// status is COMMITTED inline — for /bet and /win the entire flow is
+	// atomic, so the row only materialises if the surrounding tx commits.
+	sqlInsertLedgerTx = `
+		INSERT INTO ledger_transactions (
+			operator_code,
+			operator_transaction_id,
+			player_id,
+			transaction_type,
+			status,
+			game_id,
+			round_id,
+			reference_transaction_id,
+			request_metadata,
+			completed_at
+		)
+		VALUES ($1, $2, $3, $4, 'COMPLETED', $5, $6, $7, $8, now())
+		RETURNING id
+	`
+
+	// INSERT into ledger_entries: one row per debit or credit line.
+	// balance_after is NULL for HOUSE_* rows (per CHECK constraint).
+	sqlInsertLedgerEntry = `
+		INSERT INTO ledger_entries (
+			ledger_transaction_id,
+			player_id,
+			account_type,
+			currency,
+			direction,
+			amount,
+			balance_after
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+	`
+
+	// Lookup used by Ghost-Spin recovery to fetch the committed counterpart.
+	sqlSelectLedgerTxByOperator = `
+		SELECT id, player_id, transaction_type
+		FROM ledger_transactions
+		WHERE operator_code = $1
+		  AND operator_transaction_id = $2
+	`
+)

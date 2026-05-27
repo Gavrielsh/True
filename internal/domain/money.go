@@ -100,3 +100,28 @@ func MinMoney(a, b Money) Money {
 	}
 	return b
 }
+
+// MarshalJSON renders Money as a JSON string ("12.3400") so the precision
+// survives a round-trip through any JSON parser (JS numbers lose precision
+// above 15 significant digits). Used by the repository's response cache.
+func (m Money) MarshalJSON() ([]byte, error) {
+	s := m.String()
+	out := make([]byte, 0, len(s)+2)
+	out = append(out, '"')
+	out = append(out, s...)
+	out = append(out, '"')
+	return out, nil
+}
+
+// UnmarshalJSON parses the string form ("12.3400") back into Money.
+func (m *Money) UnmarshalJSON(data []byte) error {
+	if len(data) < 2 || data[0] != '"' || data[len(data)-1] != '"' {
+		return fmt.Errorf("money: expected JSON string, got %s", data)
+	}
+	parsed, err := MoneyFromString(string(data[1 : len(data)-1]))
+	if err != nil {
+		return err
+	}
+	*m = parsed
+	return nil
+}
