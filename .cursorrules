@@ -1,0 +1,55 @@
+# High-Frequency Sweepstakes Casino Transaction Engine - System Rules
+
+You are an expert Go developer specializing in high-frequency financial systems and sweepstakes casino backends. You must strictly adhere to these rules. No exceptions.
+
+## 1. Financial Precision & Types
+- **NO FLOATING POINT MATH:** Never use `float32` or `float64` for currency.
+- **GO TYPE:** Use `github.com/shopspring/decimal` for all calculations.
+- **DB TYPE:** Use `NUMERIC(18,4)` in PostgreSQL.
+- **PRECISION:** Maintain exactly 4 decimal places.
+
+## 2. Database & Concurrency
+- **ZERO-TRUST LEDGER:** Every wallet update MUST be accompanied by a Double-Entry Ledger record (Debit/Credit).
+- **PESSIMISTIC LOCKING:** Always use `SELECT ... FOR UPDATE` on the `wallets` table before any mutation.
+- **ISOLATION LEVEL:** Use `READ COMMITTED` for transactions.
+- **PARTITIONING:** All ledger tables must be partitioned by date.
+
+## 3. Idempotency & Fail-Safes
+- **REDIS FIRST:** Check and set idempotency in Redis BEFORE touching the database.
+- **FLOW:** 
+  1. Set "PROCESSING" in Redis (NX EX 10).
+  2. DB Transaction (Lock -> Mutate -> Ledger -> Commit).
+  3. Update Redis with final JSON (XX EX 86400).
+- **FAIL CLOSED:** If Redis or DB is unreachable, reject the transaction immediately.
+- **GHOST SPIN HANDLING:** Catch Postgres error `23505` (unique_violation) on `operator_transaction_id`. If it occurs, reconstruct the success response from the current state.
+
+## 4. Security & Webhooks
+- **RAW BODY HASHING:** Always verify HMAC-SHA256 signatures using the RAW request body. NEVER unmarshal to JSON before hashing.
+- **CONSTANT TIME:** Use `subtle.ConstantTimeCompare` for signature verification.
+- **REPLAY PROTECTION:** Validate `X-Timestamp` (max 5 mins old) and `X-Nonce` (check Redis).
+
+## 5. Sweepstakes Logic
+- **TOKEN SEGREGATION:** Native DB-level separation of GC, SC_UNPLAYED, and SC_REDEEMABLE.
+- **BETTING PRIORITY:** Consume `SC_UNPLAYED` first, then `SC_REDEEMABLE`.
+- **WINNINGS:** All SC winnings go to `SC_REDEEMABLE`.
+
+## 6. Code Structure
+- Follow Clean Architecture as defined in `ARCHITECTURE.md`.
+- Use `pgx/v5` for PostgreSQL and `gin-gonic/gin` for routing.
+
+## 7. Go Best Practices & Anti-Patterns
+- **NO ORMs:** Do NOT use GORM or any other ORM. You must write raw SQL queries using `pgx/v5`.
+- **CONTEXT PROPAGATION:** Every function interacting with the DB, Redis, or external APIs MUST accept and pass down a `context.Context`. NEVER use `context.Background()` inside operational functions.
+- **ERROR HANDLING:** Never use `panic()`. Always return explicit errors. Use `fmt.Errorf("...: %w", err)` for wrapping errors to preserve the stack context.
+- **NO GLOBAL STATE:** Do not use global variables for database pools or Redis clients. Use dependency injection.
+
+## 8. Testing Standards
+- **TABLE-DRIVEN TESTS:** All unit tests for domain logic and decimal calculations must strictly follow the Go Table-Driven Test pattern.
+- **EDGE CASE FOCUS:** When generating tests, always include edge cases like zero amounts, negative amount rejections, and exact boundary float precision checks.
+
+## 9. Observability, Logging & Tracing
+- **STRUCTURED LOGGING ONLY:** Standard `log` package or `fmt.Print` are strictly forbidden. Use Go's `log/slog` (or `rs/zerolog`) for high-performance, JSON-structured logging.
+- **CONTEXTUAL LOGS:** Every log entry MUST dynamically pull and include `operator_transaction_id`, `player_id`, and `trace_id` from the `context.Context`. Do not log isolated, contextless messages.
+- **DISTRIBUTED TRACING:** Instrument all critical paths (HTTP Handlers -> Redis Idempotency -> Postgres DB -> Response) with OpenTelemetry (OTel) spans.
+- **DATA PRIVACY (PII):** NEVER log sensitive data, raw authorization tokens, `X-Signature` headers, or raw payloads containing PII.
+- **PERFORMANCE AWARENESS:** Do not log `INFO` or `DEBUG` level messages inside the high-frequency hot path (e.g., the core `/bet` processing loop). Only log `WARN` and `ERROR` to prevent disk I/O bottlenecks in production.
