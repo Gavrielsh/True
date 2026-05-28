@@ -22,6 +22,7 @@ var (
 	ErrTransactionConflict = stderrors.New("transaction id conflict")
 	ErrRollbackNotFound    = stderrors.New("rollback target not found")
 	ErrRollbackAlready     = stderrors.New("transaction already rolled back")
+	ErrRollbackUnsupported = stderrors.New("rollback not supported for this transaction type")
 )
 
 // Code is the stable identifier surfaced to operators (e.g. in webhook
@@ -40,6 +41,7 @@ const (
 	CodeTransactionConflict Code = "TRANSACTION_CONFLICT"
 	CodeRollbackNotFound    Code = "ROLLBACK_NOT_FOUND"
 	CodeRollbackAlready     Code = "ROLLBACK_ALREADY"
+	CodeRollbackUnsupported Code = "ROLLBACK_UNSUPPORTED"
 	CodeInternal            Code = "INTERNAL_ERROR"
 )
 
@@ -67,6 +69,8 @@ func CodeFor(err error) Code {
 		return CodeRollbackNotFound
 	case stderrors.Is(err, ErrRollbackAlready):
 		return CodeRollbackAlready
+	case stderrors.Is(err, ErrRollbackUnsupported):
+		return CodeRollbackUnsupported
 	default:
 		return CodeInternal
 	}

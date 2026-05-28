@@ -23,9 +23,9 @@ func (c Currency) Valid() bool {
 // CurrencyFamily is the high-level wagering bucket the operator addresses
 // at the API surface (GC or SC). Routing within a family is engine-enforced:
 //
-//   * Bet, SC family: consume SC_UNPLAYED first, overflow into SC_REDEEMABLE.
-//   * Win, SC family: credit SC_REDEEMABLE exclusively (US sweepstakes rule).
-//   * GC family: identity routing (single bucket).
+//   - Bet, SC family: consume SC_UNPLAYED first, overflow into SC_REDEEMABLE.
+//   - Win, SC family: credit SC_REDEEMABLE exclusively (US sweepstakes rule).
+//   - GC family: identity routing (single bucket).
 //
 // Keeping families distinct from raw currencies prevents the API from
 // accidentally exposing the sub-bucket split — operators must not be able

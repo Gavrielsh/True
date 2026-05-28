@@ -296,6 +296,219 @@ func (e *engine) processWinTx(ctx context.Context, req WinRequest) (TxResult, er
 }
 
 // ----------------------------------------------------------------------------
+// ProcessRollback — reverses a previously-committed BET.
+// ----------------------------------------------------------------------------
+
+func (e *engine) ProcessRollback(ctx context.Context, req RollbackRequest) (TxResult, error) {
+	if err := req.validate(); err != nil {
+		return TxResult{}, err
+	}
+	idemKey := idempotencyKey(req.OperatorCode, req.OperatorTransactionID)
+
+	status, payload, err := e.idem.Acquire(ctx, idemKey)
+	if err != nil {
+		return TxResult{}, fmt.Errorf("idempotency acquire: %w", err)
+	}
+	switch status {
+	case cache.StatusPending:
+		return TxResult{}, fmt.Errorf("%w: %s in flight", errs.ErrTransactionPending, idemKey)
+	case cache.StatusCached:
+		return decodeCached(payload, StatusCached)
+	}
+
+	result, err := e.processRollbackTx(ctx, req)
+	if err != nil {
+		e.releaseQuietly(ctx, idemKey)
+		return TxResult{}, err
+	}
+
+	e.cacheResultQuietly(ctx, idemKey, result)
+	return result, nil
+}
+
+func (e *engine) processRollbackTx(ctx context.Context, req RollbackRequest) (TxResult, error) {
+	tx, err := e.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return TxResult{}, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// 1. Lock the wallet FIRST (consistent lock order with bet/win — avoids
+	//    deadlocks if a /bet for the same player arrives concurrently).
+	wallet, err := selectWalletForUpdate(ctx, tx, req.PlayerID)
+	if err != nil {
+		return TxResult{}, err
+	}
+
+	// 2. Lock the original tx row. The FOR UPDATE here serializes two
+	//    concurrent rollbacks of the same reference, so only one wins.
+	var (
+		origPlayerID uuid.UUID
+		origType     string
+		origStatus   string
+	)
+	err = tx.QueryRow(ctx, sqlSelectLedgerTxByIDForUpdate, req.ReferenceTransactionID).
+		Scan(&origPlayerID, &origType, &origStatus)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return TxResult{}, errs.ErrRollbackNotFound
+	}
+	if err != nil {
+		return TxResult{}, fmt.Errorf("lookup original: %w", err)
+	}
+	if origPlayerID != req.PlayerID {
+		return TxResult{}, fmt.Errorf("%w: rollback player_id %s != original %s",
+			errs.ErrTransactionConflict, req.PlayerID, origPlayerID)
+	}
+	if origStatus == "ROLLED_BACK" {
+		return TxResult{}, errs.ErrRollbackAlready
+	}
+	if origStatus != "COMPLETED" {
+		return TxResult{}, fmt.Errorf("%w: original status=%s, expected COMPLETED",
+			errs.ErrTransactionConflict, origStatus)
+	}
+	if origType != "BET" {
+		return TxResult{}, fmt.Errorf("%w: original type=%s, only BET supported",
+			errs.ErrRollbackUnsupported, origType)
+	}
+
+	// 3. Fetch the original BET's player-wallet entries (1-2 rows, ordered by currency).
+	entries, err := fetchPlayerEntries(ctx, tx, req.ReferenceTransactionID)
+	if err != nil {
+		return TxResult{}, err
+	}
+	if len(entries) == 0 {
+		// Shouldn't happen — a COMPLETED BET always wrote PLAYER_WALLET rows.
+		return TxResult{}, fmt.Errorf("%w: original tx has no PLAYER_WALLET entries",
+			errs.ErrTransactionConflict)
+	}
+
+	// 4. Reverse the wallet balances. Each original DEBIT becomes a re-credit.
+	post := wallet
+	for _, ent := range entries {
+		if ent.Direction != "DEBIT" {
+			return TxResult{}, fmt.Errorf("%w: unexpected %s entry in BET",
+				errs.ErrTransactionConflict, ent.Direction)
+		}
+		switch ent.Currency {
+		case domain.CurrencyGC:
+			post.GC = post.GC.Add(ent.Amount)
+		case domain.CurrencySCUnplayed:
+			post.SCUnplayed = post.SCUnplayed.Add(ent.Amount)
+		case domain.CurrencySCRedeemable:
+			post.SCRedeemable = post.SCRedeemable.Add(ent.Amount)
+		default:
+			return TxResult{}, fmt.Errorf("%w: unknown currency %s",
+				errs.ErrUnsupportedCurrency, ent.Currency)
+		}
+	}
+
+	// 5. UPDATE wallets to the restored balances.
+	if err := updateWalletBalances(ctx, tx, req.PlayerID, post); err != nil {
+		return TxResult{}, err
+	}
+
+	// 6. Flip the original tx's status. RowsAffected==0 would mean a concurrent
+	//    rollback raced us, but the FOR UPDATE earlier prevented that — treat
+	//    zero as a bug, not a race.
+	tag, err := tx.Exec(ctx, sqlMarkTxRolledBack, req.ReferenceTransactionID)
+	if err != nil {
+		return TxResult{}, fmt.Errorf("mark original rolled-back: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return TxResult{}, fmt.Errorf("%w: mark rolled-back affected %d rows",
+			errs.ErrTransactionConflict, tag.RowsAffected())
+	}
+
+	// 7. INSERT the ROLLBACK ledger_transactions header.
+	ledgerTxID, err := insertLedgerTx(ctx, tx, ledgerTxParams{
+		OperatorCode:          req.OperatorCode,
+		OperatorTransactionID: req.OperatorTransactionID,
+		PlayerID:              req.PlayerID,
+		Type:                  "ROLLBACK",
+		Reference:             req.ReferenceTransactionID,
+		Metadata:              req.Metadata,
+	})
+	if err != nil {
+		if isUniqueViolation(err) {
+			_ = tx.Rollback(ctx)
+			return e.recoverGhostSpin(ctx, req.OperatorCode, req.OperatorTransactionID,
+				req.PlayerID, "ROLLBACK", domain.FamilyUnknown, domain.ZeroMoney())
+		}
+		return TxResult{}, fmt.Errorf("insert rollback tx: %w", err)
+	}
+
+	// 8. INSERT reverse ledger_entries — one CREDIT per original DEBIT.
+	for _, ent := range entries {
+		balanceAfter := post.BalanceFor(ent.Currency)
+		if err := insertPlayerWalletEntry(ctx, tx, ledgerTxID, req.PlayerID,
+			ent.Currency, "CREDIT", ent.Amount, balanceAfter); err != nil {
+			return TxResult{}, err
+		}
+		if err := insertHouseEntry(ctx, tx, ledgerTxID, "HOUSE_BET_POOL",
+			ent.Currency, "DEBIT", ent.Amount); err != nil {
+			return TxResult{}, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return TxResult{}, fmt.Errorf("commit: %w", err)
+	}
+
+	// Compute total reversed amount for the response.
+	total := domain.ZeroMoney()
+	for _, e := range entries {
+		total = total.Add(e.Amount)
+	}
+
+	return TxResult{
+		OperatorCode:          req.OperatorCode,
+		OperatorTransactionID: req.OperatorTransactionID,
+		LedgerTransactionID:   ledgerTxID,
+		PlayerID:              req.PlayerID,
+		TransactionType:       "ROLLBACK",
+		Family:                "", // multi-currency aggregate; left empty
+		Amount:                total,
+		PostBalances:          balanceSummaryOf(post),
+		Status:                StatusProcessed,
+	}, nil
+}
+
+type playerEntry struct {
+	Currency  domain.Currency
+	Direction string
+	Amount    domain.Money
+}
+
+func fetchPlayerEntries(ctx context.Context, tx pgx.Tx, refTxID uuid.UUID) ([]playerEntry, error) {
+	rows, err := tx.Query(ctx, sqlSelectPlayerEntriesByTx, refTxID)
+	if err != nil {
+		return nil, fmt.Errorf("fetch entries: %w", err)
+	}
+	defer rows.Close()
+
+	var out []playerEntry
+	for rows.Next() {
+		var (
+			cur     domain.Currency
+			dir     string
+			amountD decimal.Decimal
+		)
+		if err := rows.Scan(&cur, &dir, &amountD); err != nil {
+			return nil, fmt.Errorf("scan entry: %w", err)
+		}
+		amount, err := domain.NewMoney(amountD)
+		if err != nil {
+			return nil, fmt.Errorf("scan amount: %w", err)
+		}
+		out = append(out, playerEntry{Currency: cur, Direction: dir, Amount: amount})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("entry rows: %w", err)
+	}
+	return out, nil
+}
+
+// ----------------------------------------------------------------------------
 // Ghost-Spin recovery (architecture §6.A).
 //
 // Reached when INSERT into ledger_transactions returns 23505 (unique_violation)
@@ -314,9 +527,9 @@ func (e *engine) recoverGhostSpin(
 	amount domain.Money,
 ) (TxResult, error) {
 	var (
-		ledgerTxID    uuid.UUID
-		storedPlayer  uuid.UUID
-		storedTxType  string
+		ledgerTxID   uuid.UUID
+		storedPlayer uuid.UUID
+		storedTxType string
 	)
 	err := e.db.QueryRow(ctx, sqlSelectLedgerTxByOperator, operatorCode, opTxID).
 		Scan(&ledgerTxID, &storedPlayer, &storedTxType)
@@ -593,6 +806,22 @@ func (r BetRequest) validate() error {
 	}
 	if !r.Amount.IsPositive() {
 		return fmt.Errorf("%w: bet amount must be > 0", errs.ErrInvalidAmount)
+	}
+	return nil
+}
+
+func (r RollbackRequest) validate() error {
+	if r.OperatorCode == "" {
+		return fmt.Errorf("%w: empty operator_code", errs.ErrInvalidAmount)
+	}
+	if r.OperatorTransactionID == "" {
+		return fmt.Errorf("%w: empty operator_transaction_id", errs.ErrInvalidAmount)
+	}
+	if r.PlayerID == uuid.Nil {
+		return fmt.Errorf("%w: nil player_id", errs.ErrPlayerNotFound)
+	}
+	if r.ReferenceTransactionID == uuid.Nil {
+		return fmt.Errorf("%w: nil reference_transaction_id", errs.ErrRollbackNotFound)
 	}
 	return nil
 }

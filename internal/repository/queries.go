@@ -79,4 +79,35 @@ const (
 		WHERE operator_code = $1
 		  AND operator_transaction_id = $2
 	`
+
+	// Rollback: locks the original ledger_transactions row so two concurrent
+	// rollback requests for the same reference serialize.
+	sqlSelectLedgerTxByIDForUpdate = `
+		SELECT player_id, transaction_type, status
+		FROM ledger_transactions
+		WHERE id = $1
+		FOR UPDATE
+	`
+
+	// Rollback: fetch the original tx's PLAYER_WALLET entries so we know
+	// which currencies and amounts to reverse. Order is deterministic for
+	// stable test assertions.
+	sqlSelectPlayerEntriesByTx = `
+		SELECT currency, direction, amount
+		FROM ledger_entries
+		WHERE ledger_transaction_id = $1
+		  AND account_type = 'PLAYER_WALLET'
+		ORDER BY currency
+	`
+
+	// Rollback: flip the original tx's status. The status_was_completed CHECK
+	// in the WHERE clause makes the UPDATE a no-op (RowsAffected==0) on
+	// concurrent retries — caller then knows the rollback already landed.
+	sqlMarkTxRolledBack = `
+		UPDATE ledger_transactions
+		SET status = 'ROLLED_BACK',
+		    completed_at = now()
+		WHERE id = $1
+		  AND status = 'COMPLETED'
+	`
 )

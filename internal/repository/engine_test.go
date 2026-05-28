@@ -149,12 +149,12 @@ func newEngine(t *testing.T) (*engine, pgxmock.PgxPoolIface, *fakeIdem) {
 
 // Regex shortcuts for the long SQL constants.
 var (
-	rxSelectForUpdate     = regexp.QuoteMeta("FOR UPDATE")
-	rxSelectBalances      = `SELECT gc_balance.*FROM wallets`
-	rxUpdateWallet        = `UPDATE wallets`
-	rxInsertLedgerTx      = `INSERT INTO ledger_transactions`
-	rxInsertLedgerEntry   = `INSERT INTO ledger_entries`
-	rxSelectLedgerByOp    = `SELECT id, player_id, transaction_type.*FROM ledger_transactions`
+	rxSelectForUpdate   = regexp.QuoteMeta("FOR UPDATE")
+	rxSelectBalances    = `SELECT gc_balance.*FROM wallets`
+	rxUpdateWallet      = `UPDATE wallets`
+	rxInsertLedgerTx    = `INSERT INTO ledger_transactions`
+	rxInsertLedgerEntry = `INSERT INTO ledger_entries`
+	rxSelectLedgerByOp  = `SELECT id, player_id, transaction_type.*FROM ledger_transactions`
 )
 
 func walletRows(gc, scU, scR string) *pgxmock.Rows {
@@ -696,7 +696,9 @@ func TestGetBalances_NilPlayer(t *testing.T) {
 func TestNew_NilLoggerFallsBackToDefault(t *testing.T) {
 	t.Parallel()
 	mock, err := pgxmock.NewPool()
-	if err != nil { t.Fatalf("pgxmock: %v", err) }
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
 	defer mock.Close()
 	idem := newFakeIdem()
 	got := New(mock, idem, nil)
@@ -771,7 +773,9 @@ func TestProcessWin_CachedReplay(t *testing.T) {
 		OperatorCode: operatorCode, OperatorTransactionID: "op-win-replay",
 		PlayerID: playerID, Family: domain.FamilySC, Amount: mustMoney(t, "3.0000"),
 	})
-	if err != nil { t.Fatalf("ProcessWin: %v", err) }
+	if err != nil {
+		t.Fatalf("ProcessWin: %v", err)
+	}
 	if got.Status != StatusCached {
 		t.Errorf("Status: got %v want %v", got.Status, StatusCached)
 	}
@@ -834,7 +838,9 @@ func TestProcessWin_GhostSpinRecovery(t *testing.T) {
 		PlayerID: playerID, Family: domain.FamilySC, Amount: mustMoney(t, "5.0000"),
 		ReferenceTransactionID: referenceID,
 	})
-	if err != nil { t.Fatalf("ProcessWin: %v", err) }
+	if err != nil {
+		t.Fatalf("ProcessWin: %v", err)
+	}
 	if got.Status != StatusGhostRecovered {
 		t.Errorf("Status: got %v want %v", got.Status, StatusGhostRecovered)
 	}
@@ -859,7 +865,9 @@ func TestProcessBet_BeginFails_ReleasesIdempotency(t *testing.T) {
 		OperatorCode: operatorCode, OperatorTransactionID: "op-bf",
 		PlayerID: uuid.New(), Family: domain.FamilyGC, Amount: mustMoney(t, "1.0000"),
 	})
-	if err == nil { t.Fatal("expected error on BEGIN failure") }
+	if err == nil {
+		t.Fatal("expected error on BEGIN failure")
+	}
 	if cnt := idem.released[idempotencyKey(operatorCode, "op-bf")]; cnt != 1 {
 		t.Errorf("Release count: got %d want 1", cnt)
 	}
@@ -891,7 +899,9 @@ func TestProcessBet_CommitFails(t *testing.T) {
 		OperatorCode: operatorCode, OperatorTransactionID: "op-cf",
 		PlayerID: playerID, Family: domain.FamilyGC, Amount: mustMoney(t, "10.0000"),
 	})
-	if err == nil { t.Fatal("expected error on COMMIT failure") }
+	if err == nil {
+		t.Fatal("expected error on COMMIT failure")
+	}
 	if cnt := idem.released[idempotencyKey(operatorCode, "op-cf")]; cnt != 1 {
 		t.Errorf("Release count: got %d want 1", cnt)
 	}
@@ -917,7 +927,9 @@ func TestProcessBet_UpdateZeroRowsAffected_FailsClosed(t *testing.T) {
 		OperatorCode: operatorCode, OperatorTransactionID: "op-zr",
 		PlayerID: playerID, Family: domain.FamilyGC, Amount: mustMoney(t, "10.0000"),
 	})
-	if err == nil { t.Fatal("expected error when UPDATE affected 0 rows") }
+	if err == nil {
+		t.Fatal("expected error when UPDATE affected 0 rows")
+	}
 }
 
 func TestProcessBet_GhostSpin_LedgerLookupMisses(t *testing.T) {
@@ -951,5 +963,196 @@ func TestProcessBet_GhostSpin_LedgerLookupMisses(t *testing.T) {
 func TestDecodeCached_BadPayload(t *testing.T) {
 	t.Parallel()
 	_, err := decodeCached("not-json", StatusCached)
-	if err == nil { t.Fatal("expected error decoding bad JSON") }
+	if err == nil {
+		t.Fatal("expected error decoding bad JSON")
+	}
+}
+
+// ----------------------------------------------------------------------------
+// ProcessRollback
+// ----------------------------------------------------------------------------
+
+func TestProcessRollback_HappyPath_RestoresFunds(t *testing.T) {
+	t.Parallel()
+	e, mock, _ := newEngine(t)
+	playerID := uuid.New()
+	originalTxID := uuid.New()
+	rollbackTxID := uuid.New()
+
+	mock.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	// Wallet currently shows post-bet balance (0/0/70 after a 30 SC bet).
+	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
+		WillReturnRows(walletRows("0.0000", "0.0000", "70.0000"))
+	// Lock original tx — found, COMPLETED BET.
+	mock.ExpectQuery(`SELECT player_id, transaction_type, status.*FOR UPDATE`).
+		WithArgs(originalTxID).
+		WillReturnRows(pgxmock.NewRows([]string{"player_id", "transaction_type", "status"}).
+			AddRow(playerID, "BET", "COMPLETED"))
+	// Fetch original player-wallet entries — single SC_REDEEMABLE debit of 30.
+	mock.ExpectQuery(`SELECT currency, direction, amount.*FROM ledger_entries`).
+		WithArgs(originalTxID).
+		WillReturnRows(pgxmock.NewRows([]string{"currency", "direction", "amount"}).
+			AddRow("SC_REDEEMABLE", "DEBIT", decimal.RequireFromString("30.0000")))
+	// UPDATE wallets: SC_REDEEMABLE restored to 100.
+	mock.ExpectExec(rxUpdateWallet).
+		WithArgs(dec("0.0000"), dec("0.0000"), dec("100.0000"), playerID).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	// Flip original status.
+	mock.ExpectExec(`UPDATE ledger_transactions.*SET status = 'ROLLED_BACK'`).
+		WithArgs(originalTxID).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	// INSERT rollback header.
+	mock.ExpectQuery(rxInsertLedgerTx).
+		WithArgs(operatorCode, "op-rb-1", playerID, "ROLLBACK", nil, nil, originalTxID, json.RawMessage("{}")).
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(rollbackTxID))
+	// INSERT reverse entries: CREDIT to player, DEBIT to house bet pool.
+	mock.ExpectExec(rxInsertLedgerEntry).
+		WithArgs(rollbackTxID, playerID, "PLAYER_WALLET", "SC_REDEEMABLE", "CREDIT", dec("30.0000"), dec("100.0000")).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectExec(rxInsertLedgerEntry).
+		WithArgs(rollbackTxID, nil, "HOUSE_BET_POOL", "SC_REDEEMABLE", "DEBIT", dec("30.0000"), nil).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
+
+	got, err := e.ProcessRollback(context.Background(), RollbackRequest{
+		OperatorCode:           operatorCode,
+		OperatorTransactionID:  "op-rb-1",
+		PlayerID:               playerID,
+		ReferenceTransactionID: originalTxID,
+	})
+	if err != nil {
+		t.Fatalf("ProcessRollback: %v", err)
+	}
+	if got.Status != StatusProcessed {
+		t.Errorf("Status: got %v want %v", got.Status, StatusProcessed)
+	}
+	if got.TransactionType != "ROLLBACK" {
+		t.Errorf("Type: got %s want ROLLBACK", got.TransactionType)
+	}
+	if got.PostBalances.SCRedeemable.String() != "100.0000" {
+		t.Errorf("PostBalances.SCRedeemable: got %s want 100.0000", got.PostBalances.SCRedeemable)
+	}
+	if got.Amount.String() != "30.0000" {
+		t.Errorf("Amount: got %s want 30.0000", got.Amount)
+	}
+}
+
+func TestProcessRollback_OriginalNotFound(t *testing.T) {
+	t.Parallel()
+	e, mock, _ := newEngine(t)
+	playerID := uuid.New()
+	originalTxID := uuid.New()
+
+	mock.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
+		WillReturnRows(walletRows("0.0000", "0.0000", "0.0000"))
+	mock.ExpectQuery(`SELECT player_id, transaction_type, status.*FOR UPDATE`).
+		WithArgs(originalTxID).
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectRollback()
+
+	_, err := e.ProcessRollback(context.Background(), RollbackRequest{
+		OperatorCode: operatorCode, OperatorTransactionID: "op-rb-2",
+		PlayerID: playerID, ReferenceTransactionID: originalTxID,
+	})
+	if !errors.Is(err, errs.ErrRollbackNotFound) {
+		t.Fatalf("got %v, want wrapping ErrRollbackNotFound", err)
+	}
+}
+
+func TestProcessRollback_AlreadyRolledBack(t *testing.T) {
+	t.Parallel()
+	e, mock, _ := newEngine(t)
+	playerID := uuid.New()
+	originalTxID := uuid.New()
+
+	mock.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
+		WillReturnRows(walletRows("100.0000", "0.0000", "0.0000"))
+	mock.ExpectQuery(`SELECT player_id, transaction_type, status.*FOR UPDATE`).
+		WithArgs(originalTxID).
+		WillReturnRows(pgxmock.NewRows([]string{"player_id", "transaction_type", "status"}).
+			AddRow(playerID, "BET", "ROLLED_BACK"))
+	mock.ExpectRollback()
+
+	_, err := e.ProcessRollback(context.Background(), RollbackRequest{
+		OperatorCode: operatorCode, OperatorTransactionID: "op-rb-3",
+		PlayerID: playerID, ReferenceTransactionID: originalTxID,
+	})
+	if !errors.Is(err, errs.ErrRollbackAlready) {
+		t.Fatalf("got %v, want wrapping ErrRollbackAlready", err)
+	}
+}
+
+func TestProcessRollback_WinIsUnsupported(t *testing.T) {
+	t.Parallel()
+	e, mock, _ := newEngine(t)
+	playerID := uuid.New()
+	originalTxID := uuid.New()
+
+	mock.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
+		WillReturnRows(walletRows("100.0000", "0.0000", "0.0000"))
+	mock.ExpectQuery(`SELECT player_id, transaction_type, status.*FOR UPDATE`).
+		WithArgs(originalTxID).
+		WillReturnRows(pgxmock.NewRows([]string{"player_id", "transaction_type", "status"}).
+			AddRow(playerID, "WIN", "COMPLETED"))
+	mock.ExpectRollback()
+
+	_, err := e.ProcessRollback(context.Background(), RollbackRequest{
+		OperatorCode: operatorCode, OperatorTransactionID: "op-rb-4",
+		PlayerID: playerID, ReferenceTransactionID: originalTxID,
+	})
+	if !errors.Is(err, errs.ErrRollbackUnsupported) {
+		t.Fatalf("got %v, want wrapping ErrRollbackUnsupported", err)
+	}
+}
+
+func TestProcessRollback_PlayerMismatch(t *testing.T) {
+	t.Parallel()
+	e, mock, _ := newEngine(t)
+	playerA := uuid.New()
+	playerB := uuid.New()
+	originalTxID := uuid.New()
+
+	mock.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerA).
+		WillReturnRows(walletRows("100.0000", "0.0000", "0.0000"))
+	mock.ExpectQuery(`SELECT player_id, transaction_type, status.*FOR UPDATE`).
+		WithArgs(originalTxID).
+		WillReturnRows(pgxmock.NewRows([]string{"player_id", "transaction_type", "status"}).
+			AddRow(playerB, "BET", "COMPLETED"))
+	mock.ExpectRollback()
+
+	_, err := e.ProcessRollback(context.Background(), RollbackRequest{
+		OperatorCode: operatorCode, OperatorTransactionID: "op-rb-5",
+		PlayerID: playerA, ReferenceTransactionID: originalTxID,
+	})
+	if !errors.Is(err, errs.ErrTransactionConflict) {
+		t.Fatalf("got %v, want wrapping ErrTransactionConflict", err)
+	}
+}
+
+func TestProcessRollback_Validation(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		req  RollbackRequest
+		err  error
+	}{
+		{"no_op_code", RollbackRequest{OperatorTransactionID: "x", PlayerID: uuid.New(), ReferenceTransactionID: uuid.New()}, errs.ErrInvalidAmount},
+		{"no_op_tx_id", RollbackRequest{OperatorCode: "X", PlayerID: uuid.New(), ReferenceTransactionID: uuid.New()}, errs.ErrInvalidAmount},
+		{"nil_player", RollbackRequest{OperatorCode: "X", OperatorTransactionID: "x", ReferenceTransactionID: uuid.New()}, errs.ErrPlayerNotFound},
+		{"nil_reference", RollbackRequest{OperatorCode: "X", OperatorTransactionID: "x", PlayerID: uuid.New()}, errs.ErrRollbackNotFound},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			e, _, _ := newEngine(t)
+			_, err := e.ProcessRollback(context.Background(), tc.req)
+			if !errors.Is(err, tc.err) {
+				t.Errorf("got %v, want wrapping %v", err, tc.err)
+			}
+		})
+	}
 }

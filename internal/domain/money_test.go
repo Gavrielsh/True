@@ -17,16 +17,16 @@ func TestNewMoney(t *testing.T) {
 		want    string // expected String() output (StringFixed(4))
 		wantErr error  // nil for success, sentinel otherwise
 	}{
-		{"zero",                 "0",                "0.0000",          nil},
-		{"positive_whole",       "100",              "100.0000",        nil},
-		{"positive_one_decimal", "1.5",              "1.5000",          nil},
-		{"positive_four_dec",    "1.2345",           "1.2345",          nil},
-		{"trailing_zeros",       "1.2300",           "1.2300",          nil},
-		{"negative_allowed",     "-5.5000",          "-5.5000",         nil},
-		{"max_18_4",             "99999999999999.9999", "99999999999999.9999", nil},
-		{"scale_5_rejected",     "0.00001",          "",                ErrMoneyScaleExceeded},
-		{"scale_8_rejected",     "1.12345678",       "",                ErrMoneyScaleExceeded},
-		{"sub_cent_boundary",    "0.00005",          "",                ErrMoneyScaleExceeded},
+		{"zero", "0", "0.0000", nil},
+		{"positive_whole", "100", "100.0000", nil},
+		{"positive_one_decimal", "1.5", "1.5000", nil},
+		{"positive_four_dec", "1.2345", "1.2345", nil},
+		{"trailing_zeros", "1.2300", "1.2300", nil},
+		{"negative_allowed", "-5.5000", "-5.5000", nil},
+		{"max_18_4", "99999999999999.9999", "99999999999999.9999", nil},
+		{"scale_5_rejected", "0.00001", "", ErrMoneyScaleExceeded},
+		{"scale_8_rejected", "1.12345678", "", ErrMoneyScaleExceeded},
+		{"sub_cent_boundary", "0.00005", "", ErrMoneyScaleExceeded},
 	}
 
 	for _, tt := range tests {
@@ -60,14 +60,14 @@ func TestMoneyFromString(t *testing.T) {
 		want    string
 		wantErr bool
 	}{
-		{"plain_int",          "42",         "42.0000",        false},
-		{"two_decimals",       "1.23",       "1.2300",         false},
-		{"max_scale",          "1.2345",     "1.2345",         false},
-		{"trailing_zeros_pad", "1.20",       "1.2000",         false},
-		{"negative",           "-100.5000",  "-100.5000",      false},
-		{"empty",              "",           "",               true},
-		{"garbage",            "hello",      "",               true},
-		{"too_much_precision", "1.00001",    "",               true},
+		{"plain_int", "42", "42.0000", false},
+		{"two_decimals", "1.23", "1.2300", false},
+		{"max_scale", "1.2345", "1.2345", false},
+		{"trailing_zeros_pad", "1.20", "1.2000", false},
+		{"negative", "-100.5000", "-100.5000", false},
+		{"empty", "", "", true},
+		{"garbage", "hello", "", true},
+		{"too_much_precision", "1.00001", "", true},
 	}
 
 	for _, tt := range tests {
@@ -113,15 +113,15 @@ func TestMoneyPredicates(t *testing.T) {
 	neg, _ := MoneyFromString("-0.0001")
 
 	tests := []struct {
-		name        string
-		m           Money
-		isZero      bool
-		isPositive  bool
-		isNegative  bool
+		name       string
+		m          Money
+		isZero     bool
+		isPositive bool
+		isNegative bool
 	}{
-		{"zero",     zero, true,  false, false},
-		{"one",      one,  false, true,  false},
-		{"neg_eps",  neg,  false, false, true},
+		{"zero", zero, true, false, false},
+		{"one", one, false, true, false},
+		{"neg_eps", neg, false, false, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -149,20 +149,24 @@ func TestMoneyAddSub(t *testing.T) {
 		add  string
 		sub  string
 	}{
-		{"whole_plus_whole",    "10",     "5",      "15.0000",  "5.0000"},
-		{"decimals",            "1.2345", "0.0001", "1.2346",   "1.2344"},
-		{"penny_precision",     "100.00", "0.01",   "100.0100", "99.9900"},
-		{"sub_to_zero",         "5.0000", "5.0000", "10.0000",  "0.0000"},
-		{"crosses_zero",        "5.0000", "10.0000","15.0000",  "-5.0000"},
-		{"max_scale_no_loss",   "0.0001", "0.0001", "0.0002",   "0.0000"},
+		{"whole_plus_whole", "10", "5", "15.0000", "5.0000"},
+		{"decimals", "1.2345", "0.0001", "1.2346", "1.2344"},
+		{"penny_precision", "100.00", "0.01", "100.0100", "99.9900"},
+		{"sub_to_zero", "5.0000", "5.0000", "10.0000", "0.0000"},
+		{"crosses_zero", "5.0000", "10.0000", "15.0000", "-5.0000"},
+		{"max_scale_no_loss", "0.0001", "0.0001", "0.0002", "0.0000"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			a, err := MoneyFromString(tt.a)
-			if err != nil { t.Fatalf("a parse: %v", err) }
+			if err != nil {
+				t.Fatalf("a parse: %v", err)
+			}
 			b, err := MoneyFromString(tt.b)
-			if err != nil { t.Fatalf("b parse: %v", err) }
+			if err != nil {
+				t.Fatalf("b parse: %v", err)
+			}
 
 			if got := a.Add(b).String(); got != tt.add {
 				t.Errorf("Add: got %s, want %s", got, tt.add)
@@ -197,13 +201,13 @@ func TestMoneyNoFloatDrift(t *testing.T) {
 func TestMoneyComparison(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		a, b string
+		a, b                 string
 		lt, gt, eq, lte, gte bool
 	}{
-		{"1.0000", "1.0000", false, false, true,  true,  true},
-		{"0.9999", "1.0000", true,  false, false, true,  false},
-		{"1.0001", "1.0000", false, true,  false, false, true},
-		{"-1.0000","1.0000", true,  false, false, true,  false},
+		{"1.0000", "1.0000", false, false, true, true, true},
+		{"0.9999", "1.0000", true, false, false, true, false},
+		{"1.0001", "1.0000", false, true, false, false, true},
+		{"-1.0000", "1.0000", true, false, false, true, false},
 	}
 	for _, tt := range tests {
 		a, _ := MoneyFromString(tt.a)
@@ -234,7 +238,7 @@ func TestMinMoney(t *testing.T) {
 		{"1.0000", "2.0000", "1.0000"},
 		{"2.0000", "1.0000", "1.0000"},
 		{"1.0000", "1.0000", "1.0000"},
-		{"-1.0000","0.0000", "-1.0000"},
+		{"-1.0000", "0.0000", "-1.0000"},
 	}
 	for _, tt := range tests {
 		a, _ := MoneyFromString(tt.a)
@@ -257,19 +261,23 @@ func TestMoneyJSON(t *testing.T) {
 		money   string
 		jsonOut string
 	}{
-		{"zero",            "0.0000", `"0.0000"`},
-		{"positive",        "1.2345", `"1.2345"`},
-		{"negative",        "-5.0000", `"-5.0000"`},
-		{"trailing_zeros",  "100.1000", `"100.1000"`},
-		{"max_18_4",        "99999999999999.9999", `"99999999999999.9999"`},
+		{"zero", "0.0000", `"0.0000"`},
+		{"positive", "1.2345", `"1.2345"`},
+		{"negative", "-5.0000", `"-5.0000"`},
+		{"trailing_zeros", "100.1000", `"100.1000"`},
+		{"max_18_4", "99999999999999.9999", `"99999999999999.9999"`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			m, err := MoneyFromString(tt.money)
-			if err != nil { t.Fatalf("parse: %v", err) }
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
 			got, err := m.MarshalJSON()
-			if err != nil { t.Fatalf("marshal: %v", err) }
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
 			if string(got) != tt.jsonOut {
 				t.Errorf("MarshalJSON: got %s, want %s", got, tt.jsonOut)
 			}
@@ -288,11 +296,11 @@ func TestMoneyJSON(t *testing.T) {
 func TestMoneyUnmarshalJSON_Rejects(t *testing.T) {
 	t.Parallel()
 	cases := []string{
-		`123`,            // not a string
-		`"abc"`,          // not a number
-		``,               // empty
-		`"1.00001"`,      // too much precision
-		`"`,              // unbalanced quote
+		`123`,       // not a string
+		`"abc"`,     // not a number
+		``,          // empty
+		`"1.00001"`, // too much precision
+		`"`,         // unbalanced quote
 	}
 	for _, c := range cases {
 		t.Run(c, func(t *testing.T) {
@@ -310,7 +318,9 @@ func TestMoneyDecimalRoundTrip(t *testing.T) {
 	cases := []string{"0.0000", "1.2345", "100.0000", "-50.0001", "99999999999999.9999"}
 	for _, s := range cases {
 		m, err := MoneyFromString(s)
-		if err != nil { t.Fatalf("%s: %v", s, err) }
+		if err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
 		// The Decimal() return must stamp scale=-4 so pgx writes the canonical form.
 		d := m.Decimal()
 		if d.Exponent() != -MoneyScale {

@@ -81,16 +81,16 @@ func (m Money) Decimal() decimal.Decimal { return m.v.Truncate(MoneyScale) }
 // String renders the value at fixed 4-decimal precision: "12.3400".
 func (m Money) String() string { return m.v.StringFixed(MoneyScale) }
 
-func (m Money) Add(o Money) Money         { return Money{v: m.v.Add(o.v)} }
-func (m Money) Sub(o Money) Money         { return Money{v: m.v.Sub(o.v)} }
-func (m Money) IsZero() bool              { return m.v.IsZero() }
-func (m Money) IsPositive() bool          { return m.v.Sign() > 0 }
-func (m Money) IsNegative() bool          { return m.v.Sign() < 0 }
-func (m Money) Equal(o Money) bool        { return m.v.Equal(o.v) }
-func (m Money) LessThan(o Money) bool     { return m.v.LessThan(o.v) }
-func (m Money) GreaterThan(o Money) bool  { return m.v.GreaterThan(o.v) }
-func (m Money) GTE(o Money) bool          { return m.v.GreaterThanOrEqual(o.v) }
-func (m Money) LTE(o Money) bool          { return m.v.LessThanOrEqual(o.v) }
+func (m Money) Add(o Money) Money        { return Money{v: m.v.Add(o.v)} }
+func (m Money) Sub(o Money) Money        { return Money{v: m.v.Sub(o.v)} }
+func (m Money) IsZero() bool             { return m.v.IsZero() }
+func (m Money) IsPositive() bool         { return m.v.Sign() > 0 }
+func (m Money) IsNegative() bool         { return m.v.Sign() < 0 }
+func (m Money) Equal(o Money) bool       { return m.v.Equal(o.v) }
+func (m Money) LessThan(o Money) bool    { return m.v.LessThan(o.v) }
+func (m Money) GreaterThan(o Money) bool { return m.v.GreaterThan(o.v) }
+func (m Money) GTE(o Money) bool         { return m.v.GreaterThanOrEqual(o.v) }
+func (m Money) LTE(o Money) bool         { return m.v.LessThanOrEqual(o.v) }
 
 // MinMoney returns the smaller of a and b. Used by the SC allocator to
 // clamp the SC_UNPLAYED draw to the available unplayed balance.
