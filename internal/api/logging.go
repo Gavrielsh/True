@@ -38,8 +38,9 @@ func Telemetry(logger *slog.Logger) gin.HandlerFunc {
 			return // hot path: no INFO/DEBUG logging
 		}
 
+		// trace_id is injected by ContextHandler (from the request context),
+		// so we don't add it here — doing both would duplicate the key.
 		attrs := []any{
-			slog.String("trace_id", traceID),
 			slog.String("method", c.Request.Method),
 			slog.String("path", c.Request.URL.Path),
 			slog.Int("status", status),
