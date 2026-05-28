@@ -47,7 +47,7 @@ const (
 const ProcessingMarker = "PROCESSING"
 
 const (
-	keyPrefix     = "api:idempotency:"
+	keyPrefix       = "api:idempotency:"
 	defaultLockTTL  = 10 * time.Second
 	defaultCacheTTL = 24 * time.Hour
 )

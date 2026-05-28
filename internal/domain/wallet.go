@@ -12,10 +12,11 @@ import (
 // leak a stale reference back into the caller.
 //
 // Lock-duration contract:
-//   The repository acquires SELECT ... FOR UPDATE, builds a Wallet, then
-//   calls AllocateBet / AllocateWin. Those calls are pure CPU (no I/O, no
-//   allocator-heavy paths) and complete in microseconds, so the row lock
-//   is held only for SELECT + math + UPDATE + INSERT-ledger + COMMIT.
+//
+//	The repository acquires SELECT ... FOR UPDATE, builds a Wallet, then
+//	calls AllocateBet / AllocateWin. Those calls are pure CPU (no I/O, no
+//	allocator-heavy paths) and complete in microseconds, so the row lock
+//	is held only for SELECT + math + UPDATE + INSERT-ledger + COMMIT.
 type Wallet struct {
 	PlayerID     string
 	GC           Money
@@ -60,10 +61,10 @@ type Debit struct {
 // BetAllocation is the complete debit plan for a single bet.
 //
 // Invariants (validated by AllocateBet, relied on by the repository):
-//   * len(Debits) >= 1
-//   * Sum(Debits[*].Amount) == Total == requested bet amount
-//   * Family == FamilyGC  → exactly one Debit, Currency == CurrencyGC.
-//   * Family == FamilySC  → 1–2 Debits; if two, [0] is SC_UNPLAYED and
+//   - len(Debits) >= 1
+//   - Sum(Debits[*].Amount) == Total == requested bet amount
+//   - Family == FamilyGC  → exactly one Debit, Currency == CurrencyGC.
+//   - Family == FamilySC  → 1–2 Debits; if two, [0] is SC_UNPLAYED and
 //     [1] is SC_REDEEMABLE (engine-enforced priority order).
 type BetAllocation struct {
 	Family CurrencyFamily
@@ -76,9 +77,9 @@ type BetAllocation struct {
 // SC_REDEEMABLE, per the US sweepstakes wagering rule.
 //
 // Errors:
-//   * ErrInvalidAmount       — amount is zero or negative.
-//   * ErrInsufficientFunds   — the relevant balance(s) cannot cover amount.
-//   * ErrUnsupportedCurrency — family is not GC or SC.
+//   - ErrInvalidAmount       — amount is zero or negative.
+//   - ErrInsufficientFunds   — the relevant balance(s) cannot cover amount.
+//   - ErrUnsupportedCurrency — family is not GC or SC.
 func (w Wallet) AllocateBet(family CurrencyFamily, amount Money) (BetAllocation, error) {
 	if !amount.IsPositive() {
 		return BetAllocation{}, fmt.Errorf(
@@ -175,9 +176,9 @@ type Credit struct {
 // WinAllocation is the credit plan for a single win.
 //
 // Invariants:
-//   * Total == requested win amount.
-//   * Family == FamilyGC  → Credit.Currency == CurrencyGC.
-//   * Family == FamilySC  → Credit.Currency == CurrencySCRedeemable  (always).
+//   - Total == requested win amount.
+//   - Family == FamilyGC  → Credit.Currency == CurrencyGC.
+//   - Family == FamilySC  → Credit.Currency == CurrencySCRedeemable  (always).
 type WinAllocation struct {
 	Family CurrencyFamily
 	Total  Money
@@ -190,8 +191,8 @@ type WinAllocation struct {
 // real-world prize redemption).
 //
 // Errors:
-//   * ErrInvalidAmount       — amount is zero or negative.
-//   * ErrUnsupportedCurrency — family is not GC or SC.
+//   - ErrInvalidAmount       — amount is zero or negative.
+//   - ErrUnsupportedCurrency — family is not GC or SC.
 //
 // Note: there is no ErrInsufficientFunds path — wins only ever add liquidity.
 func (w Wallet) AllocateWin(family CurrencyFamily, amount Money) (WinAllocation, error) {

@@ -29,12 +29,12 @@ func TestCurrencyValid(t *testing.T) {
 func TestCurrencyFamily(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		f      CurrencyFamily
-		str    string
-		valid  bool
+		f     CurrencyFamily
+		str   string
+		valid bool
 	}{
-		{FamilyGC,      "GC",      true},
-		{FamilySC,      "SC",      true},
+		{FamilyGC, "GC", true},
+		{FamilySC, "SC", true},
 		{FamilyUnknown, "UNKNOWN", false},
 		{CurrencyFamily(99), "UNKNOWN", false},
 	}
@@ -59,7 +59,7 @@ func TestFamilyFromString(t *testing.T) {
 	}{
 		{"GC", FamilyGC},
 		{"SC", FamilySC},
-		{"",   FamilyUnknown},
+		{"", FamilyUnknown},
 		{"gc", FamilyUnknown}, // case-sensitive on purpose
 		{"USD", FamilyUnknown},
 		{"SC_UNPLAYED", FamilyUnknown}, // raw currency leaks must not pass

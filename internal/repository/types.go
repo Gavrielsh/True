@@ -32,14 +32,21 @@ type Engine interface {
 	// ProcessWin runs the golden flow for a win (always credits SC_REDEEMABLE
 	// for SC family).
 	ProcessWin(ctx context.Context, req WinRequest) (TxResult, error)
+
+	// ProcessRollback reverses a previously-committed BET. The original tx is
+	// flipped to ROLLED_BACK and an offsetting ROLLBACK ledger_transaction is
+	// posted with opposite-direction entries that re-credit the wallet.
+	// Same Redis idempotency barrier + 23505 Ghost-Spin recovery as the BET
+	// and WIN flows.
+	ProcessRollback(ctx context.Context, req RollbackRequest) (TxResult, error)
 }
 
 // BetRequest is the validated, in-engine representation of a /bet call.
 // All currency values are already domain.Money — the HTTP layer is
 // responsible for the parse-and-reject-bad-precision step.
 type BetRequest struct {
-	OperatorCode          string                // e.g. "PRAGMATIC"
-	OperatorTransactionID string                // idempotency anchor
+	OperatorCode          string // e.g. "PRAGMATIC"
+	OperatorTransactionID string // idempotency anchor
 	PlayerID              uuid.UUID
 	Family                domain.CurrencyFamily // GC or SC
 	Amount                domain.Money          // > 0
@@ -59,7 +66,23 @@ type WinRequest struct {
 	Amount                 domain.Money
 	GameID                 string
 	RoundID                string
-	ReferenceTransactionID uuid.UUID       // uuid.Nil = NULL
+	ReferenceTransactionID uuid.UUID // uuid.Nil = NULL
+	Metadata               json.RawMessage
+}
+
+// RollbackRequest reverses a previously-committed BET. The operator supplies
+// its own OperatorTransactionID for the rollback (distinct from the original)
+// so the rollback itself is idempotent; ReferenceTransactionID points at the
+// BET being reversed.
+//
+// Currently BET rollbacks only. A WIN rollback would re-debit the wallet,
+// which may hit the CHECK (balance >= 0) constraint if the player has spent
+// the winnings — that branch is deliberately deferred.
+type RollbackRequest struct {
+	OperatorCode           string
+	OperatorTransactionID  string    // the rollback's own ID
+	PlayerID               uuid.UUID // for cross-check against the original
+	ReferenceTransactionID uuid.UUID // the BET ledger_transactions.id to reverse
 	Metadata               json.RawMessage
 }
 

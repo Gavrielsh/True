@@ -12,11 +12,17 @@ import (
 func mkWallet(t *testing.T, gc, scU, scR string) Wallet {
 	t.Helper()
 	gcM, err := MoneyFromString(gc)
-	if err != nil { t.Fatalf("gc: %v", err) }
+	if err != nil {
+		t.Fatalf("gc: %v", err)
+	}
 	uM, err := MoneyFromString(scU)
-	if err != nil { t.Fatalf("scU: %v", err) }
+	if err != nil {
+		t.Fatalf("scU: %v", err)
+	}
 	rM, err := MoneyFromString(scR)
-	if err != nil { t.Fatalf("scR: %v", err) }
+	if err != nil {
+		t.Fatalf("scR: %v", err)
+	}
 	return Wallet{
 		PlayerID:     "00000000-0000-0000-0000-000000000001",
 		GC:           gcM,
@@ -28,7 +34,9 @@ func mkWallet(t *testing.T, gc, scU, scR string) Wallet {
 func mustMoney(t *testing.T, s string) Money {
 	t.Helper()
 	m, err := MoneyFromString(s)
-	if err != nil { t.Fatalf("money %q: %v", s, err) }
+	if err != nil {
+		t.Fatalf("money %q: %v", s, err)
+	}
 	return m
 }
 
@@ -73,16 +81,16 @@ func TestAllocateBet_GC(t *testing.T) {
 			}},
 		},
 		{
-			name:    "insufficient",
-			wallet:  mkWallet(t, "5.0000", "100.0000", "100.0000"),
-			amount:  "10.0000",
-			want:    want{errKind: errs.ErrInsufficientFunds},
+			name:   "insufficient",
+			wallet: mkWallet(t, "5.0000", "100.0000", "100.0000"),
+			amount: "10.0000",
+			want:   want{errKind: errs.ErrInsufficientFunds},
 		},
 		{
-			name:    "empty_gc",
-			wallet:  mkWallet(t, "0.0000", "999.0000", "999.0000"),
-			amount:  "0.0001",
-			want:    want{errKind: errs.ErrInsufficientFunds},
+			name:   "empty_gc",
+			wallet: mkWallet(t, "0.0000", "999.0000", "999.0000"),
+			amount: "0.0001",
+			want:   want{errKind: errs.ErrInsufficientFunds},
 		},
 	}
 
@@ -133,7 +141,7 @@ func TestAllocateBet_SC_PriorityRule(t *testing.T) {
 			wallet: mkWallet(t, "0", "30.0000", "100.0000"),
 			amount: "50.0000",
 			want: want{debits: []Debit{
-				{CurrencySCUnplayed,   mustMoney(t, "30.0000")},
+				{CurrencySCUnplayed, mustMoney(t, "30.0000")},
 				{CurrencySCRedeemable, mustMoney(t, "20.0000")},
 			}},
 		},
@@ -150,7 +158,7 @@ func TestAllocateBet_SC_PriorityRule(t *testing.T) {
 			wallet: mkWallet(t, "0", "30.0000", "20.0000"),
 			amount: "50.0000",
 			want: want{debits: []Debit{
-				{CurrencySCUnplayed,   mustMoney(t, "30.0000")},
+				{CurrencySCUnplayed, mustMoney(t, "30.0000")},
 				{CurrencySCRedeemable, mustMoney(t, "20.0000")},
 			}},
 		},
@@ -167,7 +175,7 @@ func TestAllocateBet_SC_PriorityRule(t *testing.T) {
 			wallet: mkWallet(t, "0", "0.0001", "999.0000"),
 			amount: "0.0002",
 			want: want{debits: []Debit{
-				{CurrencySCUnplayed,   mustMoney(t, "0.0001")},
+				{CurrencySCUnplayed, mustMoney(t, "0.0001")},
 				{CurrencySCRedeemable, mustMoney(t, "0.0001")},
 			}},
 		},
@@ -209,12 +217,12 @@ func TestAllocateBet_Validation(t *testing.T) {
 		amount  string
 		errKind error
 	}{
-		{"zero_amount_gc",   FamilyGC,      "0.0000",  errs.ErrInvalidAmount},
-		{"zero_amount_sc",   FamilySC,      "0.0000",  errs.ErrInvalidAmount},
-		{"negative_amount",  FamilyGC,      "-1.0000", errs.ErrInvalidAmount},
-		{"negative_eps",     FamilySC,      "-0.0001", errs.ErrInvalidAmount},
-		{"unknown_family",   FamilyUnknown, "1.0000",  errs.ErrUnsupportedCurrency},
-		{"out_of_range",     CurrencyFamily(99), "1.0000", errs.ErrUnsupportedCurrency},
+		{"zero_amount_gc", FamilyGC, "0.0000", errs.ErrInvalidAmount},
+		{"zero_amount_sc", FamilySC, "0.0000", errs.ErrInvalidAmount},
+		{"negative_amount", FamilyGC, "-1.0000", errs.ErrInvalidAmount},
+		{"negative_eps", FamilySC, "-0.0001", errs.ErrInvalidAmount},
+		{"unknown_family", FamilyUnknown, "1.0000", errs.ErrUnsupportedCurrency},
+		{"out_of_range", CurrencyFamily(99), "1.0000", errs.ErrUnsupportedCurrency},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -237,11 +245,11 @@ func TestAllocateWin(t *testing.T) {
 	w := mkWallet(t, "0", "0", "0")
 
 	tests := []struct {
-		name     string
-		family   CurrencyFamily
-		amount   string
-		credit   Credit
-		errKind  error
+		name    string
+		family  CurrencyFamily
+		amount  string
+		credit  Credit
+		errKind error
 	}{
 		{
 			name:   "gc_win",
@@ -292,7 +300,9 @@ func TestAllocateWin(t *testing.T) {
 				}
 				return
 			}
-			if err != nil { t.Fatalf("unexpected: %v", err) }
+			if err != nil {
+				t.Fatalf("unexpected: %v", err)
+			}
 			if got.Family != tt.family {
 				t.Errorf("Family: got %v want %v", got.Family, tt.family)
 			}
@@ -316,10 +326,10 @@ func TestAllocateWin(t *testing.T) {
 func TestApplyBet(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name           string
-		wallet         Wallet
-		family         CurrencyFamily
-		amount         string
+		name                 string
+		wallet               Wallet
+		family               CurrencyFamily
+		amount               string
 		wantGC, wantU, wantR string
 	}{
 		{
@@ -353,11 +363,19 @@ func TestApplyBet(t *testing.T) {
 			t.Parallel()
 			amount := mustMoney(t, tt.amount)
 			alloc, err := tt.wallet.AllocateBet(tt.family, amount)
-			if err != nil { t.Fatalf("AllocateBet: %v", err) }
+			if err != nil {
+				t.Fatalf("AllocateBet: %v", err)
+			}
 			post := tt.wallet.ApplyBet(alloc)
-			if got := post.GC.String();           got != tt.wantGC { t.Errorf("GC = %s want %s", got, tt.wantGC) }
-			if got := post.SCUnplayed.String();   got != tt.wantU  { t.Errorf("U  = %s want %s", got, tt.wantU)  }
-			if got := post.SCRedeemable.String(); got != tt.wantR  { t.Errorf("R  = %s want %s", got, tt.wantR)  }
+			if got := post.GC.String(); got != tt.wantGC {
+				t.Errorf("GC = %s want %s", got, tt.wantGC)
+			}
+			if got := post.SCUnplayed.String(); got != tt.wantU {
+				t.Errorf("U  = %s want %s", got, tt.wantU)
+			}
+			if got := post.SCRedeemable.String(); got != tt.wantR {
+				t.Errorf("R  = %s want %s", got, tt.wantR)
+			}
 
 			// ApplyBet must be a pure function: the original wallet is unchanged.
 			if tt.wallet.GC.Equal(post.GC) && tt.wallet.SCUnplayed.Equal(post.SCUnplayed) && tt.wallet.SCRedeemable.Equal(post.SCRedeemable) {
@@ -370,10 +388,10 @@ func TestApplyBet(t *testing.T) {
 func TestApplyWin(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name           string
-		wallet         Wallet
-		family         CurrencyFamily
-		amount         string
+		name                 string
+		wallet               Wallet
+		family               CurrencyFamily
+		amount               string
 		wantGC, wantU, wantR string
 	}{
 		{
@@ -400,11 +418,19 @@ func TestApplyWin(t *testing.T) {
 			t.Parallel()
 			amount := mustMoney(t, tt.amount)
 			alloc, err := tt.wallet.AllocateWin(tt.family, amount)
-			if err != nil { t.Fatalf("AllocateWin: %v", err) }
+			if err != nil {
+				t.Fatalf("AllocateWin: %v", err)
+			}
 			post := tt.wallet.ApplyWin(alloc)
-			if got := post.GC.String();           got != tt.wantGC { t.Errorf("GC = %s want %s", got, tt.wantGC) }
-			if got := post.SCUnplayed.String();   got != tt.wantU  { t.Errorf("U  = %s want %s", got, tt.wantU)  }
-			if got := post.SCRedeemable.String(); got != tt.wantR  { t.Errorf("R  = %s want %s", got, tt.wantR)  }
+			if got := post.GC.String(); got != tt.wantGC {
+				t.Errorf("GC = %s want %s", got, tt.wantGC)
+			}
+			if got := post.SCUnplayed.String(); got != tt.wantU {
+				t.Errorf("U  = %s want %s", got, tt.wantU)
+			}
+			if got := post.SCRedeemable.String(); got != tt.wantR {
+				t.Errorf("R  = %s want %s", got, tt.wantR)
+			}
 		})
 	}
 }
@@ -420,11 +446,11 @@ func TestBalanceFor(t *testing.T) {
 		c    Currency
 		want string
 	}{
-		{CurrencyGC,           "100.0000"},
-		{CurrencySCUnplayed,   "30.0000"},
+		{CurrencyGC, "100.0000"},
+		{CurrencySCUnplayed, "30.0000"},
 		{CurrencySCRedeemable, "5.0000"},
-		{Currency("USD"),      "0.0000"}, // unknown currency falls through to zero
-		{Currency(""),         "0.0000"},
+		{Currency("USD"), "0.0000"}, // unknown currency falls through to zero
+		{Currency(""), "0.0000"},
 	}
 	for _, tt := range tests {
 		t.Run(string(tt.c), func(t *testing.T) {
