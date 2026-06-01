@@ -1,0 +1,17 @@
+# Node
+node_modules/
+dist/
+.next/
+*.log
+npm-debug.log*
+
+# Go
+TransactionMechanism/tmp/
+*.exe
+*.test
+
+# Env / secrets (keep .env for dev reference)
+
+# OS
+.DS_Store
+Thumbs.db
