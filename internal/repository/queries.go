@@ -98,13 +98,17 @@ const (
 		  AND operator_transaction_id = $2
 	`
 
-	// Rollback: locks the original ledger_transactions row so two concurrent
-	// rollback requests for the same reference serialize.
-	sqlSelectLedgerTxByIDForUpdate = `
-		SELECT player_id, transaction_type, status
+	// Rollback: read the original ledger_transactions header (immutable — the
+	// ledger is strictly append-only, so NO lock is taken here). Serialization
+	// of concurrent rollbacks is provided by the wallets FOR UPDATE lock taken
+	// first in the same flow: every rollback of this BET targets the same
+	// player, so they queue on that one row. `status` is intentionally NOT
+	// selected — rollback state is now derived from the append-only audit
+	// trail (sqlRollbackExistsForReference), never from a mutable flag.
+	sqlSelectLedgerTxByID = `
+		SELECT player_id, transaction_type
 		FROM ledger_transactions
 		WHERE id = $1
-		FOR UPDATE
 	`
 
 	// Rollback: fetch the original tx's PLAYER_WALLET entries so we know
@@ -118,14 +122,22 @@ const (
 		ORDER BY currency
 	`
 
-	// Rollback: flip the original tx's status. The status_was_completed CHECK
-	// in the WHERE clause makes the UPDATE a no-op (RowsAffected==0) on
-	// concurrent retries — caller then knows the rollback already landed.
-	sqlMarkTxRolledBack = `
-		UPDATE ledger_transactions
-		SET status = 'ROLLED_BACK',
-		    completed_at = now()
-		WHERE id = $1
-		  AND status = 'COMPLETED'
+	// Rollback (APPEND-ONLY double-rollback guard): a BET is "already rolled
+	// back" iff a ROLLBACK ledger_transactions row already references it. We
+	// derive that from the immutable audit trail instead of mutating a status
+	// flag on the original row. The NOT(...) clause excludes THIS rollback's
+	// own anchor so a genuine retry of the same operator_transaction_id falls
+	// through to the dedup INSERT and is handled by Ghost-Spin recovery (replay
+	// success) rather than being misreported as ErrRollbackAlready. Served by
+	// ledger_tx_reference_idx; correctness is guaranteed because the caller
+	// holds the player's wallet row lock while running this check.
+	sqlRollbackExistsForReference = `
+		SELECT EXISTS (
+			SELECT 1
+			FROM ledger_transactions
+			WHERE reference_transaction_id = $1
+			  AND transaction_type = 'ROLLBACK'
+			  AND NOT (operator_code = $2 AND operator_transaction_id = $3)
+		)
 	`
 )

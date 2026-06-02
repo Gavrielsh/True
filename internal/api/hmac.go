@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"io"
 	"net/http"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 
@@ -26,6 +28,22 @@ const (
 // an attacker streaming GBs to exhaust memory.
 const maxBodyBytes = 64 * 1024
 
+// maxPooledBodyBuf bounds the capacity of a buffer kept in hmacBodyPool. A
+// buffer that had to grow past this (only near maxBodyBytes) is discarded
+// rather than pinning tens of KiB per worker for the process lifetime.
+const maxPooledBodyBuf = maxBodyBytes
+
+// hmacBodyPool recycles the buffers used to stage the raw request body for
+// signature verification. On the 50k-TPS hot path a fresh io.ReadAll per
+// request is pure GC pressure; pooling the backing array amortises it to near
+// zero. A buffer is returned to the pool only AFTER the downstream chain
+// (c.Next) has finished reading the restored body — every handler in this
+// service consumes the body synchronously within the request, so the staged
+// bytes are never aliased beyond it.
+var hmacBodyPool = sync.Pool{
+	New: func() any { return new(bytes.Buffer) },
+}
+
 // HMACVerifier holds the per-operator shared secrets used to verify the
 // X-Signature header of inbound webhooks.
 //
@@ -33,8 +51,10 @@ const maxBodyBytes = 64 * 1024
 //  1. The signature MUST be computed over the RAW request body bytes,
 //     BEFORE any unmarshal. Unmarshalling and re-marshalling alters JSON
 //     whitespace and breaks the signature.
-//  2. The hex-encoded HMAC-SHA256 is compared with subtle.ConstantTimeCompare
-//     so signature comparison is not a timing oracle.
+//  2. The client X-Signature is hex-DECODED to raw bytes and compared to the
+//     computed HMAC-SHA256 with subtle.ConstantTimeCompare. Comparing decoded
+//     bytes (not hex strings) is both case-insensitive — "AB" and "ab" are the
+//     same MAC — and free of timing-oracle leakage.
 //  3. On verification failure the response is HTTP 401 with code
 //     "AUTHENTICATION_FAILED" — no further detail is leaked (don't
 //     tell an attacker which check failed).
@@ -78,31 +98,47 @@ func (v *HMACVerifier) Middleware() gin.HandlerFunc {
 			return
 		}
 
-		// 1. Buffer the body with a hard cap. http.MaxBytesReader is the
-		//    canonical Go way to bound a request body; it returns an error
-		//    on the (maxBodyBytes+1)-th read so we don't OOM.
+		// 1. Stage the body into a POOLED buffer (no per-request io.ReadAll
+		//    allocation). http.MaxBytesReader bounds it so a hostile stream
+		//    can't OOM us — ReadFrom surfaces its error past maxBodyBytes.
+		buf := hmacBodyPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		defer func() {
+			// Returned only after c.Next() below has consumed the restored body.
+			if buf.Cap() <= maxPooledBodyBuf {
+				hmacBodyPool.Put(buf)
+			}
+		}()
+
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
-		body, err := io.ReadAll(c.Request.Body)
-		if err != nil {
+		if _, err := buf.ReadFrom(c.Request.Body); err != nil {
 			respondErrorCode(c, http.StatusRequestEntityTooLarge,
 				errors.Code("REQUEST_TOO_LARGE"), "request body exceeds size limit")
 			return
 		}
-		// 2. Restore the body so handlers can read it (architecture §5 says
-		//    "read body, restore via io.NopCloser(bytes.NewBuffer(body))").
-		c.Request.Body = io.NopCloser(bytes.NewBuffer(body))
+		body := buf.Bytes()
+
+		// 2. Restore the body so handlers can read it (architecture §5). The
+		//    reader aliases the pooled buffer; safe because the buffer is not
+		//    recycled until this request's chain completes (see pool docs).
+		c.Request.Body = io.NopCloser(bytes.NewReader(body))
 
 		// 3. Compute HMAC over the raw bytes. NEVER unmarshal-then-rehash.
 		mac := hmac.New(sha256.New, secret)
 		mac.Write(body)
-		expected := hex.EncodeToString(mac.Sum(nil))
+		expectedMAC := mac.Sum(nil)
 
-		// 4. Constant-time compare. Both inputs must be the same length —
-		//    subtle.ConstantTimeCompare returns 0 for length mismatch but
-		//    still in constant time wrt input contents.
-		if !hmac.Equal([]byte(clientSig), []byte(expected)) {
-			// hmac.Equal wraps subtle.ConstantTimeCompare with the
-			// length-equal short-circuit; safe to use here.
+		// 4. Decode the client signature from hex to RAW BYTES, then compare
+		//    with subtle.ConstantTimeCompare. Decoding (rather than comparing
+		//    hex strings) makes the check case-insensitive — a valid signature
+		//    in upper/mixed-case hex is accepted — while staying constant-time
+		//    wrt content. A non-hex signature fails closed.
+		clientMAC, err := hex.DecodeString(clientSig)
+		if err != nil {
+			respondErrorCode(c, http.StatusUnauthorized, errors.Code("AUTHENTICATION_FAILED"), authFailMsg)
+			return
+		}
+		if subtle.ConstantTimeCompare(clientMAC, expectedMAC) != 1 {
 			respondErrorCode(c, http.StatusUnauthorized, errors.Code("AUTHENTICATION_FAILED"), authFailMsg)
 			return
 		}

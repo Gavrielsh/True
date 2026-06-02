@@ -336,6 +336,64 @@ func TestSessionHandler(t *testing.T) {
 	}
 }
 
+// Every DB-bound handler must hand the engine a context carrying a STRICT
+// deadline (context.WithTimeout), so a dropped client can never leave a
+// SELECT FOR UPDATE lock (or a pooled connection) held indefinitely.
+func TestHandlers_ApplyContextDeadline(t *testing.T) {
+	t.Parallel()
+	playerID := uuid.New()
+	ok := repository.TxResult{
+		PlayerID: playerID, Status: repository.StatusProcessed,
+		PostBalances: repository.BalanceSummary{
+			GC: mustMoney(t, "0.0000"), SCUnplayed: mustMoney(t, "0.0000"), SCRedeemable: mustMoney(t, "0.0000"),
+		},
+	}
+
+	var betDL, winDL, rbDL, sessDL bool
+	eng := &fakeEngine{
+		bet: func(ctx context.Context, _ repository.BetRequest) (repository.TxResult, error) {
+			_, betDL = ctx.Deadline()
+			return ok, nil
+		},
+		win: func(ctx context.Context, _ repository.WinRequest) (repository.TxResult, error) {
+			_, winDL = ctx.Deadline()
+			return ok, nil
+		},
+		rollback: func(ctx context.Context, _ repository.RollbackRequest) (repository.TxResult, error) {
+			_, rbDL = ctx.Deadline()
+			return ok, nil
+		},
+		balances: func(ctx context.Context, _ uuid.UUID) (domain.Wallet, error) {
+			_, sessDL = ctx.Deadline()
+			return domain.Wallet{
+				PlayerID: playerID.String(),
+				GC:       mustMoney(t, "0.0000"), SCUnplayed: mustMoney(t, "0.0000"), SCRedeemable: mustMoney(t, "0.0000"),
+			}, nil
+		},
+	}
+	r := handlerRouter(eng)
+	pid := playerID.String()
+	ref := uuid.New().String()
+
+	doJSON(r, http.MethodPost, "/api/v1/bet", `{"operator_transaction_id":"op","player_id":"`+pid+`","currency":"GC","amount":"1.0000"}`)
+	doJSON(r, http.MethodPost, "/api/v1/win", `{"operator_transaction_id":"op","player_id":"`+pid+`","currency":"GC","amount":"1.0000"}`)
+	doJSON(r, http.MethodPost, "/api/v1/rollback", `{"operator_transaction_id":"op","player_id":"`+pid+`","reference_transaction_id":"`+ref+`"}`)
+	doJSON(r, http.MethodGet, "/api/v1/session?player_id="+pid, "")
+
+	if !betDL {
+		t.Error("Bet: engine context must carry a deadline")
+	}
+	if !winDL {
+		t.Error("Win: engine context must carry a deadline")
+	}
+	if !rbDL {
+		t.Error("Rollback: engine context must carry a deadline")
+	}
+	if !sessDL {
+		t.Error("Session: engine context must carry a deadline")
+	}
+}
+
 func TestSessionHandler_MissingPlayerID(t *testing.T) {
 	t.Parallel()
 	eng := &fakeEngine{balances: func(_ context.Context, _ uuid.UUID) (domain.Wallet, error) {

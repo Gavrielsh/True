@@ -138,7 +138,13 @@ func (e *engine) processBetTx(ctx context.Context, req BetRequest) (TxResult, er
 	if err != nil {
 		return TxResult{}, err
 	}
-	post := wallet.ApplyBet(alloc)
+	post, err := wallet.ApplyBet(alloc)
+	if err != nil {
+		// Defensive: an overdraw here means the allocation didn't match the
+		// locked wallet. Abort BEFORE any UPDATE so the DB constraint layer is
+		// never the first line of defence.
+		return TxResult{}, err
+	}
 
 	// 3. UPDATE wallets to the post-state.
 	if err := updateWalletBalances(ctx, tx, req.PlayerID, post); err != nil {
@@ -340,15 +346,16 @@ func (e *engine) processRollbackTx(ctx context.Context, req RollbackRequest) (Tx
 		return TxResult{}, err
 	}
 
-	// 2. Lock the original tx row. The FOR UPDATE here serializes two
-	//    concurrent rollbacks of the same reference, so only one wins.
+	// 2. Read the original tx header. The ledger is STRICTLY APPEND-ONLY, so
+	//    this row is immutable and needs no row lock: the wallets FOR UPDATE
+	//    above already serializes every rollback of this player's BET (they all
+	//    target the same player row), making the guard in step 3 race-free.
 	var (
 		origPlayerID uuid.UUID
 		origType     string
-		origStatus   string
 	)
-	err = tx.QueryRow(ctx, sqlSelectLedgerTxByIDForUpdate, req.ReferenceTransactionID).
-		Scan(&origPlayerID, &origType, &origStatus)
+	err = tx.QueryRow(ctx, sqlSelectLedgerTxByID, req.ReferenceTransactionID).
+		Scan(&origPlayerID, &origType)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return TxResult{}, errs.ErrRollbackNotFound
 	}
@@ -359,19 +366,30 @@ func (e *engine) processRollbackTx(ctx context.Context, req RollbackRequest) (Tx
 		return TxResult{}, fmt.Errorf("%w: rollback player_id %s != original %s",
 			errs.ErrTransactionConflict, req.PlayerID, origPlayerID)
 	}
-	if origStatus == "ROLLED_BACK" {
-		return TxResult{}, errs.ErrRollbackAlready
-	}
-	if origStatus != "COMPLETED" {
-		return TxResult{}, fmt.Errorf("%w: original status=%s, expected COMPLETED",
-			errs.ErrTransactionConflict, origStatus)
-	}
 	if origType != "BET" {
 		return TxResult{}, fmt.Errorf("%w: original type=%s, only BET supported",
 			errs.ErrRollbackUnsupported, origType)
 	}
 
-	// 3. Fetch the original BET's player-wallet entries (1-2 rows, ordered by currency).
+	// 3. APPEND-ONLY double-rollback guard. Rather than mutating the original
+	//    row's status to ROLLED_BACK (forbidden in an append-only ledger), we
+	//    detect a prior reversal by the EXISTENCE of a ROLLBACK transaction that
+	//    already references this BET. The wallet lock above makes the read
+	//    race-free. A genuine retry of THIS rollback (same operator_transaction_
+	//    id) is excluded by the query and falls through to the dedup INSERT,
+	//    where Ghost-Spin recovery replays the original success instead of
+	//    erroring — true idempotency.
+	var alreadyRolledBack bool
+	if err := tx.QueryRow(ctx, sqlRollbackExistsForReference,
+		req.ReferenceTransactionID, req.OperatorCode, req.OperatorTransactionID).
+		Scan(&alreadyRolledBack); err != nil {
+		return TxResult{}, fmt.Errorf("rollback-exists check: %w", err)
+	}
+	if alreadyRolledBack {
+		return TxResult{}, errs.ErrRollbackAlready
+	}
+
+	// 4. Fetch the original BET's player-wallet entries (1-2 rows, ordered by currency).
 	entries, err := fetchPlayerEntries(ctx, tx, req.ReferenceTransactionID)
 	if err != nil {
 		return TxResult{}, err
@@ -382,7 +400,7 @@ func (e *engine) processRollbackTx(ctx context.Context, req RollbackRequest) (Tx
 			errs.ErrTransactionConflict)
 	}
 
-	// 4. Reverse the wallet balances. Each original DEBIT becomes a re-credit.
+	// 5. Reverse the wallet balances. Each original DEBIT becomes a re-credit.
 	post := wallet
 	for _, ent := range entries {
 		if ent.Direction != "DEBIT" {
@@ -402,24 +420,16 @@ func (e *engine) processRollbackTx(ctx context.Context, req RollbackRequest) (Tx
 		}
 	}
 
-	// 5. UPDATE wallets to the restored balances.
+	// 6. UPDATE wallets to the restored balances. The wallets table is the
+	//    materialized-view CACHE (architecture §3), not the ledger — mutating
+	//    it is required; the append-only invariant applies to ledger_* only.
 	if err := updateWalletBalances(ctx, tx, req.PlayerID, post); err != nil {
 		return TxResult{}, err
 	}
 
-	// 6. Flip the original tx's status. RowsAffected==0 would mean a concurrent
-	//    rollback raced us, but the FOR UPDATE earlier prevented that — treat
-	//    zero as a bug, not a race.
-	tag, err := tx.Exec(ctx, sqlMarkTxRolledBack, req.ReferenceTransactionID)
-	if err != nil {
-		return TxResult{}, fmt.Errorf("mark original rolled-back: %w", err)
-	}
-	if tag.RowsAffected() != 1 {
-		return TxResult{}, fmt.Errorf("%w: mark rolled-back affected %d rows",
-			errs.ErrTransactionConflict, tag.RowsAffected())
-	}
-
-	// 7. INSERT the ROLLBACK ledger_transactions header.
+	// 7. INSERT the ROLLBACK ledger_transactions header (append-only). Its
+	//    reference_transaction_id is what makes this BET show as rolled-back to
+	//    every future reader (and to the step-3 guard) — no UPDATE required.
 	ledgerTxID, err := insertLedgerTx(ctx, tx, ledgerTxParams{
 		OperatorCode:          req.OperatorCode,
 		OperatorTransactionID: req.OperatorTransactionID,

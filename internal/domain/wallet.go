@@ -145,22 +145,56 @@ func (w Wallet) AllocateBet(family CurrencyFamily, amount Money) (BetAllocation,
 // the repository after a successful AllocateBet to derive the post-state
 // balances written to ledger_entries.balance_after.
 //
-// ApplyBet does not revalidate — AllocateBet already produced a feasible
-// plan against this exact wallet, and the FOR UPDATE lock guarantees no
-// concurrent mutation between AllocateBet and ApplyBet.
-func (w Wallet) ApplyBet(a BetAllocation) Wallet {
+// DEFENSIVE PROGRAMMING (zero-trust): although a well-formed AllocateBet on
+// this exact wallet (held under SELECT ... FOR UPDATE) can never overdraw,
+// ApplyBet re-validates every debit against the live column and refuses to
+// produce a negative balance. This is the last in-process gate BEFORE the
+// UPDATE/INSERT round-trips; catching an impossible overdraw here returns a
+// clean ErrInsufficientFunds instead of letting a malformed allocation reach
+// — and trip — the wallets CHECK (balance >= 0) constraint inside the open
+// transaction (which would surface as an opaque 23514 and abort the tx).
+//
+// A non-nil error means a caller fed ApplyBet an allocation that was NOT
+// produced by AllocateBet against this wallet — i.e. a programming error or
+// state corruption. The repository propagates it and aborts the transaction.
+func (w Wallet) ApplyBet(a BetAllocation) (Wallet, error) {
 	out := w
 	for _, d := range a.Debits {
+		if !d.Amount.IsPositive() {
+			return Wallet{}, fmt.Errorf(
+				"%w: non-positive debit %s for %s", errs.ErrInvalidAmount, d.Amount, d.Currency)
+		}
 		switch d.Currency {
 		case CurrencyGC:
+			if out.GC.LessThan(d.Amount) {
+				return Wallet{}, fmt.Errorf(
+					"%w: GC debit %s exceeds balance %s", errs.ErrInsufficientFunds, d.Amount, out.GC)
+			}
 			out.GC = out.GC.Sub(d.Amount)
 		case CurrencySCUnplayed:
+			if out.SCUnplayed.LessThan(d.Amount) {
+				return Wallet{}, fmt.Errorf(
+					"%w: SC_UNPLAYED debit %s exceeds balance %s", errs.ErrInsufficientFunds, d.Amount, out.SCUnplayed)
+			}
 			out.SCUnplayed = out.SCUnplayed.Sub(d.Amount)
 		case CurrencySCRedeemable:
+			if out.SCRedeemable.LessThan(d.Amount) {
+				return Wallet{}, fmt.Errorf(
+					"%w: SC_REDEEMABLE debit %s exceeds balance %s", errs.ErrInsufficientFunds, d.Amount, out.SCRedeemable)
+			}
 			out.SCRedeemable = out.SCRedeemable.Sub(d.Amount)
+		default:
+			return Wallet{}, fmt.Errorf(
+				"%w: unknown debit currency %q", errs.ErrUnsupportedCurrency, d.Currency)
 		}
 	}
-	return out
+	// Belt-and-suspenders: no column may be negative after applying the plan.
+	if out.GC.IsNegative() || out.SCUnplayed.IsNegative() || out.SCRedeemable.IsNegative() {
+		return Wallet{}, fmt.Errorf(
+			"%w: post-bet balance negative (gc=%s, sc_unplayed=%s, sc_redeemable=%s)",
+			errs.ErrInsufficientFunds, out.GC, out.SCUnplayed, out.SCRedeemable)
+	}
+	return out, nil
 }
 
 // ----------------------------------------------------------------------------

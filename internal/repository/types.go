@@ -33,11 +33,12 @@ type Engine interface {
 	// for SC family).
 	ProcessWin(ctx context.Context, req WinRequest) (TxResult, error)
 
-	// ProcessRollback reverses a previously-committed BET. The original tx is
-	// flipped to ROLLED_BACK and an offsetting ROLLBACK ledger_transaction is
-	// posted with opposite-direction entries that re-credit the wallet.
-	// Same Redis idempotency barrier + 23505 Ghost-Spin recovery as the BET
-	// and WIN flows.
+	// ProcessRollback reverses a previously-committed BET. The ledger is
+	// strictly APPEND-ONLY: the original tx is NEVER mutated — instead an
+	// offsetting ROLLBACK ledger_transaction is posted with opposite-direction
+	// entries that re-credit the wallet, and that row's reference_transaction_id
+	// is the audit-trail marker that the BET has been reversed. Same Redis
+	// idempotency barrier + 23505 Ghost-Spin recovery as the BET and WIN flows.
 	ProcessRollback(ctx context.Context, req RollbackRequest) (TxResult, error)
 }
 

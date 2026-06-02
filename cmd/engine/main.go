@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -58,7 +59,9 @@ func run() error {
 		return fmt.Errorf("postgres: %w", err)
 	}
 	defer pool.Close()
-	logger.Info("postgres connected", slog.Int("max_conns", int(cfg.MaxDBConns)))
+	logger.Info("postgres connected",
+		slog.Int("max_conns", int(cfg.DB.MaxConns)),
+		slog.Int("min_conns", int(cfg.DB.MinConns)))
 
 	// --- Redis --------------------------------------------------------------
 	rdb, err := newRedisClient(bootCtx, cfg)
@@ -101,18 +104,23 @@ func run() error {
 	// --- Background workers -------------------------------------------------
 	// GGR aggregator: derives platform revenue from the ledger on an interval so
 	// gameplay never contends on a single platform-wallet row (architecture
-	// §6.C). It observes ctx and stops cleanly on signal; we wait for its
-	// in-flight cycle during shutdown. A cycle that fails (e.g. migration 000007
-	// not yet applied) is logged and retried — never fatal to the server.
+	// §6.C).
+	//
+	// Dedup pruner: trims ledger_transaction_dedup to its retention horizon in
+	// small batches so the GLOBAL idempotency index stays bounded at 50k TPS
+	// (architecture §6.B / migration 000005).
+	//
+	// Both observe ctx and stop cleanly on signal; we wait for their in-flight
+	// cycles during shutdown. Each recovers per-cycle panics internally, and
+	// runWorker adds an outermost defensive recover so a panic in the worker
+	// scaffolding itself can never crash the HTTP server. A failed cycle (e.g.
+	// migration 000007 not yet applied) is logged and retried — never fatal.
 	aggregator := worker.New(pool, logger)
+	pruner := worker.NewDedupPruner(pool, logger)
+
 	var workersWG sync.WaitGroup
-	workersWG.Add(1)
-	go func() {
-		defer workersWG.Done()
-		if err := aggregator.Run(ctx); err != nil {
-			logger.Error("ggr aggregator exited", slog.String("error", err.Error()))
-		}
-	}()
+	runWorker(ctx, &workersWG, logger, "ggr_aggregator", aggregator.Run)
+	runWorker(ctx, &workersWG, logger, "dedup_pruner", pruner.Run)
 
 	serverErr := make(chan error, 1)
 	go func() {
@@ -147,6 +155,36 @@ func run() error {
 	return nil
 }
 
+// runWorker launches a background worker on wg with an outermost defensive
+// panic guard. The workers already recover per-cycle (internal/worker), so this
+// is belt-and-suspenders: even a panic in a worker's own loop scaffolding logs
+// a stack and unwinds only this goroutine — never the process or HTTP server.
+func runWorker(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	logger *slog.Logger,
+	name string,
+	run func(context.Context) error,
+) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("worker goroutine panic recovered",
+					slog.String("worker", name),
+					slog.Any("panic", r),
+					slog.String("stack", string(debug.Stack())))
+			}
+		}()
+		if err := run(ctx); err != nil {
+			logger.Error("worker exited with error",
+				slog.String("worker", name),
+				slog.String("error", err.Error()))
+		}
+	}()
+}
+
 // newLogger builds the global JSON slog logger, decorated so every record
 // carries trace_id / operator_code from its context (cursor rule §9).
 func newLogger(level string) *slog.Logger {
@@ -165,17 +203,22 @@ func newLogger(level string) *slog.Logger {
 	return slog.New(api.NewContextHandler(base))
 }
 
-// newPostgresPool builds and verifies the pgx pool. MaxConns follows the
-// architecture's (2*CPU)+1 writer heuristic via cfg.MaxDBConns.
+// newPostgresPool builds and verifies the pgx pool from the HFT-ready
+// cfg.DB tuning (MaxConns/MinConns/idle/lifetime + lifetime jitter).
 func newPostgresPool(ctx context.Context, cfg config.Config) (*pgxpool.Pool, error) {
 	poolCfg, err := pgxpool.ParseConfig(cfg.PostgresURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse url: %w", err)
 	}
-	poolCfg.MaxConns = cfg.MaxDBConns
-	poolCfg.MaxConnLifetime = time.Hour
-	poolCfg.MaxConnIdleTime = 30 * time.Minute
-	poolCfg.HealthCheckPeriod = time.Minute
+	poolCfg.MaxConns = cfg.DB.MaxConns
+	poolCfg.MinConns = cfg.DB.MinConns
+	poolCfg.MaxConnIdleTime = cfg.DB.MaxConnIdleTime
+	poolCfg.MaxConnLifetime = cfg.DB.MaxConnLifetime
+	poolCfg.HealthCheckPeriod = cfg.DB.HealthCheckPeriod
+	// Spread connection rotation over a jitter window so MaxConnLifetime never
+	// expires a large cohort simultaneously (reconnect thundering-herd) — a
+	// must at 50k TPS where a synchronized drop would stall the writer pool.
+	poolCfg.MaxConnLifetimeJitter = cfg.DB.MaxConnLifetime / 10
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {

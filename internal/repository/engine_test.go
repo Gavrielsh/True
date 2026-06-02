@@ -156,6 +156,10 @@ var (
 	rxInsertDedup       = `INSERT INTO ledger_transaction_dedup`
 	rxInsertLedgerEntry = `INSERT INTO ledger_entries`
 	rxSelectLedgerByOp  = `SELECT id, player_id, transaction_type.*FROM ledger_transactions`
+	// Append-only rollback flow: header lookup is by id (no status, no lock)
+	// and the double-rollback guard is an EXISTS over the audit trail.
+	rxSelectLedgerByID = `SELECT player_id, transaction_type`
+	rxRollbackExists   = `SELECT EXISTS`
 )
 
 func walletRows(gc, scU, scR string) *pgxmock.Rows {
@@ -1010,24 +1014,25 @@ func TestProcessRollback_HappyPath_RestoresFunds(t *testing.T) {
 	// Wallet currently shows post-bet balance (0/0/70 after a 30 SC bet).
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("0.0000", "0.0000", "70.0000"))
-	// Lock original tx — found, COMPLETED BET.
-	mock.ExpectQuery(`SELECT player_id, transaction_type, status.*FOR UPDATE`).
+	// Read original tx header (append-only: no FOR UPDATE, no status column).
+	mock.ExpectQuery(rxSelectLedgerByID).
 		WithArgs(originalTxID).
-		WillReturnRows(pgxmock.NewRows([]string{"player_id", "transaction_type", "status"}).
-			AddRow(playerID, "BET", "COMPLETED"))
+		WillReturnRows(pgxmock.NewRows([]string{"player_id", "transaction_type"}).
+			AddRow(playerID, "BET"))
+	// APPEND-ONLY double-rollback guard: no prior ROLLBACK references this BET.
+	mock.ExpectQuery(rxRollbackExists).
+		WithArgs(originalTxID, operatorCode, "op-rb-1").
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(false))
 	// Fetch original player-wallet entries — single SC_REDEEMABLE debit of 30.
 	mock.ExpectQuery(`SELECT currency, direction, amount.*FROM ledger_entries`).
 		WithArgs(originalTxID).
 		WillReturnRows(pgxmock.NewRows([]string{"currency", "direction", "amount"}).
 			AddRow("SC_REDEEMABLE", "DEBIT", decimal.RequireFromString("30.0000")))
-	// UPDATE wallets: SC_REDEEMABLE restored to 100.
+	// UPDATE wallets: SC_REDEEMABLE restored to 100 (wallets is the cache, not the ledger).
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("0.0000"), dec("0.0000"), dec("100.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
-	// Flip original status.
-	mock.ExpectExec(`UPDATE ledger_transactions.*SET status = 'ROLLED_BACK'`).
-		WithArgs(originalTxID).
-		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	// NOTE: no UPDATE of ledger_transactions — the ledger is strictly append-only.
 	// INSERT rollback header.
 	mock.ExpectQuery(rxInsertLedgerTx).
 		WithArgs(operatorCode, "op-rb-1", playerID, "ROLLBACK", nil, nil, originalTxID, json.RawMessage("{}")).
@@ -1076,7 +1081,7 @@ func TestProcessRollback_OriginalNotFound(t *testing.T) {
 	mock.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("0.0000", "0.0000", "0.0000"))
-	mock.ExpectQuery(`SELECT player_id, transaction_type, status.*FOR UPDATE`).
+	mock.ExpectQuery(rxSelectLedgerByID).
 		WithArgs(originalTxID).
 		WillReturnError(pgx.ErrNoRows)
 	mock.ExpectRollback()
@@ -1099,10 +1104,16 @@ func TestProcessRollback_AlreadyRolledBack(t *testing.T) {
 	mock.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("100.0000", "0.0000", "0.0000"))
-	mock.ExpectQuery(`SELECT player_id, transaction_type, status.*FOR UPDATE`).
+	// Original is a valid BET...
+	mock.ExpectQuery(rxSelectLedgerByID).
 		WithArgs(originalTxID).
-		WillReturnRows(pgxmock.NewRows([]string{"player_id", "transaction_type", "status"}).
-			AddRow(playerID, "BET", "ROLLED_BACK"))
+		WillReturnRows(pgxmock.NewRows([]string{"player_id", "transaction_type"}).
+			AddRow(playerID, "BET"))
+	// ...but a ROLLBACK already references it (detected via the append-only
+	// audit trail, NOT a mutated status flag).
+	mock.ExpectQuery(rxRollbackExists).
+		WithArgs(originalTxID, operatorCode, "op-rb-3").
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
 	mock.ExpectRollback()
 
 	_, err := e.ProcessRollback(context.Background(), RollbackRequest{
@@ -1123,10 +1134,11 @@ func TestProcessRollback_WinIsUnsupported(t *testing.T) {
 	mock.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("100.0000", "0.0000", "0.0000"))
-	mock.ExpectQuery(`SELECT player_id, transaction_type, status.*FOR UPDATE`).
+	// Original is a WIN — rejected before the double-rollback guard runs.
+	mock.ExpectQuery(rxSelectLedgerByID).
 		WithArgs(originalTxID).
-		WillReturnRows(pgxmock.NewRows([]string{"player_id", "transaction_type", "status"}).
-			AddRow(playerID, "WIN", "COMPLETED"))
+		WillReturnRows(pgxmock.NewRows([]string{"player_id", "transaction_type"}).
+			AddRow(playerID, "WIN"))
 	mock.ExpectRollback()
 
 	_, err := e.ProcessRollback(context.Background(), RollbackRequest{
@@ -1148,10 +1160,11 @@ func TestProcessRollback_PlayerMismatch(t *testing.T) {
 	mock.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerA).
 		WillReturnRows(walletRows("100.0000", "0.0000", "0.0000"))
-	mock.ExpectQuery(`SELECT player_id, transaction_type, status.*FOR UPDATE`).
+	// Original belongs to a different player — rejected before the guard runs.
+	mock.ExpectQuery(rxSelectLedgerByID).
 		WithArgs(originalTxID).
-		WillReturnRows(pgxmock.NewRows([]string{"player_id", "transaction_type", "status"}).
-			AddRow(playerB, "BET", "COMPLETED"))
+		WillReturnRows(pgxmock.NewRows([]string{"player_id", "transaction_type"}).
+			AddRow(playerB, "BET"))
 	mock.ExpectRollback()
 
 	_, err := e.ProcessRollback(context.Background(), RollbackRequest{
@@ -1160,6 +1173,67 @@ func TestProcessRollback_PlayerMismatch(t *testing.T) {
 	})
 	if !errors.Is(err, errs.ErrTransactionConflict) {
 		t.Fatalf("got %v, want wrapping ErrTransactionConflict", err)
+	}
+}
+
+// A retry of the SAME rollback (same operator_transaction_id) after the Redis
+// cache was lost must NOT be misreported as ErrRollbackAlready. The append-only
+// guard excludes our own anchor, the flow reaches the dedup INSERT, hits 23505,
+// and Ghost-Spin recovery replays the original success — true idempotency.
+func TestProcessRollback_SameOpTxRetry_GhostRecovers(t *testing.T) {
+	t.Parallel()
+	e, mock, idem := newEngine(t)
+	playerID := uuid.New()
+	originalTxID := uuid.New()
+	committedRollbackID := uuid.New()
+
+	mock.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
+		WillReturnRows(walletRows("0.0000", "0.0000", "70.0000"))
+	mock.ExpectQuery(rxSelectLedgerByID).WithArgs(originalTxID).
+		WillReturnRows(pgxmock.NewRows([]string{"player_id", "transaction_type"}).
+			AddRow(playerID, "BET"))
+	// Guard EXCLUDES our own (op-rb-retry) anchor → no "other" rollback exists.
+	mock.ExpectQuery(rxRollbackExists).
+		WithArgs(originalTxID, operatorCode, "op-rb-retry").
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectQuery(`SELECT currency, direction, amount.*FROM ledger_entries`).
+		WithArgs(originalTxID).
+		WillReturnRows(pgxmock.NewRows([]string{"currency", "direction", "amount"}).
+			AddRow("SC_REDEEMABLE", "DEBIT", decimal.RequireFromString("30.0000")))
+	mock.ExpectExec(rxUpdateWallet).
+		WithArgs(dec("0.0000"), dec("0.0000"), dec("100.0000"), playerID).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectQuery(rxInsertLedgerTx).
+		WithArgs(operatorCode, "op-rb-retry", playerID, "ROLLBACK", nil, nil, originalTxID, json.RawMessage("{}")).
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(uuid.New()))
+	// The GLOBAL dedup anchor is what collides on the duplicate rollback.
+	mock.ExpectExec(rxInsertDedup).
+		WithArgs(operatorCode, "op-rb-retry", pgxmock.AnyArg()).
+		WillReturnError(&pgconn.PgError{Code: pgerrcode.UniqueViolation, ConstraintName: "ledger_transaction_dedup_pkey"})
+	mock.ExpectRollback()
+	// Ghost recovery: find the committed rollback + read current balances.
+	mock.ExpectQuery(rxSelectLedgerByOp).WithArgs(operatorCode, "op-rb-retry").
+		WillReturnRows(pgxmock.NewRows([]string{"id", "player_id", "transaction_type"}).
+			AddRow(committedRollbackID, playerID, "ROLLBACK"))
+	mock.ExpectQuery(rxSelectBalances).WithArgs(playerID).
+		WillReturnRows(walletRows("0.0000", "0.0000", "100.0000"))
+
+	got, err := e.ProcessRollback(context.Background(), RollbackRequest{
+		OperatorCode: operatorCode, OperatorTransactionID: "op-rb-retry",
+		PlayerID: playerID, ReferenceTransactionID: originalTxID,
+	})
+	if err != nil {
+		t.Fatalf("ProcessRollback: %v", err)
+	}
+	if got.Status != StatusGhostRecovered {
+		t.Errorf("Status: got %v want %v", got.Status, StatusGhostRecovered)
+	}
+	if got.LedgerTransactionID != committedRollbackID {
+		t.Errorf("LedgerTransactionID: got %v want %v", got.LedgerTransactionID, committedRollbackID)
+	}
+	if _, ok := idem.stored[idempotencyKey(operatorCode, "op-rb-retry")]; !ok {
+		t.Error("ghost recovery must cache the response")
 	}
 }
 

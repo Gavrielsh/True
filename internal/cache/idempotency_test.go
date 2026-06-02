@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -208,6 +209,79 @@ func TestAcquire_FailClosed_OnRedisDown(t *testing.T) {
 	}
 	if !errors.Is(err, err) { // sanity check; wrapping kept
 		t.Errorf("error should be wrapped")
+	}
+}
+
+// Atomicity proof: with the single-script Acquire, N concurrent callers on the
+// same key yield EXACTLY ONE StatusAcquired; the rest see StatusPending. There
+// is no interleaving window for two callers to both "win" the PROCESSING claim.
+func TestAcquire_AtomicUnderConcurrency(t *testing.T) {
+	t.Parallel()
+	s, _, _ := newStore(t)
+	ctx := context.Background()
+	const n = 64
+
+	var (
+		mu       sync.Mutex
+		acquired int
+		pending  int
+		failed   int
+		wg       sync.WaitGroup
+	)
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			st, _, err := s.Acquire(ctx, "concurrent-key")
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err != nil:
+				failed++
+			case st == StatusAcquired:
+				acquired++
+			case st == StatusPending:
+				pending++
+			}
+		}()
+	}
+	wg.Wait()
+
+	if failed != 0 {
+		t.Fatalf("unexpected Acquire errors: %d", failed)
+	}
+	if acquired != 1 {
+		t.Fatalf("exactly one winner expected: got acquired=%d pending=%d", acquired, pending)
+	}
+	if pending != n-1 {
+		t.Errorf("losers must all be Pending: got pending=%d want %d", pending, n-1)
+	}
+}
+
+// The Lua script must round-trip an arbitrary cached payload verbatim (it is
+// returned as the second table element, not re-encoded).
+func TestAcquire_ReturnsCachedPayloadVerbatim(t *testing.T) {
+	t.Parallel()
+	s, _, _ := newStore(t)
+	ctx := context.Background()
+	key := "payload-key"
+
+	if _, _, err := s.Acquire(ctx, key); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	payload := `{"status":"PROCESSED","amount":"12.3400","nested":{"k":"v,;:"}}`
+	if err := s.Store(ctx, key, payload); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	st, got, err := s.Acquire(ctx, key)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if st != StatusCached {
+		t.Fatalf("status: got %v want %v", st, StatusCached)
+	}
+	if got != payload {
+		t.Errorf("payload not verbatim:\n got %q\nwant %q", got, payload)
 	}
 }
 

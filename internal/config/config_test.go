@@ -95,8 +95,20 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.ShutdownTimeout != 30*time.Second {
 		t.Errorf("ShutdownTimeout default: got %s", cfg.ShutdownTimeout)
 	}
-	if cfg.MaxDBConns <= 0 {
-		t.Errorf("MaxDBConns must default positive, got %d", cfg.MaxDBConns)
+	if cfg.DB.MaxConns <= 0 {
+		t.Errorf("DB.MaxConns must default positive, got %d", cfg.DB.MaxConns)
+	}
+	if cfg.DB.MinConns <= 0 || cfg.DB.MinConns > cfg.DB.MaxConns {
+		t.Errorf("DB.MinConns must default into (0, MaxConns]: got %d (max %d)", cfg.DB.MinConns, cfg.DB.MaxConns)
+	}
+	if cfg.DB.MaxConnIdleTime != 30*time.Minute {
+		t.Errorf("DB.MaxConnIdleTime default: got %s want 30m", cfg.DB.MaxConnIdleTime)
+	}
+	if cfg.DB.MaxConnLifetime != time.Hour {
+		t.Errorf("DB.MaxConnLifetime default: got %s want 1h", cfg.DB.MaxConnLifetime)
+	}
+	if cfg.DB.HealthCheckPeriod != time.Minute {
+		t.Errorf("DB.HealthCheckPeriod default: got %s want 1m", cfg.DB.HealthCheckPeriod)
 	}
 	if cfg.OperatorSecrets["OP1"] != "secret" {
 		t.Errorf("secret not loaded: %v", cfg.OperatorSecrets)
@@ -108,7 +120,11 @@ func TestLoad_Overrides(t *testing.T) {
 	t.Setenv("PORT", "9000")
 	t.Setenv("LOG_LEVEL", "debug")
 	t.Setenv("SHUTDOWN_TIMEOUT", "5s")
-	t.Setenv("MAX_DB_CONNS", "42")
+	t.Setenv("DB_MAX_CONNS", "42")
+	t.Setenv("DB_MIN_CONNS", "8")
+	t.Setenv("DB_MAX_CONN_IDLE_TIME", "90s")
+	t.Setenv("DB_MAX_CONN_LIFETIME", "2h")
+	t.Setenv("DB_HEALTH_CHECK_PERIOD", "30s")
 
 	cfg, err := Load()
 	if err != nil {
@@ -120,8 +136,61 @@ func TestLoad_Overrides(t *testing.T) {
 	if cfg.ShutdownTimeout != 5*time.Second {
 		t.Errorf("ShutdownTimeout: got %s want 5s", cfg.ShutdownTimeout)
 	}
-	if cfg.MaxDBConns != 42 {
-		t.Errorf("MaxDBConns: got %d want 42", cfg.MaxDBConns)
+	if cfg.DB.MaxConns != 42 {
+		t.Errorf("DB.MaxConns: got %d want 42", cfg.DB.MaxConns)
+	}
+	if cfg.DB.MinConns != 8 {
+		t.Errorf("DB.MinConns: got %d want 8", cfg.DB.MinConns)
+	}
+	if cfg.DB.MaxConnIdleTime != 90*time.Second {
+		t.Errorf("DB.MaxConnIdleTime: got %s want 90s", cfg.DB.MaxConnIdleTime)
+	}
+	if cfg.DB.MaxConnLifetime != 2*time.Hour {
+		t.Errorf("DB.MaxConnLifetime: got %s want 2h", cfg.DB.MaxConnLifetime)
+	}
+	if cfg.DB.HealthCheckPeriod != 30*time.Second {
+		t.Errorf("DB.HealthCheckPeriod: got %s want 30s", cfg.DB.HealthCheckPeriod)
+	}
+}
+
+// The legacy MAX_DB_CONNS name remains a fallback for DB_MAX_CONNS so existing
+// deploys keep working; DB_MAX_CONNS wins when both are set.
+func TestLoad_LegacyMaxDBConnsAlias(t *testing.T) {
+	t.Run("legacy_only", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("MAX_DB_CONNS", "17")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.DB.MaxConns != 17 {
+			t.Errorf("DB.MaxConns from legacy alias: got %d want 17", cfg.DB.MaxConns)
+		}
+	})
+	t.Run("new_wins_over_legacy", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("MAX_DB_CONNS", "17")
+		t.Setenv("DB_MAX_CONNS", "33")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.DB.MaxConns != 33 {
+			t.Errorf("DB_MAX_CONNS must win: got %d want 33", cfg.DB.MaxConns)
+		}
+	})
+}
+
+// MinConns may legitimately be 0 (no warm floor); the loader must accept it.
+func TestLoad_MinConnsZeroAllowed(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("DB_MIN_CONNS", "0")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.DB.MinConns != 0 {
+		t.Errorf("DB.MinConns: got %d want 0", cfg.DB.MinConns)
 	}
 }
 
@@ -150,8 +219,12 @@ func TestLoad_MalformedValues(t *testing.T) {
 	}{
 		{"bad_duration", "SHUTDOWN_TIMEOUT", "not-a-duration"},
 		{"zero_duration", "HTTP_READ_TIMEOUT", "0s"},
-		{"bad_int", "MAX_DB_CONNS", "abc"},
-		{"negative_int", "MAX_DB_CONNS", "-3"},
+		{"bad_int", "DB_MAX_CONNS", "abc"},
+		{"negative_int", "DB_MAX_CONNS", "-3"},
+		{"zero_max_conns", "DB_MAX_CONNS", "0"},
+		{"negative_min_conns", "DB_MIN_CONNS", "-1"},
+		{"bad_idle_duration", "DB_MAX_CONN_IDLE_TIME", "nope"},
+		{"bad_lifetime_duration", "DB_MAX_CONN_LIFETIME", "5"},
 		{"bad_secrets", "OPERATOR_SECRETS", "no-colon-here"},
 	}
 	for _, tc := range cases {
@@ -165,13 +238,28 @@ func TestLoad_MalformedValues(t *testing.T) {
 	}
 }
 
+// MinConns must not exceed MaxConns — a contradictory pool sizing must fail
+// fast at boot, never silently clamp.
+func TestLoad_MinConnsExceedsMaxConns(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("DB_MAX_CONNS", "4")
+	t.Setenv("DB_MIN_CONNS", "9")
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error when DB_MIN_CONNS > DB_MAX_CONNS")
+	}
+	if !strings.Contains(err.Error(), "DB_MIN_CONNS") {
+		t.Errorf("error should name DB_MIN_CONNS: %v", err)
+	}
+}
+
 func TestConfig_LogValueHidesSecrets(t *testing.T) {
 	cfg := Config{
 		Port:            "8080",
 		PostgresURL:     "postgres://user:SUPERSECRET@host/db",
 		RedisURL:        "redis://:REDISPASS@host:6379",
 		OperatorSecrets: map[string]string{"OP1": "HMACSECRET"},
-		MaxDBConns:      9,
+		DB:              DBConfig{MaxConns: 9, MinConns: 2, MaxConnIdleTime: 30 * time.Minute, MaxConnLifetime: time.Hour},
 		ShutdownTimeout: 30 * time.Second,
 	}
 	rendered := cfg.LogValue().String()
