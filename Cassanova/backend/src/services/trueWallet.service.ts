@@ -1,7 +1,13 @@
 /**
  * TrueWalletService — HMAC-signed HTTP client for the True transaction engine.
  *
- * Every call includes:
+ * AMOUNT CONVENTION (Directive 4 — Integer-Cents Architecture):
+ *   All monetary amounts are passed as integer cents (e.g. 150 = $1.50).
+ *   centsToWire() converts to the 4-decimal string required by the True Engine
+ *   using pure integer arithmetic — no floating-point division that could
+ *   produce 1.5099999... instead of "1.5100".
+ *
+ * Every outbound call includes:
  *   X-Operator-Code  — identifies Cassanova as the operator
  *   X-Signature      — HMAC-SHA256(raw_body, secret) as hex
  *   X-Timestamp      — unix seconds (True rejects if >5 min old)
@@ -18,7 +24,7 @@ const TRUE_OPERATOR_SECRET =
   process.env.TRUE_OPERATOR_SECRET || 'dev-secret-change-me';
 
 // ────────────────────────────────────────────────────────────────────────────
-// Error type so callers can distinguish True domain errors (e.g. insufficient
+// Error type — lets callers distinguish True domain errors (e.g. insufficient
 // funds) from unexpected network / server failures.
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -32,6 +38,24 @@ export class TrueEngineError extends Error {
     this.trueCode = trueCode;
     this.httpStatus = httpStatus;
   }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Integer-cents → 4-decimal wire format (Directive 4).
+//
+// Uses integer arithmetic only — no floating-point division.
+//   centsToWire(150)  → "1.5000"
+//   centsToWire(151)  → "1.5100"
+//   centsToWire(10000) → "100.0000"
+// ────────────────────────────────────────────────────────────────────────────
+
+function centsToWire(cents: number): string {
+  if (!Number.isInteger(cents) || cents < 0) {
+    throw new Error(`Amount must be a non-negative integer (cents), got: ${cents}`);
+  }
+  const major = Math.floor(cents / 100);
+  const minor = cents % 100;
+  return `${major}.${minor.toString().padStart(2, '0')}00`;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -113,26 +137,32 @@ export const trueWallet = {
   getBalances: (playerId: string) =>
     call('GET', `/api/v1/session?player_id=${playerId}`),
 
-  /** Credit the player's GC (real money) or SC_UNPLAYED (promo) wallet. */
+  /**
+   * Credit the player's GC (real money) or SC_UNPLAYED (promo) wallet.
+   * @param amountCents - Integer cents (e.g. 5000 = $50.00)
+   */
   deposit: (
     operatorTxId: string,
     playerId: string,
     currency: 'GC' | 'SC',
-    amount: number,
+    amountCents: number,
   ) =>
     call('POST', '/api/v1/deposit', {
       operator_transaction_id: operatorTxId,
       player_id: playerId,
       currency,
-      amount: amount.toFixed(4),
+      amount: centsToWire(amountCents),
     }),
 
-  /** Debit a bet from GC or SC wallet. Returns the True TxResult. */
+  /**
+   * Debit a bet from GC or SC wallet. Returns the True TxResult.
+   * @param amountCents - Integer cents (e.g. 150 = $1.50)
+   */
   bet: (
     operatorTxId: string,
     playerId: string,
     currency: 'GC' | 'SC',
-    amount: number,
+    amountCents: number,
     gameId: string,
     roundId: string,
   ) =>
@@ -140,17 +170,20 @@ export const trueWallet = {
       operator_transaction_id: operatorTxId,
       player_id: playerId,
       currency,
-      amount: amount.toFixed(4),
+      amount: centsToWire(amountCents),
       game_id: gameId,
       round_id: roundId,
     }),
 
-  /** Credit a win to the GC or SC_REDEEMABLE wallet. */
+  /**
+   * Credit a win to the GC or SC_REDEEMABLE wallet.
+   * @param amountCents - Integer cents (e.g. 375 = $3.75)
+   */
   win: (
     operatorTxId: string,
     playerId: string,
     currency: 'GC' | 'SC',
-    amount: number,
+    amountCents: number,
     gameId: string,
     roundId: string,
     referenceTxId: string,
@@ -159,7 +192,7 @@ export const trueWallet = {
       operator_transaction_id: operatorTxId,
       player_id: playerId,
       currency,
-      amount: amount.toFixed(4),
+      amount: centsToWire(amountCents),
       game_id: gameId,
       round_id: roundId,
       reference_transaction_id: referenceTxId || undefined,

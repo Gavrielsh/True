@@ -11,6 +11,11 @@ import promotionRoutes from './routes/promotion.routes';
 import transactionRoutes from './routes/transaction.routes';
 import walletRoutes from './routes/wallet.routes';
 
+// Directive 2 — Start the win-credit worker.
+// In production, run this in a separate process / pod so it survives
+// API server restarts independently. For development we co-locate it here.
+import { startWinWorker } from './workers/win.worker';
+
 dotenv.config();
 
 const app: Application = express();
@@ -40,6 +45,8 @@ mongoose
   .connect(MONGODB_URI)
   .then(() => {
     console.log('Connected to MongoDB');
+    startWinWorker();
+    console.log('Win credit worker started');
     app.listen(PORT, () => {
       console.log(`Server is running on port ${PORT}`);
     });

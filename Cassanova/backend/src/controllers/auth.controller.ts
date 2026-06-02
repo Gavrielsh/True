@@ -121,8 +121,6 @@ export const login = async (req: Request, res: Response) => {
         id: user._id,
         username: user.username,
         email: user.email,
-        balance: user.balance,
-        bonusBalance: user.bonusBalance,
         vipLevel: user.vipLevel,
         twoFactorEnabled: user.twoFactorEnabled,
       },
