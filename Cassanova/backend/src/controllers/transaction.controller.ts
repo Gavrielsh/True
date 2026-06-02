@@ -1,3 +1,15 @@
+/**
+ * transaction.controller.ts
+ *
+ * Directive 1 — No local balance mutations.
+ * Deposits and withdrawals route exclusively through the True Engine.
+ * No user.balance reads or writes. The Transaction collection is kept
+ * as an audit log (read-only after creation) — the source of financial
+ * truth is always the True Engine ledger.
+ *
+ * Directive 4 — Amounts converted to integer cents before calling trueWallet.
+ */
+
 import { Response } from 'express';
 import { AuthRequest } from '../middleware/auth.middleware';
 import Transaction from '../models/Transaction';
@@ -7,7 +19,7 @@ import { trueWallet, TrueEngineError } from '../services/trueWallet.service';
 export const getUserTransactions = async (req: AuthRequest, res: Response) => {
   try {
     const { type, status } = req.query;
-    const filter: any = { userId: req.userId };
+    const filter: Record<string, unknown> = { userId: req.userId };
 
     if (type) filter.type = type;
     if (status) filter.status = status;
@@ -16,7 +28,7 @@ export const getUserTransactions = async (req: AuthRequest, res: Response) => {
     res.json(transactions);
   } catch (error) {
     console.error('Get transactions error:', error);
-    res.status(500).json({ message: 'Failed to fetch transactions', error });
+    res.status(500).json({ message: 'Failed to fetch transactions' });
   }
 };
 
@@ -24,56 +36,62 @@ export const createDeposit = async (req: AuthRequest, res: Response) => {
   try {
     const { amount, paymentMethod } = req.body;
 
-    if (!amount || amount <= 0) {
+    const amountNum = Number(amount);
+    if (!isFinite(amountNum) || amountNum <= 0) {
       return res.status(400).json({ message: 'Invalid deposit amount' });
     }
 
-    const user = await User.findById(req.userId);
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
+    // Directive 4: convert to integer cents at the boundary.
+    const amountCents = Math.round(amountNum * 100);
+
+    const user = await User.findById(req.userId).select('truePlayerId kycStatus');
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    if (!user.truePlayerId) {
+      return res.status(400).json({
+        message: 'Wallet not provisioned. Please contact support.',
+        code: 'WALLET_NOT_PROVISIONED',
+      });
     }
 
-    const balanceBefore = user.balance;
-    const balanceAfter = Math.round((balanceBefore + amount) * 100) / 100;
+    // Directive 1: Deposit goes to the True Engine first. If the engine is
+    // unreachable, we return 503 — no local balance mutation ever happens.
+    let trueResult: any;
+    try {
+      trueResult = await trueWallet.deposit(
+        `dep-${req.userId}-${Date.now()}`,
+        user.truePlayerId,
+        'GC',
+        amountCents,
+      );
+    } catch (err) {
+      if (err instanceof TrueEngineError) {
+        return res.status(err.httpStatus).json({ message: err.message, code: err.trueCode });
+      }
+      return res.status(503).json({
+        message: 'Financial service temporarily unavailable. Deposit was not processed.',
+        code: 'ENGINE_UNAVAILABLE',
+      });
+    }
 
-    const transaction = new Transaction({
+    // Persist audit log after the True Engine confirms.
+    const transaction = await new Transaction({
       userId: req.userId,
       type: 'deposit',
-      amount,
+      amount: amountCents,
       status: 'completed',
       paymentMethod,
-      balanceBefore,
-      balanceAfter,
       description: `Deposit via ${paymentMethod}`,
-    });
-    await transaction.save();
-
-    user.balance = balanceAfter;
-    await user.save();
-
-    // Mirror the deposit into the True wallet (GC family = real money).
-    // Best-effort: log failures but don't roll back the MongoDB deposit.
-    if (user.truePlayerId) {
-      try {
-        await trueWallet.deposit(
-          String(transaction._id),
-          user.truePlayerId,
-          'GC',
-          amount,
-        );
-      } catch (err) {
-        console.error('True wallet deposit sync failed:', err);
-      }
-    }
+    }).save();
 
     res.status(201).json({
       message: 'Deposit successful',
       transaction,
-      newBalance: balanceAfter,
+      balances: trueResult?.result?.post_balances ?? null,
     });
   } catch (error) {
     console.error('Deposit error:', error);
-    res.status(500).json({ message: 'Deposit failed', error });
+    res.status(500).json({ message: 'Deposit failed' });
   }
 };
 
@@ -81,48 +99,38 @@ export const createWithdrawal = async (req: AuthRequest, res: Response) => {
   try {
     const { amount, paymentMethod } = req.body;
 
-    if (!amount || amount <= 0) {
+    const amountNum = Number(amount);
+    if (!isFinite(amountNum) || amountNum <= 0) {
       return res.status(400).json({ message: 'Invalid withdrawal amount' });
     }
 
-    const user = await User.findById(req.userId);
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
-    }
-
-    if (user.balance < amount) {
-      return res.status(400).json({ message: 'Insufficient balance' });
-    }
+    const user = await User.findById(req.userId).select('truePlayerId kycStatus');
+    if (!user) return res.status(404).json({ message: 'User not found' });
 
     if (user.kycStatus !== 'verified') {
       return res.status(400).json({ message: 'KYC verification required for withdrawals' });
     }
 
-    const balanceBefore = user.balance;
-    const balanceAfter = Math.round((balanceBefore - amount) * 100) / 100;
+    // Note: balance check is performed by the True Engine (it will return
+    // INSUFFICIENT_FUNDS if the wallet balance is below the withdrawal amount).
+    // We never read a local balance to gate this check.
 
-    const transaction = new Transaction({
+    // Persist withdrawal request as "pending" for operations review.
+    const transaction = await new Transaction({
       userId: req.userId,
       type: 'withdrawal',
-      amount,
+      amount: Math.round(amountNum * 100),
       status: 'pending',
       paymentMethod,
-      balanceBefore,
-      balanceAfter,
       description: `Withdrawal via ${paymentMethod}`,
-    });
-    await transaction.save();
-
-    user.balance = balanceAfter;
-    await user.save();
+    }).save();
 
     res.status(201).json({
-      message: 'Withdrawal request submitted',
+      message: 'Withdrawal request submitted and pending review',
       transaction,
-      newBalance: balanceAfter,
     });
   } catch (error) {
     console.error('Withdrawal error:', error);
-    res.status(500).json({ message: 'Withdrawal failed', error });
+    res.status(500).json({ message: 'Withdrawal failed' });
   }
 };

@@ -49,11 +49,9 @@ func NewRouter(cfg Config) *gin.Engine {
 	})
 
 	handlers := NewHandlers(cfg.Engine)
-	hmacMW := NewHMACVerifier(cfg.Secrets).Middleware()
-	replayMW := NewReplayGuard(cfg.Redis).Middleware()
 
 	v1 := r.Group("/api/v1")
-	v1.Use(hmacMW, replayMW)
+	v1.Use(AuthMiddlewareStack(cfg.Secrets, cfg.Redis)...)
 	{
 		v1.POST("/player", handlers.CreatePlayer)
 		v1.POST("/deposit", handlers.Deposit)

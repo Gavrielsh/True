@@ -6,7 +6,11 @@ export interface IUser extends Document {
   password: string;
   firstName?: string;
   lastName?: string;
-  truePlayerId?: string; // UUID registered in the True transaction engine
+  /**
+   * UUID registered in the True Engine — the SOLE authoritative source for
+   * all financial balances. balance/bonusBalance no longer exist here.
+   */
+  truePlayerId?: string;
   dateOfBirth?: Date;
   address?: {
     street?: string;
@@ -15,8 +19,6 @@ export interface IUser extends Document {
     country?: string;
     zipCode?: string;
   };
-  balance: number;
-  bonusBalance: number;
   isVerified: boolean;
   verificationToken?: string;
   passwordResetToken?: string;
@@ -62,8 +64,6 @@ const UserSchema: Schema = new Schema(
       country: { type: String },
       zipCode: { type: String },
     },
-    balance: { type: Number, default: 0 },
-    bonusBalance: { type: Number, default: 0 },
     isVerified: { type: Boolean, default: false },
     verificationToken: { type: String },
     passwordResetToken: { type: String },
