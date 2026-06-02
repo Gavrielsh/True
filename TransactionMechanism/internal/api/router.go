@@ -59,6 +59,10 @@ func NewRouter(cfg Config) *gin.Engine {
 		v1.POST("/win", handlers.Win)
 		v1.POST("/rollback", handlers.Rollback)
 		v1.GET("/session", handlers.Session)
+		v1.GET("/transactions", handlers.Transactions)
+		v1.POST("/escrow/reserve", handlers.EscrowReserve)
+		v1.POST("/escrow/commit", handlers.EscrowCommit)
+		v1.POST("/escrow/release", handlers.EscrowRelease)
 	}
 
 	return r

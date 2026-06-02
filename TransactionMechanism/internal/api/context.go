@@ -11,6 +11,7 @@ import (
 type (
 	traceIDKey      struct{}
 	operatorCodeKey struct{}
+	requestHashKey  struct{}
 )
 
 const (
@@ -31,6 +32,13 @@ func withOperator(parent context.Context, v string) context.Context {
 	return context.WithValue(parent, operatorCodeKey{}, v)
 }
 
+// withRequestHash attaches the SHA-256 (hex) of the raw request body computed by
+// the HMAC middleware, so handlers can forward it to the engine's idempotency
+// barrier without re-reading the (already consumed) body.
+func withRequestHash(parent context.Context, v string) context.Context {
+	return context.WithValue(parent, requestHashKey{}, v)
+}
+
 // TraceIDFromContext is used by structured loggers (cursor rule §9) to pull
 // the trace_id out of any context.Context produced by this package.
 func TraceIDFromContext(ctx context.Context) string {
@@ -45,6 +53,17 @@ func TraceIDFromContext(ctx context.Context) string {
 // without trusting client-supplied operator fields.
 func OperatorCodeFromContext(ctx context.Context) string {
 	if v, ok := ctx.Value(operatorCodeKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// RequestHashFromContext extracts the raw-body SHA-256 (hex) stashed by the
+// HMAC middleware. Empty if the middleware did not run (e.g. unit tests that
+// mount handlers directly), in which case the engine simply records an empty
+// hash — two empty-hash requests still match, preserving idempotent replay.
+func RequestHashFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(requestHashKey{}).(string); ok {
 		return v
 	}
 	return ""

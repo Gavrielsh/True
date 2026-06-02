@@ -1,15 +1,26 @@
 import mongoose, { Schema, Document } from 'mongoose';
 
+/**
+ * Pillar 2 — Single Source of Truth.
+ *
+ * MongoDB is NO LONGER a copy of financial history. Completed deposits, bets,
+ * wins and escrow movements live exclusively in the True Engine ledger. This
+ * collection now persists only the OPS-WORKFLOW STATE of *pending manual
+ * withdrawals*: a row is created when funds are escrow-reserved in the engine,
+ * and it carries `trueEscrowTransactionId` so ops can later commit (pay out) or
+ * release (refund) the matching engine reservation.
+ *
+ * Balance columns are gone — balances are the engine's domain.
+ */
 export interface ITransaction extends Document {
   userId: mongoose.Types.ObjectId;
   type: 'deposit' | 'withdrawal' | 'bet' | 'win' | 'bonus';
-  amount: number;
+  amount: number; // integer cents
   status: 'pending' | 'completed' | 'failed' | 'cancelled';
   paymentMethod?: string;
-  transactionId?: string;
+  /** The True Engine escrow ledger_transaction_id this request reserved. */
+  trueEscrowTransactionId?: string;
   description?: string;
-  balanceBefore: number;
-  balanceAfter: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -17,23 +28,23 @@ export interface ITransaction extends Document {
 const TransactionSchema: Schema = new Schema(
   {
     userId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
-    type: { 
-      type: String, 
+    type: {
+      type: String,
       required: true,
-      enum: ['deposit', 'withdrawal', 'bet', 'win', 'bonus']
+      enum: ['deposit', 'withdrawal', 'bet', 'win', 'bonus'],
     },
-    amount: { type: Number, required: true },
-    status: { 
-      type: String, 
+    amount: { type: Number, required: true }, // integer cents
+    status: {
+      type: String,
       required: true,
       enum: ['pending', 'completed', 'failed', 'cancelled'],
-      default: 'pending'
+      default: 'pending',
     },
     paymentMethod: { type: String },
-    transactionId: { type: String },
+    // Links the pending withdrawal to its engine escrow reservation so ops can
+    // commit/release it. Unique (sparse) so we never double-record a reserve.
+    trueEscrowTransactionId: { type: String, index: true, unique: true, sparse: true },
     description: { type: String },
-    balanceBefore: { type: Number, required: true },
-    balanceAfter: { type: Number, required: true },
   },
   {
     timestamps: true,

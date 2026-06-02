@@ -42,6 +42,12 @@ func httpStatusFor(code errors.Code) int {
 		return http.StatusConflict
 	case errors.CodeRollbackUnsupported:
 		return http.StatusUnprocessableEntity
+	case errors.CodeIdempotencyMismatch:
+		return http.StatusConflict
+	case errors.CodeEscrowNotFound:
+		return http.StatusNotFound
+	case errors.CodeEscrowConflict:
+		return http.StatusConflict
 	default:
 		return http.StatusInternalServerError
 	}
@@ -103,6 +109,12 @@ func publicMessageFor(code errors.Code) string {
 		return "transaction already rolled back"
 	case errors.CodeRollbackUnsupported:
 		return "rollback not supported for this transaction type"
+	case errors.CodeIdempotencyMismatch:
+		return "idempotency key reused with a different request body"
+	case errors.CodeEscrowNotFound:
+		return "escrow reservation not found"
+	case errors.CodeEscrowConflict:
+		return "escrow reservation is not pending"
 	default:
 		return "internal error"
 	}

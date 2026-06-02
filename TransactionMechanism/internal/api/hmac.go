@@ -107,9 +107,18 @@ func (v *HMACVerifier) Middleware() gin.HandlerFunc {
 			return
 		}
 
-		// Trusted: stash the operator code for the handler.
+		// 5. Cryptographic idempotency input: a plain SHA-256 of the SAME raw
+		//    bytes. The engine stores it with the idempotency key and rejects a
+		//    reused operator_transaction_id whose body hash differs (e.g. a
+		//    retry that silently changed the amount). Computed here because this
+		//    is the only place that has buffered the raw body.
+		bodyDigest := sha256.Sum256(body)
+		requestHash := hex.EncodeToString(bodyDigest[:])
+
+		// Trusted: stash the operator code (and body hash) for the handler.
 		c.Set(ginKeyOperator, operator)
-		c.Request = c.Request.WithContext(withOperator(c.Request.Context(), operator))
+		c.Request = c.Request.WithContext(
+			withRequestHash(withOperator(c.Request.Context(), operator), requestHash))
 		c.Next()
 	}
 }

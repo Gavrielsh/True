@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -51,6 +52,7 @@ func (h *Handlers) Bet(c *gin.Context) {
 		GameID:                dto.GameID,
 		RoundID:               dto.RoundID,
 		Metadata:              dto.Metadata,
+		RequestHash:           RequestHashFromContext(c.Request.Context()),
 	})
 	if err != nil {
 		respondError(c, err)
@@ -101,6 +103,7 @@ func (h *Handlers) Win(c *gin.Context) {
 		RoundID:                dto.RoundID,
 		ReferenceTransactionID: reference,
 		Metadata:               dto.Metadata,
+		RequestHash:            RequestHashFromContext(c.Request.Context()),
 	})
 	if err != nil {
 		respondError(c, err)
@@ -133,6 +136,7 @@ func (h *Handlers) Rollback(c *gin.Context) {
 		PlayerID:               playerID,
 		ReferenceTransactionID: reference,
 		Metadata:               dto.Metadata,
+		RequestHash:            RequestHashFromContext(c.Request.Context()),
 	})
 	if err != nil {
 		respondError(c, err)
@@ -195,6 +199,7 @@ func (h *Handlers) Deposit(c *gin.Context) {
 		Currency:              family,
 		Amount:                amount,
 		Metadata:              dto.Metadata,
+		RequestHash:           RequestHashFromContext(c.Request.Context()),
 	})
 	if err != nil {
 		respondError(c, err)
@@ -226,6 +231,137 @@ func (h *Handlers) Session(c *gin.Context) {
 	})
 }
 
+// EscrowReserve handles POST /api/v1/escrow/reserve — locks SC_REDEEMABLE for a
+// pending withdrawal. The returned ledger_transaction_id is the
+// escrow_transaction_id the operator persists for later commit/release.
+func (h *Handlers) EscrowReserve(c *gin.Context) {
+	var dto escrowReserveRequestDTO
+	if err := c.ShouldBindJSON(&dto); err != nil {
+		respondErrorCode(c, http.StatusBadRequest, errors.CodeInvalidAmount, "invalid request body")
+		return
+	}
+
+	playerID, ok := parsePlayerID(c, dto.PlayerID)
+	if !ok {
+		return
+	}
+	amount, ok := parseAmount(c, dto.Amount)
+	if !ok {
+		return
+	}
+
+	result, err := h.engine.ProcessEscrowReserve(c.Request.Context(), repository.EscrowReserveRequest{
+		OperatorCode:          OperatorCodeFromContext(c.Request.Context()),
+		OperatorTransactionID: dto.OperatorTransactionID,
+		PlayerID:              playerID,
+		Amount:                amount,
+		Metadata:              dto.Metadata,
+		RequestHash:           RequestHashFromContext(c.Request.Context()),
+	})
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, successResponse{Code: errors.CodeOK, Result: result})
+}
+
+// EscrowCommit handles POST /api/v1/escrow/commit — finalises (burns) a reserve.
+func (h *Handlers) EscrowCommit(c *gin.Context) {
+	var dto escrowCommitRequestDTO
+	if err := c.ShouldBindJSON(&dto); err != nil {
+		respondErrorCode(c, http.StatusBadRequest, errors.CodeInvalidAmount, "invalid request body")
+		return
+	}
+
+	playerID, ok := parsePlayerID(c, dto.PlayerID)
+	if !ok {
+		return
+	}
+	escrowID, ok := parseEscrowID(c, dto.EscrowTransactionID)
+	if !ok {
+		return
+	}
+
+	result, err := h.engine.ProcessEscrowCommit(c.Request.Context(), repository.EscrowCommitRequest{
+		OperatorCode:          OperatorCodeFromContext(c.Request.Context()),
+		OperatorTransactionID: dto.OperatorTransactionID,
+		PlayerID:              playerID,
+		EscrowTransactionID:   escrowID,
+		Metadata:              dto.Metadata,
+		RequestHash:           RequestHashFromContext(c.Request.Context()),
+	})
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, successResponse{Code: errors.CodeOK, Result: result})
+}
+
+// EscrowRelease handles POST /api/v1/escrow/release — returns a reserve to the
+// player (rejected withdrawal).
+func (h *Handlers) EscrowRelease(c *gin.Context) {
+	var dto escrowReleaseRequestDTO
+	if err := c.ShouldBindJSON(&dto); err != nil {
+		respondErrorCode(c, http.StatusBadRequest, errors.CodeInvalidAmount, "invalid request body")
+		return
+	}
+
+	playerID, ok := parsePlayerID(c, dto.PlayerID)
+	if !ok {
+		return
+	}
+	escrowID, ok := parseEscrowID(c, dto.EscrowTransactionID)
+	if !ok {
+		return
+	}
+
+	result, err := h.engine.ProcessEscrowRelease(c.Request.Context(), repository.EscrowReleaseRequest{
+		OperatorCode:          OperatorCodeFromContext(c.Request.Context()),
+		OperatorTransactionID: dto.OperatorTransactionID,
+		PlayerID:              playerID,
+		EscrowTransactionID:   escrowID,
+		Metadata:              dto.Metadata,
+		RequestHash:           RequestHashFromContext(c.Request.Context()),
+	})
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, successResponse{Code: errors.CodeOK, Result: result})
+}
+
+// Transactions handles GET /api/v1/transactions?player_id=<uuid>&type=&status=&limit=
+// returning the player's ledger history — the financial source of truth.
+func (h *Handlers) Transactions(c *gin.Context) {
+	playerID, ok := parsePlayerID(c, c.Query("player_id"))
+	if !ok {
+		return
+	}
+
+	limit := 50
+	if raw := c.Query("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			limit = n
+		}
+	}
+
+	txns, err := h.engine.ListTransactions(c.Request.Context(), repository.ListTransactionsRequest{
+		PlayerID:        playerID,
+		Limit:           limit,
+		TransactionType: c.Query("type"),
+		Status:          c.Query("status"),
+	})
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, transactionsResponse{
+		Code:         errors.CodeOK,
+		PlayerID:     playerID.String(),
+		Transactions: txns,
+	})
+}
+
 // ----------------------------------------------------------------------------
 // Shared field parsers. Each writes the error response itself and returns
 // ok=false so the caller just `return`s — keeps the handlers flat.
@@ -239,6 +375,15 @@ func parsePlayerID(c *gin.Context, raw string) (uuid.UUID, bool) {
 	id, err := uuid.Parse(raw)
 	if err != nil {
 		respondErrorCode(c, http.StatusBadRequest, errors.CodeInvalidAmount, "invalid player_id")
+		return uuid.Nil, false
+	}
+	return id, true
+}
+
+func parseEscrowID(c *gin.Context, raw string) (uuid.UUID, bool) {
+	id, err := uuid.Parse(raw)
+	if err != nil {
+		respondErrorCode(c, http.StatusBadRequest, errors.CodeInvalidAmount, "invalid escrow_transaction_id")
 		return uuid.Nil, false
 	}
 	return id, true

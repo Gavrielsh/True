@@ -197,4 +197,74 @@ export const trueWallet = {
       round_id: roundId,
       reference_transaction_id: referenceTxId || undefined,
     }),
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Escrow (withdrawal lock) — Pillar 1.
+  //
+  // A withdrawal RESERVES SC_REDEEMABLE in the engine (deducting it from the
+  // player's wallet into HOUSE_ESCROW_POOL) so the funds cannot be re-gambled
+  // while the request is pending. Ops later COMMIT (pay out / burn) or RELEASE
+  // (refund). The engine draws strictly from SC_REDEEMABLE — only redeemable
+  // sweepstakes coins are withdrawable.
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Lock SC_REDEEMABLE for a pending withdrawal. The returned
+   * result.ledger_transaction_id is the escrow_transaction_id to persist and
+   * later commit/release.
+   * @param amountCents - Integer cents (e.g. 5000 = $50.00)
+   */
+  escrowReserve: (
+    operatorTxId: string,
+    playerId: string,
+    amountCents: number,
+  ) =>
+    call('POST', '/api/v1/escrow/reserve', {
+      operator_transaction_id: operatorTxId,
+      player_id: playerId,
+      amount: centsToWire(amountCents),
+    }),
+
+  /** Finalise (burn) a reserved withdrawal after ops approval. */
+  escrowCommit: (
+    operatorTxId: string,
+    playerId: string,
+    escrowTransactionId: string,
+  ) =>
+    call('POST', '/api/v1/escrow/commit', {
+      operator_transaction_id: operatorTxId,
+      player_id: playerId,
+      escrow_transaction_id: escrowTransactionId,
+    }),
+
+  /** Reverse a reserved withdrawal (refund to the player) after ops rejection. */
+  escrowRelease: (
+    operatorTxId: string,
+    playerId: string,
+    escrowTransactionId: string,
+  ) =>
+    call('POST', '/api/v1/escrow/release', {
+      operator_transaction_id: operatorTxId,
+      player_id: playerId,
+      escrow_transaction_id: escrowTransactionId,
+    }),
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Transaction history (Pillar 2) — the engine ledger is the source of truth.
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Fetch a player's most recent ledger transactions from the engine. Optional
+   * exact filters on type/status, and a page-size limit (engine caps at 100).
+   */
+  getTransactions: (
+    playerId: string,
+    opts: { type?: string; status?: string; limit?: number } = {},
+  ) => {
+    const params = new URLSearchParams({ player_id: playerId });
+    if (opts.type) params.set('type', opts.type);
+    if (opts.status) params.set('status', opts.status);
+    if (opts.limit) params.set('limit', String(opts.limit));
+    return call('GET', `/api/v1/transactions?${params.toString()}`);
+  },
 };

@@ -23,6 +23,20 @@ var (
 	ErrRollbackNotFound    = stderrors.New("rollback target not found")
 	ErrRollbackAlready     = stderrors.New("transaction already rolled back")
 	ErrRollbackUnsupported = stderrors.New("rollback not supported for this transaction type")
+
+	// ErrIdempotencyMismatch is returned when a retried operator_transaction_id
+	// arrives with a request body whose SHA-256 differs from the body of the
+	// original attempt. Replaying the cached success would be unsafe (the
+	// operator changed the amount/payload under a reused id), so we fail closed.
+	ErrIdempotencyMismatch = stderrors.New("idempotency key reused with a different request body")
+
+	// ErrEscrowNotFound is returned when an escrow commit/release references an
+	// escrow_transaction_id that does not exist.
+	ErrEscrowNotFound = stderrors.New("escrow reservation not found")
+	// ErrEscrowConflict is returned when an escrow reservation cannot be
+	// committed or released because it is not in the PENDING state (already
+	// committed, already released, or not an escrow reservation at all).
+	ErrEscrowConflict = stderrors.New("escrow reservation is not pending")
 )
 
 // Code is the stable identifier surfaced to operators (e.g. in webhook
@@ -42,6 +56,9 @@ const (
 	CodeRollbackNotFound    Code = "ROLLBACK_NOT_FOUND"
 	CodeRollbackAlready     Code = "ROLLBACK_ALREADY"
 	CodeRollbackUnsupported Code = "ROLLBACK_UNSUPPORTED"
+	CodeIdempotencyMismatch Code = "IDEMPOTENCY_MISMATCH"
+	CodeEscrowNotFound      Code = "ESCROW_NOT_FOUND"
+	CodeEscrowConflict      Code = "ESCROW_CONFLICT"
 	CodeInternal            Code = "INTERNAL_ERROR"
 )
 
@@ -71,6 +88,12 @@ func CodeFor(err error) Code {
 		return CodeRollbackAlready
 	case stderrors.Is(err, ErrRollbackUnsupported):
 		return CodeRollbackUnsupported
+	case stderrors.Is(err, ErrIdempotencyMismatch):
+		return CodeIdempotencyMismatch
+	case stderrors.Is(err, ErrEscrowNotFound):
+		return CodeEscrowNotFound
+	case stderrors.Is(err, ErrEscrowConflict):
+		return CodeEscrowConflict
 	default:
 		return CodeInternal
 	}

@@ -89,3 +89,37 @@ type depositRequestDTO struct {
 	Amount                string          `json:"amount"                  binding:"required"`
 	Metadata              json.RawMessage `json:"metadata,omitempty"`
 }
+
+// escrowReserveRequestDTO is the wire format for POST /api/v1/escrow/reserve.
+// Amount is a 4-decimal JSON string; the engine draws it from SC_REDEEMABLE.
+type escrowReserveRequestDTO struct {
+	OperatorTransactionID string          `json:"operator_transaction_id" binding:"required"`
+	PlayerID              string          `json:"player_id"               binding:"required"`
+	Amount                string          `json:"amount"                  binding:"required"`
+	Metadata              json.RawMessage `json:"metadata,omitempty"`
+}
+
+// escrowCommitRequestDTO / escrowReleaseRequestDTO finalise or reverse a
+// previously reserved withdrawal. escrow_transaction_id is the ledger id
+// returned by reserve.
+type escrowCommitRequestDTO struct {
+	OperatorTransactionID string          `json:"operator_transaction_id" binding:"required"`
+	PlayerID              string          `json:"player_id"               binding:"required"`
+	EscrowTransactionID   string          `json:"escrow_transaction_id"   binding:"required"`
+	Metadata              json.RawMessage `json:"metadata,omitempty"`
+}
+
+type escrowReleaseRequestDTO struct {
+	OperatorTransactionID string          `json:"operator_transaction_id" binding:"required"`
+	PlayerID              string          `json:"player_id"               binding:"required"`
+	EscrowTransactionID   string          `json:"escrow_transaction_id"   binding:"required"`
+	Metadata              json.RawMessage `json:"metadata,omitempty"`
+}
+
+// transactionsResponse is the GET /api/v1/transactions payload — the player's
+// ledger history straight from the source of truth.
+type transactionsResponse struct {
+	Code         errors.Code                     `json:"code"`
+	PlayerID     string                          `json:"player_id"`
+	Transactions []repository.TransactionSummary `json:"transactions"`
+}

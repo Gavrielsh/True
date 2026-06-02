@@ -125,4 +125,82 @@ const (
 		VALUES ($1)
 		ON CONFLICT (player_id) DO NOTHING
 	`
+
+	// ---- Escrow (withdrawal lock) -------------------------------------------
+
+	// INSERT the ESCROW_RESERVE header. Unlike sqlInsertLedgerTx this lands in
+	// status PENDING (funds locked, awaiting ops decision) with completed_at
+	// NULL. Same (operator_code, operator_transaction_id) UNIQUE anchor → 23505
+	// drives Ghost-Spin recovery.
+	sqlInsertEscrowReserveTx = `
+		INSERT INTO ledger_transactions (
+			operator_code,
+			operator_transaction_id,
+			player_id,
+			transaction_type,
+			status,
+			request_metadata
+		)
+		VALUES ($1, $2, $3, 'ESCROW_RESERVE', 'PENDING', $4)
+		RETURNING id
+	`
+
+	// Flip a PENDING ESCROW_RESERVE to COMPLETED (ops approved the withdrawal).
+	// The status + transaction_type predicates make a double-commit, or a commit
+	// of an already-released reserve, a no-op (RowsAffected==0) which the engine
+	// surfaces as ErrEscrowConflict — the core double-spend guard.
+	sqlMarkEscrowCommitted = `
+		UPDATE ledger_transactions
+		SET status = 'COMPLETED',
+		    completed_at = now()
+		WHERE id = $1
+		  AND status = 'PENDING'
+		  AND transaction_type = 'ESCROW_RESERVE'
+	`
+
+	// Flip a PENDING ESCROW_RESERVE to ROLLED_BACK (ops rejected the withdrawal;
+	// funds return to the player). Same guard semantics as the commit.
+	sqlMarkEscrowReleased = `
+		UPDATE ledger_transactions
+		SET status = 'ROLLED_BACK',
+		    completed_at = now()
+		WHERE id = $1
+		  AND status = 'PENDING'
+		  AND transaction_type = 'ESCROW_RESERVE'
+	`
+
+	// ---- Transaction history (single source of truth) -----------------------
+
+	// A player's most recent ledger transactions, with the per-transaction
+	// player-facing amount aggregated from its PLAYER_WALLET entries. House-only
+	// rows (e.g. an escrow commit's burn) yield NULL amount/currency/direction.
+	// Optional exact filters on type/status are skipped when '' is passed (the
+	// ::text comparison avoids enum-cast errors on unrecognised filter input).
+	sqlSelectTransactionsByPlayer = `
+		SELECT t.id,
+		       t.operator_transaction_id,
+		       t.transaction_type::text,
+		       t.status::text,
+		       t.game_id,
+		       t.round_id,
+		       t.created_at,
+		       t.completed_at,
+		       pe.amount,
+		       pe.currency,
+		       pe.direction
+		FROM ledger_transactions t
+		LEFT JOIN LATERAL (
+			SELECT SUM(amount)         AS amount,
+			       MAX(currency::text) AS currency,
+			       MAX(direction::text) AS direction
+			FROM ledger_entries
+			WHERE ledger_transaction_id = t.id
+			  AND account_type = 'PLAYER_WALLET'
+		) pe ON TRUE
+		WHERE t.player_id = $1
+		  AND ($2 = '' OR t.transaction_type::text = $2)
+		  AND ($3 = '' OR t.status::text = $3)
+		ORDER BY t.created_at DESC
+		LIMIT $4
+	`
 )

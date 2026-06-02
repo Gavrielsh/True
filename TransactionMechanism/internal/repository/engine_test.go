@@ -31,7 +31,8 @@ import (
 type fakeIdem struct {
 	mu sync.Mutex
 
-	state map[string]string
+	state  map[string]string
+	hashes map[string]string // request-body hash recorded per key
 
 	acquireErr error
 	storeErr   error
@@ -44,28 +45,33 @@ type fakeIdem struct {
 func newFakeIdem() *fakeIdem {
 	return &fakeIdem{
 		state:    map[string]string{},
+		hashes:   map[string]string{},
 		stored:   map[string]string{},
 		released: map[string]int{},
 	}
 }
 
-func (f *fakeIdem) Acquire(_ context.Context, key string) (cache.AcquireStatus, string, error) {
+func (f *fakeIdem) Acquire(_ context.Context, key, reqHash string) (cache.AcquireStatus, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.acquireErr != nil {
 		return cache.StatusUnknown, "", f.acquireErr
 	}
 	if v, ok := f.state[key]; ok {
+		if f.hashes[key] != reqHash {
+			return cache.StatusMismatch, "", nil
+		}
 		if v == cache.ProcessingMarker {
 			return cache.StatusPending, "", nil
 		}
 		return cache.StatusCached, v, nil
 	}
 	f.state[key] = cache.ProcessingMarker
+	f.hashes[key] = reqHash
 	return cache.StatusAcquired, "", nil
 }
 
-func (f *fakeIdem) Store(_ context.Context, key, payload string) error {
+func (f *fakeIdem) Store(_ context.Context, key, payload, reqHash string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.storeErr != nil {
@@ -75,6 +81,7 @@ func (f *fakeIdem) Store(_ context.Context, key, payload string) error {
 		return nil // XX semantics
 	}
 	f.state[key] = payload
+	f.hashes[key] = reqHash
 	f.stored[key] = payload
 	return nil
 }

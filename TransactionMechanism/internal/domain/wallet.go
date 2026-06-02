@@ -234,3 +234,59 @@ func (w Wallet) ApplyWin(a WinAllocation) Wallet {
 	}
 	return out
 }
+
+// ----------------------------------------------------------------------------
+// Escrow allocation (withdrawal double-spend fix)
+// ----------------------------------------------------------------------------
+
+// EscrowReservation is the plan for locking funds against a pending withdrawal.
+//
+// Invariant: escrow draws EXCLUSIVELY from SC_REDEEMABLE. Promotional
+// SC_UNPLAYED has not satisfied the sweepstakes play-through rule and is never
+// withdrawable, so it can never fund — or be locked by — a reserve. GC has no
+// real-world value and is likewise ineligible. This is intentionally stricter
+// than AllocateBet's SC_UNPLAYED-first routing.
+type EscrowReservation struct {
+	Currency Currency // always CurrencySCRedeemable
+	Amount   Money
+}
+
+// AllocateEscrowReserve computes the debit plan for locking `amount` of
+// SC_REDEEMABLE for a withdrawal, without mutating the wallet.
+//
+// Errors:
+//   - ErrInvalidAmount     — amount is zero or negative.
+//   - ErrInsufficientFunds — SC_REDEEMABLE cannot cover amount.
+func (w Wallet) AllocateEscrowReserve(amount Money) (EscrowReservation, error) {
+	if !amount.IsPositive() {
+		return EscrowReservation{}, fmt.Errorf(
+			"%w: escrow amount must be > 0, got %s",
+			errs.ErrInvalidAmount, amount,
+		)
+	}
+	if w.SCRedeemable.LessThan(amount) {
+		return EscrowReservation{}, fmt.Errorf(
+			"%w: SC_REDEEMABLE balance %s < escrow %s",
+			errs.ErrInsufficientFunds, w.SCRedeemable, amount,
+		)
+	}
+	return EscrowReservation{Currency: CurrencySCRedeemable, Amount: amount}, nil
+}
+
+// ApplyEscrowReserve returns a new Wallet with the reservation deducted from
+// SC_REDEEMABLE. Like ApplyBet, it does not revalidate — AllocateEscrowReserve
+// already proved feasibility against this exact wallet under the FOR UPDATE lock.
+func (w Wallet) ApplyEscrowReserve(r EscrowReservation) Wallet {
+	out := w
+	out.SCRedeemable = out.SCRedeemable.Sub(r.Amount)
+	return out
+}
+
+// ApplyEscrowRelease returns a new Wallet with `amount` re-credited to
+// SC_REDEEMABLE — the inverse of ApplyEscrowReserve, used when ops reject a
+// withdrawal and the locked funds return to the player.
+func (w Wallet) ApplyEscrowRelease(amount Money) Wallet {
+	out := w
+	out.SCRedeemable = out.SCRedeemable.Add(amount)
+	return out
+}

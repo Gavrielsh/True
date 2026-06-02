@@ -10,6 +10,7 @@ package repository
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,6 +34,7 @@ import (
 type DB interface {
 	BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
 // engine is the concrete implementation. The unexported name keeps the
@@ -57,6 +59,37 @@ func New(db DB, idem cache.Store, logger *slog.Logger) Engine {
 // two independent aggregators can never collide on the same string.
 func idempotencyKey(operatorCode, opTxID string) string {
 	return operatorCode + ":" + opTxID
+}
+
+// acquireBarrier runs Phase 1 (Redis idempotency) for one operation. reqHash is
+// the SHA-256 of the raw request body, compared against the hash stored under
+// the key on the first attempt.
+//
+// When handled is true the caller MUST return (replay, err) immediately:
+//   - Redis error                → fail closed (wrapped error)
+//   - StatusPending              → ErrTransactionPending (409, retryable)
+//   - StatusCached               → the decoded cached payload (idempotent replay)
+//   - StatusMismatch             → ErrIdempotencyMismatch (409, body changed)
+//
+// When handled is false the lock was freshly acquired (StatusAcquired) and the
+// caller proceeds to the DB transaction.
+func (e *engine) acquireBarrier(ctx context.Context, idemKey, reqHash string) (TxResult, bool, error) {
+	status, payload, err := e.idem.Acquire(ctx, idemKey, reqHash)
+	if err != nil {
+		// FAIL CLOSED — never proceed when the idempotency barrier is down.
+		return TxResult{}, true, fmt.Errorf("idempotency acquire: %w", err)
+	}
+	switch status {
+	case cache.StatusPending:
+		return TxResult{}, true, fmt.Errorf("%w: %s in flight", errs.ErrTransactionPending, idemKey)
+	case cache.StatusCached:
+		res, derr := decodeCached(payload, StatusCached)
+		return res, true, derr
+	case cache.StatusMismatch:
+		return TxResult{}, true, fmt.Errorf(
+			"%w: %s replayed with a different request body", errs.ErrIdempotencyMismatch, idemKey)
+	}
+	return TxResult{}, false, nil // StatusAcquired — proceed to the DB tx.
 }
 
 // ----------------------------------------------------------------------------
@@ -93,15 +126,8 @@ func (e *engine) ProcessDeposit(ctx context.Context, req DepositRequest) (TxResu
 	}
 	idemKey := idempotencyKey(req.OperatorCode, req.OperatorTransactionID)
 
-	status, payload, err := e.idem.Acquire(ctx, idemKey)
-	if err != nil {
-		return TxResult{}, fmt.Errorf("idempotency acquire: %w", err)
-	}
-	switch status {
-	case cache.StatusPending:
-		return TxResult{}, fmt.Errorf("%w: %s in flight", errs.ErrTransactionPending, idemKey)
-	case cache.StatusCached:
-		return decodeCached(payload, StatusCached)
+	if replay, handled, err := e.acquireBarrier(ctx, idemKey, req.RequestHash); handled {
+		return replay, err
 	}
 
 	result, err := e.processDepositTx(ctx, req)
@@ -110,7 +136,7 @@ func (e *engine) ProcessDeposit(ctx context.Context, req DepositRequest) (TxResu
 		return TxResult{}, err
 	}
 
-	e.cacheResultQuietly(ctx, idemKey, result)
+	e.cacheResultQuietly(ctx, idemKey, result, req.RequestHash)
 	return result, nil
 }
 
@@ -158,7 +184,7 @@ func (e *engine) processDepositTx(ctx context.Context, req DepositRequest) (TxRe
 		if isUniqueViolation(err) {
 			_ = tx.Rollback(ctx)
 			return e.recoverGhostSpin(ctx, req.OperatorCode, req.OperatorTransactionID,
-				req.PlayerID, "DEPOSIT", req.Currency, req.Amount)
+				req.PlayerID, "DEPOSIT", req.Currency, req.Amount, req.RequestHash)
 		}
 		return TxResult{}, fmt.Errorf("insert ledger tx: %w", err)
 	}
@@ -240,17 +266,9 @@ func (e *engine) ProcessBet(ctx context.Context, req BetRequest) (TxResult, erro
 	}
 	idemKey := idempotencyKey(req.OperatorCode, req.OperatorTransactionID)
 
-	// ---- Phase 1: Redis idempotency ----
-	status, payload, err := e.idem.Acquire(ctx, idemKey)
-	if err != nil {
-		// FAIL CLOSED — never proceed when the idempotency barrier is down.
-		return TxResult{}, fmt.Errorf("idempotency acquire: %w", err)
-	}
-	switch status {
-	case cache.StatusPending:
-		return TxResult{}, fmt.Errorf("%w: %s in flight", errs.ErrTransactionPending, idemKey)
-	case cache.StatusCached:
-		return decodeCached(payload, StatusCached)
+	// ---- Phase 1: Redis idempotency (with request-body hash verification) ----
+	if replay, handled, err := e.acquireBarrier(ctx, idemKey, req.RequestHash); handled {
+		return replay, err
 	}
 
 	// ---- Phase 2: DB transaction ----
@@ -261,7 +279,7 @@ func (e *engine) ProcessBet(ctx context.Context, req BetRequest) (TxResult, erro
 	}
 
 	// ---- Phase 3: cache the response ----
-	e.cacheResultQuietly(ctx, idemKey, result)
+	e.cacheResultQuietly(ctx, idemKey, result, req.RequestHash)
 	return result, nil
 }
 
@@ -310,7 +328,7 @@ func (e *engine) processBetTx(ctx context.Context, req BetRequest) (TxResult, er
 			// Stale FOR UPDATE rows are released by the deferred Rollback.
 			// Then read the committed state to reconstruct the response.
 			_ = tx.Rollback(ctx)
-			return e.recoverGhostSpin(ctx, req.OperatorCode, req.OperatorTransactionID, req.PlayerID, "BET", req.Family, req.Amount)
+			return e.recoverGhostSpin(ctx, req.OperatorCode, req.OperatorTransactionID, req.PlayerID, "BET", req.Family, req.Amount, req.RequestHash)
 		}
 		return TxResult{}, fmt.Errorf("insert ledger tx: %w", err)
 	}
@@ -356,15 +374,8 @@ func (e *engine) ProcessWin(ctx context.Context, req WinRequest) (TxResult, erro
 	}
 	idemKey := idempotencyKey(req.OperatorCode, req.OperatorTransactionID)
 
-	status, payload, err := e.idem.Acquire(ctx, idemKey)
-	if err != nil {
-		return TxResult{}, fmt.Errorf("idempotency acquire: %w", err)
-	}
-	switch status {
-	case cache.StatusPending:
-		return TxResult{}, fmt.Errorf("%w: %s in flight", errs.ErrTransactionPending, idemKey)
-	case cache.StatusCached:
-		return decodeCached(payload, StatusCached)
+	if replay, handled, err := e.acquireBarrier(ctx, idemKey, req.RequestHash); handled {
+		return replay, err
 	}
 
 	result, err := e.processWinTx(ctx, req)
@@ -373,7 +384,7 @@ func (e *engine) ProcessWin(ctx context.Context, req WinRequest) (TxResult, erro
 		return TxResult{}, err
 	}
 
-	e.cacheResultQuietly(ctx, idemKey, result)
+	e.cacheResultQuietly(ctx, idemKey, result, req.RequestHash)
 	return result, nil
 }
 
@@ -412,7 +423,7 @@ func (e *engine) processWinTx(ctx context.Context, req WinRequest) (TxResult, er
 	if err != nil {
 		if isUniqueViolation(err) {
 			_ = tx.Rollback(ctx)
-			return e.recoverGhostSpin(ctx, req.OperatorCode, req.OperatorTransactionID, req.PlayerID, "WIN", req.Family, req.Amount)
+			return e.recoverGhostSpin(ctx, req.OperatorCode, req.OperatorTransactionID, req.PlayerID, "WIN", req.Family, req.Amount, req.RequestHash)
 		}
 		return TxResult{}, fmt.Errorf("insert ledger tx: %w", err)
 	}
@@ -453,15 +464,8 @@ func (e *engine) ProcessRollback(ctx context.Context, req RollbackRequest) (TxRe
 	}
 	idemKey := idempotencyKey(req.OperatorCode, req.OperatorTransactionID)
 
-	status, payload, err := e.idem.Acquire(ctx, idemKey)
-	if err != nil {
-		return TxResult{}, fmt.Errorf("idempotency acquire: %w", err)
-	}
-	switch status {
-	case cache.StatusPending:
-		return TxResult{}, fmt.Errorf("%w: %s in flight", errs.ErrTransactionPending, idemKey)
-	case cache.StatusCached:
-		return decodeCached(payload, StatusCached)
+	if replay, handled, err := e.acquireBarrier(ctx, idemKey, req.RequestHash); handled {
+		return replay, err
 	}
 
 	result, err := e.processRollbackTx(ctx, req)
@@ -470,7 +474,7 @@ func (e *engine) ProcessRollback(ctx context.Context, req RollbackRequest) (TxRe
 		return TxResult{}, err
 	}
 
-	e.cacheResultQuietly(ctx, idemKey, result)
+	e.cacheResultQuietly(ctx, idemKey, result, req.RequestHash)
 	return result, nil
 }
 
@@ -580,7 +584,7 @@ func (e *engine) processRollbackTx(ctx context.Context, req RollbackRequest) (Tx
 		if isUniqueViolation(err) {
 			_ = tx.Rollback(ctx)
 			return e.recoverGhostSpin(ctx, req.OperatorCode, req.OperatorTransactionID,
-				req.PlayerID, "ROLLBACK", domain.FamilyUnknown, domain.ZeroMoney())
+				req.PlayerID, "ROLLBACK", domain.FamilyUnknown, domain.ZeroMoney(), req.RequestHash)
 		}
 		return TxResult{}, fmt.Errorf("insert rollback tx: %w", err)
 	}
@@ -657,6 +661,428 @@ func fetchPlayerEntries(ctx context.Context, tx pgx.Tx, refTxID uuid.UUID) ([]pl
 }
 
 // ----------------------------------------------------------------------------
+// Escrow — withdrawal double-spend fix.
+//
+// A withdrawal first RESERVES the SC_REDEEMABLE (deducting it from the wallet
+// and parking it in HOUSE_ESCROW_POOL) so the player cannot gamble funds that
+// are pending payout. Ops later COMMIT (burn → HOUSE_WITHDRAWAL_POOL) or
+// RELEASE (return to the player). All three share the Redis idempotency barrier
+// and the 23505 Ghost-Spin recovery used by bet/win/rollback.
+// ----------------------------------------------------------------------------
+
+// ProcessEscrowReserve — Phase 1 idempotency → reserve DB tx → cache response.
+func (e *engine) ProcessEscrowReserve(ctx context.Context, req EscrowReserveRequest) (TxResult, error) {
+	if err := req.validate(); err != nil {
+		return TxResult{}, err
+	}
+	idemKey := idempotencyKey(req.OperatorCode, req.OperatorTransactionID)
+
+	if replay, handled, err := e.acquireBarrier(ctx, idemKey, req.RequestHash); handled {
+		return replay, err
+	}
+
+	result, err := e.processEscrowReserveTx(ctx, req)
+	if err != nil {
+		e.releaseQuietly(ctx, idemKey)
+		return TxResult{}, err
+	}
+
+	e.cacheResultQuietly(ctx, idemKey, result, req.RequestHash)
+	return result, nil
+}
+
+func (e *engine) processEscrowReserveTx(ctx context.Context, req EscrowReserveRequest) (TxResult, error) {
+	tx, err := e.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return TxResult{}, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// 1. Lock the wallet — same window as bet/win.
+	wallet, err := selectWalletForUpdate(ctx, tx, req.PlayerID)
+	if err != nil {
+		return TxResult{}, err
+	}
+
+	// 2. Pure domain math — SC_REDEEMABLE only.
+	res, err := wallet.AllocateEscrowReserve(req.Amount)
+	if err != nil {
+		return TxResult{}, err
+	}
+	post := wallet.ApplyEscrowReserve(res)
+
+	// 3. UPDATE wallet to the post-state (funds now locked).
+	if err := updateWalletBalances(ctx, tx, req.PlayerID, post); err != nil {
+		return TxResult{}, err
+	}
+
+	// 4. INSERT the PENDING ESCROW_RESERVE header (idempotency anchor).
+	ledgerTxID, err := insertEscrowReserveTx(ctx, tx, req.OperatorCode, req.OperatorTransactionID, req.PlayerID, req.Metadata)
+	if err != nil {
+		if isUniqueViolation(err) {
+			_ = tx.Rollback(ctx)
+			return e.recoverGhostSpin(ctx, req.OperatorCode, req.OperatorTransactionID,
+				req.PlayerID, "ESCROW_RESERVE", domain.FamilySC, req.Amount, req.RequestHash)
+		}
+		return TxResult{}, fmt.Errorf("insert escrow reserve tx: %w", err)
+	}
+
+	// 5. Double-entry: player DEBIT SC_REDEEMABLE / HOUSE_ESCROW_POOL CREDIT.
+	balanceAfter := post.BalanceFor(domain.CurrencySCRedeemable)
+	if err := insertPlayerWalletEntry(ctx, tx, ledgerTxID, req.PlayerID, domain.CurrencySCRedeemable, "DEBIT", req.Amount, balanceAfter); err != nil {
+		return TxResult{}, err
+	}
+	if err := insertHouseEntry(ctx, tx, ledgerTxID, "HOUSE_ESCROW_POOL", domain.CurrencySCRedeemable, "CREDIT", req.Amount); err != nil {
+		return TxResult{}, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return TxResult{}, fmt.Errorf("commit: %w", err)
+	}
+
+	return TxResult{
+		OperatorCode:          req.OperatorCode,
+		OperatorTransactionID: req.OperatorTransactionID,
+		LedgerTransactionID:   ledgerTxID, // == escrow_transaction_id
+		PlayerID:              req.PlayerID,
+		TransactionType:       "ESCROW_RESERVE",
+		Family:                domain.FamilySC.String(),
+		Amount:                req.Amount,
+		PostBalances:          balanceSummaryOf(post),
+		Status:                StatusProcessed,
+	}, nil
+}
+
+// ProcessEscrowCommit — finalises an approved withdrawal (burns the escrow).
+func (e *engine) ProcessEscrowCommit(ctx context.Context, req EscrowCommitRequest) (TxResult, error) {
+	if err := req.validate(); err != nil {
+		return TxResult{}, err
+	}
+	idemKey := idempotencyKey(req.OperatorCode, req.OperatorTransactionID)
+
+	if replay, handled, err := e.acquireBarrier(ctx, idemKey, req.RequestHash); handled {
+		return replay, err
+	}
+
+	result, err := e.processEscrowCommitTx(ctx, req)
+	if err != nil {
+		e.releaseQuietly(ctx, idemKey)
+		return TxResult{}, err
+	}
+
+	e.cacheResultQuietly(ctx, idemKey, result, req.RequestHash)
+	return result, nil
+}
+
+func (e *engine) processEscrowCommitTx(ctx context.Context, req EscrowCommitRequest) (TxResult, error) {
+	tx, err := e.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return TxResult{}, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// 1. Lock the wallet FIRST (consistent lock order with release/rollback;
+	//    a commit does not mutate the wallet but holding the lock serializes a
+	//    concurrent release of the same player and prevents lock-order deadlock).
+	wallet, err := selectWalletForUpdate(ctx, tx, req.PlayerID)
+	if err != nil {
+		return TxResult{}, err
+	}
+
+	// 2. Lock + validate the reserve. FOR UPDATE here is what serializes commit
+	//    vs release: only one can observe PENDING and flip it.
+	amount, err := lockEscrowReserve(ctx, tx, req.EscrowTransactionID, req.PlayerID)
+	if err != nil {
+		return TxResult{}, err
+	}
+
+	// 3. Flip the reserve PENDING→COMPLETED. The WHERE-clause guard makes a lost
+	//    race a no-op; we hold FOR UPDATE so exactly 1 row must change.
+	tag, err := tx.Exec(ctx, sqlMarkEscrowCommitted, req.EscrowTransactionID)
+	if err != nil {
+		return TxResult{}, fmt.Errorf("mark escrow committed: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return TxResult{}, fmt.Errorf("%w: commit affected %d rows", errs.ErrEscrowConflict, tag.RowsAffected())
+	}
+
+	// 4. INSERT the ESCROW_COMMIT header (references the reserve).
+	ledgerTxID, err := insertLedgerTx(ctx, tx, ledgerTxParams{
+		OperatorCode:          req.OperatorCode,
+		OperatorTransactionID: req.OperatorTransactionID,
+		PlayerID:              req.PlayerID,
+		Type:                  "ESCROW_COMMIT",
+		Reference:             req.EscrowTransactionID,
+		Metadata:              req.Metadata,
+	})
+	if err != nil {
+		if isUniqueViolation(err) {
+			_ = tx.Rollback(ctx)
+			return e.recoverGhostSpin(ctx, req.OperatorCode, req.OperatorTransactionID,
+				req.PlayerID, "ESCROW_COMMIT", domain.FamilySC, amount, req.RequestHash)
+		}
+		return TxResult{}, fmt.Errorf("insert escrow commit tx: %w", err)
+	}
+
+	// 5. Burn the escrow: HOUSE_ESCROW_POOL DEBIT / HOUSE_WITHDRAWAL_POOL CREDIT.
+	//    No player entry — the player's balance changed at reserve time.
+	if err := insertHouseEntry(ctx, tx, ledgerTxID, "HOUSE_ESCROW_POOL", domain.CurrencySCRedeemable, "DEBIT", amount); err != nil {
+		return TxResult{}, err
+	}
+	if err := insertHouseEntry(ctx, tx, ledgerTxID, "HOUSE_WITHDRAWAL_POOL", domain.CurrencySCRedeemable, "CREDIT", amount); err != nil {
+		return TxResult{}, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return TxResult{}, fmt.Errorf("commit: %w", err)
+	}
+
+	return TxResult{
+		OperatorCode:          req.OperatorCode,
+		OperatorTransactionID: req.OperatorTransactionID,
+		LedgerTransactionID:   ledgerTxID,
+		PlayerID:              req.PlayerID,
+		TransactionType:       "ESCROW_COMMIT",
+		Family:                domain.FamilySC.String(),
+		Amount:                amount,
+		PostBalances:          balanceSummaryOf(wallet), // unchanged by a commit
+		Status:                StatusProcessed,
+	}, nil
+}
+
+// ProcessEscrowRelease — reverses a rejected withdrawal (returns the funds).
+func (e *engine) ProcessEscrowRelease(ctx context.Context, req EscrowReleaseRequest) (TxResult, error) {
+	if err := req.validate(); err != nil {
+		return TxResult{}, err
+	}
+	idemKey := idempotencyKey(req.OperatorCode, req.OperatorTransactionID)
+
+	if replay, handled, err := e.acquireBarrier(ctx, idemKey, req.RequestHash); handled {
+		return replay, err
+	}
+
+	result, err := e.processEscrowReleaseTx(ctx, req)
+	if err != nil {
+		e.releaseQuietly(ctx, idemKey)
+		return TxResult{}, err
+	}
+
+	e.cacheResultQuietly(ctx, idemKey, result, req.RequestHash)
+	return result, nil
+}
+
+func (e *engine) processEscrowReleaseTx(ctx context.Context, req EscrowReleaseRequest) (TxResult, error) {
+	tx, err := e.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return TxResult{}, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// 1. Lock the wallet (we DO mutate it: the funds come back).
+	wallet, err := selectWalletForUpdate(ctx, tx, req.PlayerID)
+	if err != nil {
+		return TxResult{}, err
+	}
+
+	// 2. Lock + validate the reserve (serializes against a concurrent commit).
+	amount, err := lockEscrowReserve(ctx, tx, req.EscrowTransactionID, req.PlayerID)
+	if err != nil {
+		return TxResult{}, err
+	}
+
+	// 3. Return the funds to SC_REDEEMABLE.
+	post := wallet.ApplyEscrowRelease(amount)
+	if err := updateWalletBalances(ctx, tx, req.PlayerID, post); err != nil {
+		return TxResult{}, err
+	}
+
+	// 4. Flip the reserve PENDING→ROLLED_BACK.
+	tag, err := tx.Exec(ctx, sqlMarkEscrowReleased, req.EscrowTransactionID)
+	if err != nil {
+		return TxResult{}, fmt.Errorf("mark escrow released: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return TxResult{}, fmt.Errorf("%w: release affected %d rows", errs.ErrEscrowConflict, tag.RowsAffected())
+	}
+
+	// 5. INSERT the ESCROW_RELEASE header (references the reserve).
+	ledgerTxID, err := insertLedgerTx(ctx, tx, ledgerTxParams{
+		OperatorCode:          req.OperatorCode,
+		OperatorTransactionID: req.OperatorTransactionID,
+		PlayerID:              req.PlayerID,
+		Type:                  "ESCROW_RELEASE",
+		Reference:             req.EscrowTransactionID,
+		Metadata:              req.Metadata,
+	})
+	if err != nil {
+		if isUniqueViolation(err) {
+			_ = tx.Rollback(ctx)
+			return e.recoverGhostSpin(ctx, req.OperatorCode, req.OperatorTransactionID,
+				req.PlayerID, "ESCROW_RELEASE", domain.FamilySC, amount, req.RequestHash)
+		}
+		return TxResult{}, fmt.Errorf("insert escrow release tx: %w", err)
+	}
+
+	// 6. Reverse the reserve's lines: player CREDIT / HOUSE_ESCROW_POOL DEBIT.
+	balanceAfter := post.BalanceFor(domain.CurrencySCRedeemable)
+	if err := insertPlayerWalletEntry(ctx, tx, ledgerTxID, req.PlayerID, domain.CurrencySCRedeemable, "CREDIT", amount, balanceAfter); err != nil {
+		return TxResult{}, err
+	}
+	if err := insertHouseEntry(ctx, tx, ledgerTxID, "HOUSE_ESCROW_POOL", domain.CurrencySCRedeemable, "DEBIT", amount); err != nil {
+		return TxResult{}, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return TxResult{}, fmt.Errorf("commit: %w", err)
+	}
+
+	return TxResult{
+		OperatorCode:          req.OperatorCode,
+		OperatorTransactionID: req.OperatorTransactionID,
+		LedgerTransactionID:   ledgerTxID,
+		PlayerID:              req.PlayerID,
+		TransactionType:       "ESCROW_RELEASE",
+		Family:                domain.FamilySC.String(),
+		Amount:                amount,
+		PostBalances:          balanceSummaryOf(post),
+		Status:                StatusProcessed,
+	}, nil
+}
+
+// lockEscrowReserve locks the reserve ledger_transactions row FOR UPDATE and
+// validates it is a PENDING ESCROW_RESERVE owned by playerID. It returns the
+// single reserved amount, read from the reserve's PLAYER_WALLET debit entry.
+//
+// This FOR UPDATE is the crux of the double-spend guard: a reserve can be
+// observed PENDING by at most one of {commit, release}; the loser sees a
+// non-PENDING status and is rejected with ErrEscrowConflict.
+func lockEscrowReserve(ctx context.Context, tx pgx.Tx, escrowTxID, playerID uuid.UUID) (domain.Money, error) {
+	var (
+		origPlayerID uuid.UUID
+		origType     string
+		origStatus   string
+	)
+	err := tx.QueryRow(ctx, sqlSelectLedgerTxByIDForUpdate, escrowTxID).
+		Scan(&origPlayerID, &origType, &origStatus)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ZeroMoney(), errs.ErrEscrowNotFound
+	}
+	if err != nil {
+		return domain.ZeroMoney(), fmt.Errorf("lookup escrow reserve: %w", err)
+	}
+	if origType != "ESCROW_RESERVE" {
+		return domain.ZeroMoney(), fmt.Errorf("%w: tx %s is %s, not ESCROW_RESERVE",
+			errs.ErrEscrowConflict, escrowTxID, origType)
+	}
+	if origPlayerID != playerID {
+		return domain.ZeroMoney(), fmt.Errorf("%w: escrow %s player mismatch",
+			errs.ErrTransactionConflict, escrowTxID)
+	}
+	if origStatus != "PENDING" {
+		// Already committed (COMPLETED) or released (ROLLED_BACK): the funds are
+		// spoken for. Refusing here is what stops a double payout / double refund.
+		return domain.ZeroMoney(), fmt.Errorf("%w: escrow %s status=%s",
+			errs.ErrEscrowConflict, escrowTxID, origStatus)
+	}
+
+	entries, err := fetchPlayerEntries(ctx, tx, escrowTxID)
+	if err != nil {
+		return domain.ZeroMoney(), err
+	}
+	if len(entries) != 1 || entries[0].Currency != domain.CurrencySCRedeemable || entries[0].Direction != "DEBIT" {
+		return domain.ZeroMoney(), fmt.Errorf("%w: escrow %s has malformed reserve entries",
+			errs.ErrEscrowConflict, escrowTxID)
+	}
+	return entries[0].Amount, nil
+}
+
+// ----------------------------------------------------------------------------
+// Transaction history — read straight from the ledger (single source of truth).
+// ----------------------------------------------------------------------------
+
+// maxTransactionsLimit caps the history page size so a misbehaving caller can't
+// request an unbounded scan across the partitioned ledger.
+const maxTransactionsLimit = 100
+
+func (e *engine) ListTransactions(ctx context.Context, req ListTransactionsRequest) ([]TransactionSummary, error) {
+	if req.PlayerID == uuid.Nil {
+		return nil, fmt.Errorf("%w: nil player id", errs.ErrPlayerNotFound)
+	}
+	limit := req.Limit
+	if limit <= 0 || limit > maxTransactionsLimit {
+		limit = maxTransactionsLimit
+	}
+
+	rows, err := e.db.Query(ctx, sqlSelectTransactionsByPlayer,
+		req.PlayerID, req.TransactionType, req.Status, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list transactions: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]TransactionSummary, 0, limit)
+	for rows.Next() {
+		var (
+			id          uuid.UUID
+			opTxID      string
+			txType      string
+			status      string
+			gameID      sql.NullString
+			roundID     sql.NullString
+			createdAt   time.Time
+			completedAt sql.NullTime
+			amount      decimal.NullDecimal
+			currency    sql.NullString
+			direction   sql.NullString
+		)
+		if err := rows.Scan(&id, &opTxID, &txType, &status, &gameID, &roundID,
+			&createdAt, &completedAt, &amount, &currency, &direction); err != nil {
+			return nil, fmt.Errorf("scan transaction: %w", err)
+		}
+
+		s := TransactionSummary{
+			LedgerTransactionID:   id,
+			OperatorTransactionID: opTxID,
+			TransactionType:       txType,
+			Status:                status,
+			GameID:                gameID.String,
+			RoundID:               roundID.String,
+			Currency:              currency.String,
+			Direction:             direction.String,
+			CreatedAt:             createdAt,
+		}
+		if amount.Valid {
+			m, err := domain.NewMoney(amount.Decimal)
+			if err != nil {
+				return nil, fmt.Errorf("scan transaction amount: %w", err)
+			}
+			s.Amount = &m
+		}
+		if completedAt.Valid {
+			t := completedAt.Time
+			s.CompletedAt = &t
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("transaction rows: %w", err)
+	}
+	return out, nil
+}
+
+// insertEscrowReserveTx writes the PENDING ESCROW_RESERVE header and returns its
+// id (the escrow_transaction_id). Returns the raw error so the caller can
+// distinguish 23505 (Ghost-Spin) from other failures.
+func insertEscrowReserveTx(ctx context.Context, tx pgx.Tx, operatorCode, opTxID string, playerID uuid.UUID, metadata json.RawMessage) (uuid.UUID, error) {
+	if len(metadata) == 0 {
+		metadata = json.RawMessage("{}")
+	}
+	var id uuid.UUID
+	err := tx.QueryRow(ctx, sqlInsertEscrowReserveTx, operatorCode, opTxID, playerID, metadata).Scan(&id)
+	return id, err
+}
+
+// ----------------------------------------------------------------------------
 // Ghost-Spin recovery (architecture §6.A).
 //
 // Reached when INSERT into ledger_transactions returns 23505 (unique_violation)
@@ -673,6 +1099,7 @@ func (e *engine) recoverGhostSpin(
 	txType string,
 	family domain.CurrencyFamily,
 	amount domain.Money,
+	reqHash string,
 ) (TxResult, error) {
 	var (
 		ledgerTxID   uuid.UUID
@@ -723,7 +1150,7 @@ func (e *engine) recoverGhostSpin(
 	}
 
 	// Best-effort cache write so the next retry hits the fast Cached path.
-	e.cacheResultQuietly(ctx, idempotencyKey(operatorCode, opTxID), result)
+	e.cacheResultQuietly(ctx, idempotencyKey(operatorCode, opTxID), result, reqHash)
 	return result, nil
 }
 
@@ -909,9 +1336,10 @@ func (e *engine) releaseQuietly(ctx context.Context, idemKey string) {
 	}
 }
 
-// cacheResultQuietly tries to write the success payload. Failure here is the
-// "Ghost Spin" origin condition: a retry will catch 23505 and recover.
-func (e *engine) cacheResultQuietly(ctx context.Context, idemKey string, result TxResult) {
+// cacheResultQuietly tries to write the success payload, tagged with the same
+// request-body hash that claimed the key. Failure here is the "Ghost Spin"
+// origin condition: a retry will catch 23505 and recover.
+func (e *engine) cacheResultQuietly(ctx context.Context, idemKey string, result TxResult, reqHash string) {
 	b, err := json.Marshal(result)
 	if err != nil {
 		// json.Marshal on our well-defined struct cannot fail unless one of
@@ -922,7 +1350,7 @@ func (e *engine) cacheResultQuietly(ctx context.Context, idemKey string, result 
 		)
 		return
 	}
-	if err := e.idem.Store(ctx, idemKey, string(b)); err != nil {
+	if err := e.idem.Store(ctx, idemKey, string(b), reqHash); err != nil {
 		e.logger.WarnContext(ctx, "idempotency cache store",
 			slog.String("error", err.Error()),
 			slog.String("idempotency_key", idemKey),
@@ -989,6 +1417,54 @@ func (r WinRequest) validate() error {
 	}
 	if !r.Amount.IsPositive() {
 		return fmt.Errorf("%w: win amount must be > 0", errs.ErrInvalidAmount)
+	}
+	return nil
+}
+
+func (r EscrowReserveRequest) validate() error {
+	if r.OperatorCode == "" {
+		return fmt.Errorf("%w: empty operator_code", errs.ErrInvalidAmount)
+	}
+	if r.OperatorTransactionID == "" {
+		return fmt.Errorf("%w: empty operator_transaction_id", errs.ErrInvalidAmount)
+	}
+	if r.PlayerID == uuid.Nil {
+		return fmt.Errorf("%w: nil player_id", errs.ErrPlayerNotFound)
+	}
+	if !r.Amount.IsPositive() {
+		return fmt.Errorf("%w: escrow amount must be > 0", errs.ErrInvalidAmount)
+	}
+	return nil
+}
+
+func (r EscrowCommitRequest) validate() error {
+	if r.OperatorCode == "" {
+		return fmt.Errorf("%w: empty operator_code", errs.ErrInvalidAmount)
+	}
+	if r.OperatorTransactionID == "" {
+		return fmt.Errorf("%w: empty operator_transaction_id", errs.ErrInvalidAmount)
+	}
+	if r.PlayerID == uuid.Nil {
+		return fmt.Errorf("%w: nil player_id", errs.ErrPlayerNotFound)
+	}
+	if r.EscrowTransactionID == uuid.Nil {
+		return fmt.Errorf("%w: nil escrow_transaction_id", errs.ErrEscrowNotFound)
+	}
+	return nil
+}
+
+func (r EscrowReleaseRequest) validate() error {
+	if r.OperatorCode == "" {
+		return fmt.Errorf("%w: empty operator_code", errs.ErrInvalidAmount)
+	}
+	if r.OperatorTransactionID == "" {
+		return fmt.Errorf("%w: empty operator_transaction_id", errs.ErrInvalidAmount)
+	}
+	if r.PlayerID == uuid.Nil {
+		return fmt.Errorf("%w: nil player_id", errs.ErrPlayerNotFound)
+	}
+	if r.EscrowTransactionID == uuid.Nil {
+		return fmt.Errorf("%w: nil escrow_transaction_id", errs.ErrEscrowNotFound)
 	}
 	return nil
 }

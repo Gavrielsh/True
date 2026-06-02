@@ -26,12 +26,19 @@ func TestMain(m *testing.M) {
 // ----------------------------------------------------------------------------
 
 type fakeEngine struct {
-	bet      func(context.Context, repository.BetRequest) (repository.TxResult, error)
-	win      func(context.Context, repository.WinRequest) (repository.TxResult, error)
-	rollback func(context.Context, repository.RollbackRequest) (repository.TxResult, error)
-	balances func(context.Context, uuid.UUID) (domain.Wallet, error)
+	bet           func(context.Context, repository.BetRequest) (repository.TxResult, error)
+	win           func(context.Context, repository.WinRequest) (repository.TxResult, error)
+	rollback      func(context.Context, repository.RollbackRequest) (repository.TxResult, error)
+	balances      func(context.Context, uuid.UUID) (domain.Wallet, error)
+	deposit       func(context.Context, repository.DepositRequest) (repository.TxResult, error)
+	escrowReserve func(context.Context, repository.EscrowReserveRequest) (repository.TxResult, error)
+	escrowCommit  func(context.Context, repository.EscrowCommitRequest) (repository.TxResult, error)
+	escrowRelease func(context.Context, repository.EscrowReleaseRequest) (repository.TxResult, error)
+	listTxns      func(context.Context, repository.ListTransactionsRequest) ([]repository.TransactionSummary, error)
 
-	lastBet repository.BetRequest // captured for assertions
+	lastBet     repository.BetRequest           // captured for assertions
+	lastReserve repository.EscrowReserveRequest // captured for assertions
+	lastCommit  repository.EscrowCommitRequest  // captured for assertions
 }
 
 func (f *fakeEngine) ProcessBet(ctx context.Context, req repository.BetRequest) (repository.TxResult, error) {
@@ -46,6 +53,41 @@ func (f *fakeEngine) ProcessRollback(ctx context.Context, req repository.Rollbac
 }
 func (f *fakeEngine) GetBalances(ctx context.Context, id uuid.UUID) (domain.Wallet, error) {
 	return f.balances(ctx, id)
+}
+func (f *fakeEngine) CreatePlayer(_ context.Context, _ repository.CreatePlayerRequest) error {
+	return nil
+}
+func (f *fakeEngine) ProcessDeposit(ctx context.Context, req repository.DepositRequest) (repository.TxResult, error) {
+	if f.deposit != nil {
+		return f.deposit(ctx, req)
+	}
+	return repository.TxResult{}, nil
+}
+func (f *fakeEngine) ProcessEscrowReserve(ctx context.Context, req repository.EscrowReserveRequest) (repository.TxResult, error) {
+	f.lastReserve = req
+	if f.escrowReserve != nil {
+		return f.escrowReserve(ctx, req)
+	}
+	return repository.TxResult{}, nil
+}
+func (f *fakeEngine) ProcessEscrowCommit(ctx context.Context, req repository.EscrowCommitRequest) (repository.TxResult, error) {
+	f.lastCommit = req
+	if f.escrowCommit != nil {
+		return f.escrowCommit(ctx, req)
+	}
+	return repository.TxResult{}, nil
+}
+func (f *fakeEngine) ProcessEscrowRelease(ctx context.Context, req repository.EscrowReleaseRequest) (repository.TxResult, error) {
+	if f.escrowRelease != nil {
+		return f.escrowRelease(ctx, req)
+	}
+	return repository.TxResult{}, nil
+}
+func (f *fakeEngine) ListTransactions(ctx context.Context, req repository.ListTransactionsRequest) ([]repository.TransactionSummary, error) {
+	if f.listTxns != nil {
+		return f.listTxns(ctx, req)
+	}
+	return nil, nil
 }
 
 func mustMoney(t *testing.T, s string) domain.Money {
@@ -73,6 +115,10 @@ func handlerRouter(eng repository.Engine) *gin.Engine {
 	g.POST("/win", h.Win)
 	g.POST("/rollback", h.Rollback)
 	g.GET("/session", h.Session)
+	g.GET("/transactions", h.Transactions)
+	g.POST("/escrow/reserve", h.EscrowReserve)
+	g.POST("/escrow/commit", h.EscrowCommit)
+	g.POST("/escrow/release", h.EscrowRelease)
 	return r
 }
 
@@ -362,6 +408,118 @@ func TestSessionHandler_NotFound(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
+// Escrow handlers
+// ----------------------------------------------------------------------------
+
+func TestEscrowReserveHandler_HappyPath(t *testing.T) {
+	t.Parallel()
+	playerID := uuid.New()
+	escrowID := uuid.New()
+	eng := &fakeEngine{
+		escrowReserve: func(_ context.Context, req repository.EscrowReserveRequest) (repository.TxResult, error) {
+			return repository.TxResult{
+				LedgerTransactionID: escrowID,
+				PlayerID:            req.PlayerID,
+				TransactionType:     "ESCROW_RESERVE",
+				Amount:              req.Amount,
+				PostBalances: repository.BalanceSummary{
+					GC: mustMoney(t, "0.0000"), SCUnplayed: mustMoney(t, "0.0000"), SCRedeemable: mustMoney(t, "70.0000"),
+				},
+				Status: repository.StatusProcessed,
+			}, nil
+		},
+	}
+	r := handlerRouter(eng)
+	body := `{"operator_transaction_id":"resv-1","player_id":"` + playerID.String() + `","amount":"30.0000"}`
+	w := doJSON(r, http.MethodPost, "/api/v1/escrow/reserve", body)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d want 200; body=%s", w.Code, w.Body.String())
+	}
+	var resp successResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Result.LedgerTransactionID != escrowID {
+		t.Errorf("escrow id: got %v want %v", resp.Result.LedgerTransactionID, escrowID)
+	}
+	// Operator code must come from the trusted context, amount from the body.
+	if eng.lastReserve.OperatorCode != "OP1" {
+		t.Errorf("operator code: got %q want OP1", eng.lastReserve.OperatorCode)
+	}
+	if eng.lastReserve.Amount.String() != "30.0000" {
+		t.Errorf("amount: got %s want 30.0000", eng.lastReserve.Amount)
+	}
+}
+
+func TestEscrowCommitHandler_BadEscrowID(t *testing.T) {
+	t.Parallel()
+	eng := &fakeEngine{escrowCommit: func(_ context.Context, _ repository.EscrowCommitRequest) (repository.TxResult, error) {
+		t.Error("engine must not be called on invalid escrow id")
+		return repository.TxResult{}, nil
+	}}
+	r := handlerRouter(eng)
+	playerID := uuid.New()
+	body := `{"operator_transaction_id":"c1","player_id":"` + playerID.String() + `","escrow_transaction_id":"not-a-uuid"}`
+	w := doJSON(r, http.MethodPost, "/api/v1/escrow/commit", body)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status: got %d want 400", w.Code)
+	}
+}
+
+func TestEscrowCommitHandler_ConflictMapsTo409(t *testing.T) {
+	t.Parallel()
+	eng := &fakeEngine{escrowCommit: func(_ context.Context, _ repository.EscrowCommitRequest) (repository.TxResult, error) {
+		return repository.TxResult{}, errs.ErrEscrowConflict
+	}}
+	r := handlerRouter(eng)
+	playerID := uuid.New()
+	escrowID := uuid.New()
+	body := `{"operator_transaction_id":"c1","player_id":"` + playerID.String() + `","escrow_transaction_id":"` + escrowID.String() + `"}`
+	w := doJSON(r, http.MethodPost, "/api/v1/escrow/commit", body)
+	if w.Code != http.StatusConflict {
+		t.Errorf("status: got %d want 409; body=%s", w.Code, w.Body.String())
+	}
+	if got := decodeErr(t, w).Code; got != errs.CodeEscrowConflict {
+		t.Errorf("code: got %s want %s", got, errs.CodeEscrowConflict)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Transactions handler (history straight from the ledger)
+// ----------------------------------------------------------------------------
+
+func TestTransactionsHandler(t *testing.T) {
+	t.Parallel()
+	playerID := uuid.New()
+	amount := mustMoney(t, "12.3400")
+	var captured repository.ListTransactionsRequest
+	eng := &fakeEngine{
+		listTxns: func(_ context.Context, req repository.ListTransactionsRequest) ([]repository.TransactionSummary, error) {
+			captured = req
+			return []repository.TransactionSummary{
+				{LedgerTransactionID: uuid.New(), TransactionType: "DEPOSIT", Status: "COMPLETED", Amount: &amount, Currency: "GC", Direction: "CREDIT"},
+			}, nil
+		},
+	}
+	r := handlerRouter(eng)
+	w := doJSON(r, http.MethodGet, "/api/v1/transactions?player_id="+playerID.String()+"&type=DEPOSIT&limit=10", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d want 200; body=%s", w.Code, w.Body.String())
+	}
+	var resp transactionsResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Transactions) != 1 || resp.Transactions[0].TransactionType != "DEPOSIT" {
+		t.Errorf("transactions: got %+v", resp.Transactions)
+	}
+	if captured.PlayerID != playerID || captured.TransactionType != "DEPOSIT" || captured.Limit != 10 {
+		t.Errorf("filters not forwarded: %+v", captured)
+	}
+}
+
+// ----------------------------------------------------------------------------
 // Error-code → HTTP-status mapping (exhaustive table)
 // ----------------------------------------------------------------------------
 
@@ -382,6 +540,9 @@ func TestHTTPStatusFor(t *testing.T) {
 		{errs.CodeRollbackNotFound, http.StatusNotFound},
 		{errs.CodeRollbackAlready, http.StatusConflict},
 		{errs.CodeRollbackUnsupported, http.StatusUnprocessableEntity},
+		{errs.CodeIdempotencyMismatch, http.StatusConflict},
+		{errs.CodeEscrowNotFound, http.StatusNotFound},
+		{errs.CodeEscrowConflict, http.StatusConflict},
 		{errs.CodeInternal, http.StatusInternalServerError},
 		{errs.Code("WHO_KNOWS"), http.StatusInternalServerError},
 	}
