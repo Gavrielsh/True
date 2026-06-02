@@ -182,6 +182,50 @@ func TestRun_StopsOnContextCancel(t *testing.T) {
 	}
 }
 
+// panicBeginDB satisfies the aggregator's DB interface and panics on Begin,
+// simulating an unexpected fault (nil-deref, driver bug) inside a cycle.
+type panicBeginDB struct{}
+
+func (panicBeginDB) Begin(context.Context) (pgx.Tx, error) { panic("synthetic begin panic") }
+
+// runOnceSafely must convert a panic into a returned error, never propagate it.
+func TestRunOnceSafely_RecoversPanic(t *testing.T) {
+	t.Parallel()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	agg := New(panicBeginDB{}, logger)
+
+	n, err := agg.runOnceSafely(context.Background())
+	if err == nil {
+		t.Fatal("expected recovered panic to surface as an error")
+	}
+	if n != 0 {
+		t.Errorf("rows: got %d want 0", n)
+	}
+}
+
+// The Run loop must survive panicking cycles and exit cleanly (nil) on cancel —
+// a panic in the worker must NEVER crash the process / HTTP server.
+func TestRun_SurvivesPanickingCycles(t *testing.T) {
+	t.Parallel()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	agg := New(panicBeginDB{}, logger, WithInterval(2*time.Millisecond))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- agg.Run(ctx) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run through panics: got %v want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after panicking cycles + cancel")
+	}
+}
+
 func TestWithOptions_GuardInvalidValues(t *testing.T) {
 	t.Parallel()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))

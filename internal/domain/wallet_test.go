@@ -366,7 +366,10 @@ func TestApplyBet(t *testing.T) {
 			if err != nil {
 				t.Fatalf("AllocateBet: %v", err)
 			}
-			post := tt.wallet.ApplyBet(alloc)
+			post, err := tt.wallet.ApplyBet(alloc)
+			if err != nil {
+				t.Fatalf("ApplyBet: %v", err)
+			}
 			if got := post.GC.String(); got != tt.wantGC {
 				t.Errorf("GC = %s want %s", got, tt.wantGC)
 			}
@@ -432,6 +435,89 @@ func TestApplyWin(t *testing.T) {
 				t.Errorf("R  = %s want %s", got, tt.wantR)
 			}
 		})
+	}
+}
+
+// ----------------------------------------------------------------------------
+// ApplyBet — DEFENSIVE programming: a hand-crafted allocation that does not
+// match the wallet must be rejected with ErrInsufficientFunds (never silently
+// produce a negative balance that only the DB CHECK would catch).
+// ----------------------------------------------------------------------------
+
+func TestApplyBet_DefensiveRejectsOverdraw(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		wallet  Wallet
+		alloc   BetAllocation
+		errKind error
+	}{
+		{
+			name:   "gc_debit_exceeds_balance",
+			wallet: mkWallet(t, "5.0000", "0.0000", "0.0000"),
+			alloc: BetAllocation{Family: FamilyGC, Total: mustMoney(t, "10.0000"),
+				Debits: []Debit{{CurrencyGC, mustMoney(t, "10.0000")}}},
+			errKind: errs.ErrInsufficientFunds,
+		},
+		{
+			name:   "sc_unplayed_debit_exceeds_balance",
+			wallet: mkWallet(t, "0.0000", "1.0000", "100.0000"),
+			alloc: BetAllocation{Family: FamilySC, Total: mustMoney(t, "5.0000"),
+				Debits: []Debit{{CurrencySCUnplayed, mustMoney(t, "5.0000")}}},
+			errKind: errs.ErrInsufficientFunds,
+		},
+		{
+			name:   "sc_redeemable_debit_exceeds_balance",
+			wallet: mkWallet(t, "0.0000", "0.0000", "3.0000"),
+			alloc: BetAllocation{Family: FamilySC, Total: mustMoney(t, "4.0000"),
+				Debits: []Debit{{CurrencySCRedeemable, mustMoney(t, "4.0000")}}},
+			errKind: errs.ErrInsufficientFunds,
+		},
+		{
+			name:   "second_debit_overdraws_redeemable",
+			wallet: mkWallet(t, "0.0000", "10.0000", "5.0000"),
+			alloc: BetAllocation{Family: FamilySC, Total: mustMoney(t, "20.0000"),
+				Debits: []Debit{
+					{CurrencySCUnplayed, mustMoney(t, "10.0000")},
+					{CurrencySCRedeemable, mustMoney(t, "10.0000")}, // only 5 available
+				}},
+			errKind: errs.ErrInsufficientFunds,
+		},
+		{
+			name:   "non_positive_debit",
+			wallet: mkWallet(t, "100.0000", "0.0000", "0.0000"),
+			alloc: BetAllocation{Family: FamilyGC, Total: mustMoney(t, "0.0000"),
+				Debits: []Debit{{CurrencyGC, mustMoney(t, "0.0000")}}},
+			errKind: errs.ErrInvalidAmount,
+		},
+		{
+			name:   "unknown_currency_debit",
+			wallet: mkWallet(t, "100.0000", "0.0000", "0.0000"),
+			alloc: BetAllocation{Family: FamilyGC, Total: mustMoney(t, "1.0000"),
+				Debits: []Debit{{Currency("USD"), mustMoney(t, "1.0000")}}},
+			errKind: errs.ErrUnsupportedCurrency,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := tt.wallet.ApplyBet(tt.alloc)
+			if !errors.Is(err, tt.errKind) {
+				t.Fatalf("ApplyBet: got %v, want wrapping %v", err, tt.errKind)
+			}
+		})
+	}
+}
+
+func TestApplyBet_EmptyAllocationIsNoOp(t *testing.T) {
+	t.Parallel()
+	w := mkWallet(t, "100.0000", "5.0000", "10.0000")
+	post, err := w.ApplyBet(BetAllocation{Family: FamilyGC, Total: ZeroMoney()})
+	if err != nil {
+		t.Fatalf("empty alloc: %v", err)
+	}
+	if !post.GC.Equal(w.GC) || !post.SCUnplayed.Equal(w.SCUnplayed) || !post.SCRedeemable.Equal(w.SCRedeemable) {
+		t.Errorf("empty allocation must not change balances: got %+v", post)
 	}
 }
 

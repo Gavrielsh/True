@@ -3,13 +3,15 @@
 //
 // The two-phase contract (architecture §4):
 //
-//	Phase 1 — Acquire:  SET key=PROCESSING NX EX 10
-//	Phase 2 — Store:    SET key=<json>     XX EX 86400  (after DB commit)
+//	Phase 1 — Acquire:  atomic GET-then-conditional-SET (single Lua script)
+//	Phase 2 — Store:    SET key=<json> XX PX 86400000  (after DB commit)
 //
-// Phase 1 atomically reserves the operator_transaction_id. If the SET fails
-// (NX violated), a concurrent or already-completed request owns the key
-// and we read its value to decide whether to wait, replay the cache, or
-// (on a stale PROCESSING / cache miss) try again.
+// Phase 1 runs a server-side Lua script so the "is the key present?" read and
+// the "claim it with PROCESSING" write are ONE atomic step. This eliminates the
+// SETNX-then-GET race where the key's TTL could fire in the window between the
+// two round-trips (a concurrent retry would then observe a phantom miss). The
+// script returns one of three discriminated outcomes — Acquired / Pending /
+// Cached — with no second network call.
 //
 // FAIL CLOSED: any Redis error short-circuits the request with HTTP 5xx;
 // proceeding without idempotency could double-charge a player on retry.
@@ -86,40 +88,96 @@ func NewRedisWithTTLs(client redis.UniversalClient, lockTTL, cacheTTL time.Durat
 
 func keyFor(opTxID string) string { return keyPrefix + opTxID }
 
-// Acquire attempts to claim the idempotency key. See AcquireStatus for the
+// Lua return codes for acquireScript. Kept in lock-step with the script body.
+const (
+	luaAcquired int64 = 1 // we set the PROCESSING marker
+	luaPending  int64 = 2 // marker already held by a concurrent request
+	luaCached   int64 = 3 // a JSON payload is already cached
+)
+
+// acquireScript performs the entire Acquire decision in ONE atomic, server-side
+// step (Redis executes a script with no interleaving). Logic:
+//
+//	missing       → SET PROCESSING with the lock TTL, return {acquired, ""}
+//	== PROCESSING → return {pending, ""}
+//	otherwise     → return {cached, <payload>}
+//
+// PX (millisecond TTL) is used so sub-second lock windows (tests) are exact;
+// EX would truncate a 100ms TTL to 0 and error.
+var acquireScript = redis.NewScript(`
+local existing = redis.call('GET', KEYS[1])
+if existing == false then
+	redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+	return {1, ''}
+end
+if existing == ARGV[1] then
+	return {2, ''}
+end
+return {3, existing}
+`)
+
+// Acquire atomically claims the idempotency key. See AcquireStatus for the
 // possible outcomes. The returned payload is non-empty only for StatusCached.
 //
-// Implementation note: we do not loop on the SETNX-then-GET race because the
-// caller will retry the whole request. A bounded retry here would add jitter
-// and bloat the hot path; the operator's retry budget already covers it.
+// Because the GET and the conditional SET happen inside one Lua invocation,
+// there is no SETNX-then-GET window for the TTL to expire through — the race
+// the previous implementation papered over with a "treat phantom miss as
+// Pending" branch simply cannot occur.
 func (r *Redis) Acquire(ctx context.Context, opTxID string) (AcquireStatus, string, error) {
 	if opTxID == "" {
 		return StatusUnknown, "", errors.New("idempotency: empty operator_transaction_id")
 	}
 	k := keyFor(opTxID)
 
-	ok, err := r.client.SetNX(ctx, k, ProcessingMarker, r.lockTTL).Result()
-	if err != nil {
-		return StatusUnknown, "", fmt.Errorf("idempotency SETNX: %w", err)
-	}
-	if ok {
-		return StatusAcquired, "", nil
+	// PX demands an integer >= 1ms.
+	ttlMillis := r.lockTTL.Milliseconds()
+	if ttlMillis < 1 {
+		ttlMillis = 1
 	}
 
-	// SETNX failed — read the current value to disambiguate Pending vs Cached.
-	val, err := r.client.Get(ctx, k).Result()
-	if errors.Is(err, redis.Nil) {
-		// Race: TTL fired between SETNX and GET. Treat as Pending — operator
-		// will retry, and the retry's SETNX will succeed.
-		return StatusPending, "", nil
-	}
+	res, err := acquireScript.Run(ctx, r.client, []string{k}, ProcessingMarker, ttlMillis).Result()
 	if err != nil {
-		return StatusUnknown, "", fmt.Errorf("idempotency GET: %w", err)
+		return StatusUnknown, "", fmt.Errorf("idempotency acquire script: %w", err)
 	}
-	if val == ProcessingMarker {
+
+	code, payload, err := parseAcquireResult(res)
+	if err != nil {
+		return StatusUnknown, "", err
+	}
+	switch code {
+	case luaAcquired:
+		return StatusAcquired, "", nil
+	case luaPending:
 		return StatusPending, "", nil
+	case luaCached:
+		return StatusCached, payload, nil
+	default:
+		return StatusUnknown, "", fmt.Errorf("idempotency: unexpected acquire code %d", code)
 	}
-	return StatusCached, val, nil
+}
+
+// parseAcquireResult unpacks the {code, payload} table the Lua script returns.
+// go-redis decodes a Lua array into []any with an int64 head; the payload is a
+// string (or []byte on some transports) and may be empty.
+func parseAcquireResult(res any) (int64, string, error) {
+	arr, ok := res.([]any)
+	if !ok || len(arr) != 2 {
+		return 0, "", fmt.Errorf("idempotency: malformed acquire result %T", res)
+	}
+	code, ok := arr[0].(int64)
+	if !ok {
+		return 0, "", fmt.Errorf("idempotency: acquire code not int64 (%T)", arr[0])
+	}
+	switch v := arr[1].(type) {
+	case string:
+		return code, v, nil
+	case []byte:
+		return code, string(v), nil
+	case nil:
+		return code, "", nil
+	default:
+		return 0, "", fmt.Errorf("idempotency: acquire payload bad type %T", arr[1])
+	}
 }
 
 // Store writes the final success payload, transitioning the key from

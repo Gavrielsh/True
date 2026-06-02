@@ -4,11 +4,13 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -117,6 +119,119 @@ func TestHMAC_BodyTooLarge(t *testing.T) {
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("status: got %d want 413", w.Code)
+	}
+}
+
+// mixHexCase upper-cases every other hex digit so the result is neither all
+// lower nor all upper — exercising the case-insensitive decode path.
+func mixHexCase(s string) string {
+	b := []byte(s)
+	for i := 0; i < len(b); i += 2 {
+		if b[i] >= 'a' && b[i] <= 'f' {
+			b[i] -= 32 // to upper
+		}
+	}
+	return string(b)
+}
+
+// The raw-byte comparison must accept a correct signature regardless of hex
+// case (the previous string compare spuriously rejected upper/mixed case).
+func TestHMAC_CaseInsensitiveHexAccepted(t *testing.T) {
+	t.Parallel()
+	secret := "topsecret"
+	body := `{"amount":"10.0000","nested":{"a":1}}`
+	lower := sign(secret, body)
+
+	cases := []struct{ name, sig string }{
+		{"lowercase", lower},
+		{"uppercase", strings.ToUpper(lower)},
+		{"mixedcase", mixHexCase(lower)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := hmacRouter(map[string]string{"OP1": secret})
+			req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(body))
+			req.Header.Set(HeaderOperatorCode, "OP1")
+			req.Header.Set(HeaderSignature, tc.sig)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Errorf("case-insensitive hex must pass: got %d body=%s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+// A signature that is not valid hex must fail closed (401), never 500.
+func TestHMAC_NonHexSignatureRejected(t *testing.T) {
+	t.Parallel()
+	secret := "topsecret"
+	body := `{"x":1}`
+	r := hmacRouter(map[string]string{"OP1": secret})
+	req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(body))
+	req.Header.Set(HeaderOperatorCode, "OP1")
+	req.Header.Set(HeaderSignature, "nothexZZ"+sign(secret, body)) // invalid hex prefix
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("non-hex signature: got %d want 401", w.Code)
+	}
+}
+
+// Pool-safety proof: many concurrent requests with DISTINCT bodies must all
+// verify. A pooled buffer leaking bytes across requests would corrupt the hash
+// input and surface as a 401, so all-200 means the sync.Pool is race-clean.
+func TestHMAC_PooledBufferConcurrencySafe(t *testing.T) {
+	t.Parallel()
+	secret := "topsecret"
+	r := hmacRouter(map[string]string{"OP1": secret})
+
+	const n = 64
+	var wg sync.WaitGroup
+	fail := make(chan string, n)
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			body := fmt.Sprintf(`{"i":%d,"pad":%q}`, i, strings.Repeat("x", i*11))
+			req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(body))
+			req.Header.Set(HeaderOperatorCode, "OP1")
+			req.Header.Set(HeaderSignature, sign(secret, body))
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				fail <- fmt.Sprintf("i=%d: got %d (pool corruption ⇒ HMAC mismatch)", i, w.Code)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(fail)
+	for e := range fail {
+		t.Error(e)
+	}
+}
+
+// BenchmarkHMACMiddleware documents the hot-path allocation profile after
+// pooling the body buffer. (httptest overhead dominates wall time; ReportAllocs
+// is the signal of interest.)
+func BenchmarkHMACMiddleware(b *testing.B) {
+	secret := "topsecret"
+	r := hmacRouter(map[string]string{"OP1": secret})
+	body := `{"operator_transaction_id":"op-bench","amount":"10.0000","game_id":"G1"}`
+	sig := sign(secret, body)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(body))
+		req.Header.Set(HeaderOperatorCode, "OP1")
+		req.Header.Set(HeaderSignature, sig)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			b.Fatalf("status %d", w.Code)
+		}
 	}
 }
 

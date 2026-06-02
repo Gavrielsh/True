@@ -173,7 +173,7 @@ func (a *Aggregator) Run(ctx context.Context) error {
 			a.logger.InfoContext(ctx, "ggr aggregator stopped")
 			return nil
 		case <-ticker.C:
-			n, err := a.runOnce(ctx)
+			n, err := a.runOnceSafely(ctx)
 			if err != nil {
 				// Cancellation during a cycle is a clean stop, not an error.
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -190,6 +190,19 @@ func (a *Aggregator) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// runOnceSafely wraps runOnce in panic recovery so a single poisoned cycle
+// (e.g. a nil-deref introduced by a future change, or a driver bug) is logged
+// with its stack and surfaced as an ordinary cycle error — it never unwinds the
+// worker goroutine and so can never crash the HTTP server sharing the process.
+func (a *Aggregator) runOnceSafely(ctx context.Context) (n int64, err error) {
+	gErr := guard(ctx, a.logger, "ggr_aggregator", func() error {
+		var inner error
+		n, inner = a.runOnce(ctx)
+		return inner
+	})
+	return n, gErr
 }
 
 // runOnce executes one aggregation cycle in a single transaction: lock the

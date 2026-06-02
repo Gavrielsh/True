@@ -38,14 +38,51 @@ type Config struct {
 	// requests to drain before forcing the server closed.
 	ShutdownTimeout time.Duration
 
-	// MaxDBConns sizes the pgx pool. Defaults to (2*CPU)+1 per architecture
-	// §6.B (writer-node sizing to avoid context-switch collapse).
-	MaxDBConns int32
+	// DB holds the HFT-ready pgxpool tuning (see DBConfig).
+	DB DBConfig
+}
+
+// DBConfig is the fully-resolved pgxpool tuning. The four primary knobs are
+// settable via env: DB_MAX_CONNS, DB_MIN_CONNS, DB_MAX_CONN_IDLE_TIME,
+// DB_MAX_CONN_LIFETIME (HealthCheckPeriod via DB_HEALTH_CHECK_PERIOD). Sized for
+// 50k-TPS writer nodes where connection-pool exhaustion, not CPU, is the first
+// wall (architecture §6.B).
+type DBConfig struct {
+	// MaxConns caps concurrent connections. Default (2*CPU)+1 — past that,
+	// context-switching between backends collapses writer throughput.
+	MaxConns int32
+	// MinConns is the warm floor kept open so a slot-spin burst never pays
+	// cold-connect (TCP + TLS + auth) latency on the hot path. Default: a
+	// quarter of MaxConns, never below 2.
+	MinConns int32
+	// MaxConnIdleTime closes connections idle beyond this, releasing server
+	// resources during troughs without churning the warm MinConns floor.
+	MaxConnIdleTime time.Duration
+	// MaxConnLifetime caps total connection age so the pool rotates steadily:
+	// this rebalances backends after a failover/replica swap and bounds
+	// server-side per-connection memory growth.
+	MaxConnLifetime time.Duration
+	// HealthCheckPeriod is how often the pool probes idle connections and tops
+	// the pool back up to MinConns.
+	HealthCheckPeriod time.Duration
 }
 
 // defaultMaxConns implements the architecture's writer-pool heuristic.
 func defaultMaxConns() int {
 	return 2*runtime.NumCPU() + 1
+}
+
+// defaultMinConns keeps a warm floor of ~25% of MaxConns (at least 2, never
+// above MaxConns) so traffic bursts don't stall establishing connections.
+func defaultMinConns(maxConns int) int {
+	m := maxConns / 4
+	if m < 2 {
+		m = 2
+	}
+	if m > maxConns {
+		m = maxConns
+	}
+	return m
 }
 
 // Load reads configuration from the process environment.
@@ -66,7 +103,7 @@ func Load() (Config, error) {
 		WriteTimeout:      l.duration("HTTP_WRITE_TIMEOUT", 15*time.Second),
 		IdleTimeout:       l.duration("HTTP_IDLE_TIMEOUT", 60*time.Second),
 		ShutdownTimeout:   l.duration("SHUTDOWN_TIMEOUT", 30*time.Second),
-		MaxDBConns:        int32(l.positiveInt("MAX_DB_CONNS", defaultMaxConns())),
+		DB:                l.dbConfig(),
 	}
 	rawSecrets := l.required("OPERATOR_SECRETS")
 
@@ -92,7 +129,10 @@ func (c Config) LogValue() slog.Value {
 		slog.String("port", c.Port),
 		slog.String("log_level", c.LogLevel),
 		slog.Int("operator_count", len(c.OperatorSecrets)),
-		slog.Int("max_db_conns", int(c.MaxDBConns)),
+		slog.Int("db_max_conns", int(c.DB.MaxConns)),
+		slog.Int("db_min_conns", int(c.DB.MinConns)),
+		slog.Duration("db_max_conn_idle_time", c.DB.MaxConnIdleTime),
+		slog.Duration("db_max_conn_lifetime", c.DB.MaxConnLifetime),
 		slog.Duration("shutdown_timeout", c.ShutdownTimeout),
 		slog.Duration("read_timeout", c.ReadTimeout),
 		slog.Duration("write_timeout", c.WriteTimeout),
@@ -201,21 +241,53 @@ func (l *loader) duration(key string, def time.Duration) time.Duration {
 	return d
 }
 
-func (l *loader) positiveInt(key string, def int) int {
+// dbConfig resolves the pgxpool tuning, applying HFT-ready defaults and
+// validating MinConns <= MaxConns. The legacy MAX_DB_CONNS name is accepted as
+// a fallback for DB_MAX_CONNS so existing deploys upgrade without a config edit.
+func (l *loader) dbConfig() DBConfig {
+	maxConns := l.intEnv([]string{"DB_MAX_CONNS", "MAX_DB_CONNS"}, defaultMaxConns(), false)
+	minConns := l.intEnv([]string{"DB_MIN_CONNS"}, defaultMinConns(maxConns), true)
+
+	cfg := DBConfig{
+		MaxConns:          int32(maxConns),
+		MinConns:          int32(minConns),
+		MaxConnIdleTime:   l.duration("DB_MAX_CONN_IDLE_TIME", 30*time.Minute),
+		MaxConnLifetime:   l.duration("DB_MAX_CONN_LIFETIME", time.Hour),
+		HealthCheckPeriod: l.duration("DB_HEALTH_CHECK_PERIOD", time.Minute),
+	}
+	if l.err == nil && minConns > maxConns {
+		l.err = fmt.Errorf("DB_MIN_CONNS (%d) must not exceed DB_MAX_CONNS (%d)", minConns, maxConns)
+	}
+	return cfg
+}
+
+// intEnv reads the first present key among keys and parses a positive integer
+// (or non-negative when allowZero). Returns def when none of the keys is set.
+func (l *loader) intEnv(keys []string, def int, allowZero bool) int {
 	if l.err != nil {
 		return def
 	}
-	v := os.Getenv(key)
-	if v == "" {
+	var raw, key string
+	for _, k := range keys {
+		if v := os.Getenv(k); v != "" {
+			raw, key = v, k
+			break
+		}
+	}
+	if raw == "" {
 		return def
 	}
-	n, err := strconv.Atoi(v)
+	n, err := strconv.Atoi(raw)
 	if err != nil {
-		l.err = fmt.Errorf("env %s: invalid int %q: %w", key, v, err)
+		l.err = fmt.Errorf("env %s: invalid int %q: %w", key, raw, err)
 		return def
 	}
-	if n <= 0 {
-		l.err = fmt.Errorf("env %s: must be positive, got %d", key, n)
+	if n < 0 || (!allowZero && n == 0) {
+		want := "positive"
+		if allowZero {
+			want = "non-negative"
+		}
+		l.err = fmt.Errorf("env %s: must be %s, got %d", key, want, n)
 		return def
 	}
 	return n

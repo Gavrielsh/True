@@ -1,7 +1,9 @@
 package api
 
 import (
+	"context"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -11,14 +13,53 @@ import (
 	"github.com/Gavrielsh/True/pkg/errors"
 )
 
+const (
+	// defaultTxTimeout bounds one state-mutating transaction end-to-end
+	// (idempotency → SELECT FOR UPDATE → ledger writes → COMMIT). The raw Gin
+	// request context is cancelled if the operator's socket drops, but it has
+	// NO upper bound otherwise — a wedged backend or a half-open connection
+	// could then hold a wallet row's FOR UPDATE lock indefinitely, head-of-line
+	// blocking every spin for that player. A strict derived deadline guarantees
+	// pgx cancels the query and releases the lock no matter what the client does.
+	defaultTxTimeout = 5 * time.Second
+	// defaultReadTimeout bounds the non-locking /session snapshot read.
+	defaultReadTimeout = 3 * time.Second
+)
+
 // Handlers wires the HTTP endpoints to the repository.Engine. It holds no
-// state beyond the engine dependency — safe for concurrent use.
+// mutable state beyond the engine dependency and the per-request deadlines —
+// safe for concurrent use.
 type Handlers struct {
-	engine repository.Engine
+	engine      repository.Engine
+	txTimeout   time.Duration
+	readTimeout time.Duration
 }
 
 func NewHandlers(engine repository.Engine) *Handlers {
-	return &Handlers{engine: engine}
+	return &Handlers{
+		engine:      engine,
+		txTimeout:   defaultTxTimeout,
+		readTimeout: defaultReadTimeout,
+	}
+}
+
+// NewHandlersWithTimeouts overrides the per-request DB deadlines (e.g. from
+// config / load tests). Non-positive values fall back to the defaults.
+func NewHandlersWithTimeouts(engine repository.Engine, tx, read time.Duration) *Handlers {
+	h := NewHandlers(engine)
+	if tx > 0 {
+		h.txTimeout = tx
+	}
+	if read > 0 {
+		h.readTimeout = read
+	}
+	return h
+}
+
+// txContext derives a strictly-bounded context from the request context for a
+// state-mutating (locking) operation. The caller MUST defer the returned cancel.
+func (h *Handlers) txContext(c *gin.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(c.Request.Context(), h.txTimeout)
 }
 
 // Bet handles POST /api/v1/bet.
@@ -42,7 +83,9 @@ func (h *Handlers) Bet(c *gin.Context) {
 		return
 	}
 
-	result, err := h.engine.ProcessBet(c.Request.Context(), repository.BetRequest{
+	ctx, cancel := h.txContext(c)
+	defer cancel()
+	result, err := h.engine.ProcessBet(ctx, repository.BetRequest{
 		OperatorCode:          OperatorCodeFromContext(c.Request.Context()),
 		OperatorTransactionID: dto.OperatorTransactionID,
 		PlayerID:              playerID,
@@ -91,7 +134,9 @@ func (h *Handlers) Win(c *gin.Context) {
 		reference = ref
 	}
 
-	result, err := h.engine.ProcessWin(c.Request.Context(), repository.WinRequest{
+	ctx, cancel := h.txContext(c)
+	defer cancel()
+	result, err := h.engine.ProcessWin(ctx, repository.WinRequest{
 		OperatorCode:           OperatorCodeFromContext(c.Request.Context()),
 		OperatorTransactionID:  dto.OperatorTransactionID,
 		PlayerID:               playerID,
@@ -127,7 +172,9 @@ func (h *Handlers) Rollback(c *gin.Context) {
 		return
 	}
 
-	result, err := h.engine.ProcessRollback(c.Request.Context(), repository.RollbackRequest{
+	ctx, cancel := h.txContext(c)
+	defer cancel()
+	result, err := h.engine.ProcessRollback(ctx, repository.RollbackRequest{
 		OperatorCode:           OperatorCodeFromContext(c.Request.Context()),
 		OperatorTransactionID:  dto.OperatorTransactionID,
 		PlayerID:               playerID,
@@ -148,7 +195,11 @@ func (h *Handlers) Session(c *gin.Context) {
 		return
 	}
 
-	wallet, err := h.engine.GetBalances(c.Request.Context(), playerID)
+	// Even the non-locking snapshot read gets a hard deadline so a stalled
+	// backend can't pin a connection for a dropped client.
+	ctx, cancel := context.WithTimeout(c.Request.Context(), h.readTimeout)
+	defer cancel()
+	wallet, err := h.engine.GetBalances(ctx, playerID)
 	if err != nil {
 		respondError(c, err)
 		return
