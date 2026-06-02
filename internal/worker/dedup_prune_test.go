@@ -27,12 +27,22 @@ type fakeExecDB struct {
 	sequence []int64 // rows affected per call; last entry repeats
 	err      error
 	panicOn  int // 1-based call index to panic on; 0 = never
+	// called, if non-nil, receives a non-blocking signal on every Exec entry so
+	// a test can synchronize on "the sweep actually issued a statement" instead
+	// of guessing with a sleep.
+	called chan struct{}
 }
 
 func (f *fakeExecDB) Exec(_ context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
+	if f.called != nil {
+		select {
+		case f.called <- struct{}{}:
+		default:
+		}
+	}
 	if f.panicOn == f.calls {
 		panic("synthetic exec panic")
 	}
@@ -138,18 +148,28 @@ func TestPruneSweep_StopsOnContextCancel(t *testing.T) {
 	}
 }
 
-// Run performs an initial sweep then returns nil on context cancel.
+// Run performs an initial sweep then returns nil on context cancel. We
+// synchronize on the initial sweep's first Exec (via the `called` channel)
+// before cancelling, so the assertion can never race the goroutine scheduler —
+// a sleep-then-cancel could fire before Run was scheduled, leaving callCount 0.
 func TestPrune_Run_StopsOnContextCancel(t *testing.T) {
 	t.Parallel()
-	db := &fakeExecDB{sequence: []int64{0}} // nothing to delete
+	called := make(chan struct{}, 1)
+	db := &fakeExecDB{sequence: []int64{0}, called: called} // nothing to delete
 	p := NewDedupPruner(db, discardLogger(), WithPruneInterval(time.Hour), WithBatchPause(0))
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- p.Run(ctx) }()
 
-	// Give the initial sweep a beat, then stop.
-	time.Sleep(20 * time.Millisecond)
+	// Wait until the initial sweep has actually issued a prune statement, THEN
+	// cancel — deterministic, no timing assumptions.
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial sweep never issued a prune statement")
+	}
 	cancel()
 
 	select {
