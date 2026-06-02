@@ -57,6 +57,24 @@ const (
 		RETURNING id
 	`
 
+	// INSERT into ledger_transaction_dedup: the GLOBAL, cross-time idempotency
+	// anchor (migration 000005). ledger_transactions is RANGE-partitioned by
+	// created_at, so its UNIQUE(operator_code, operator_transaction_id,
+	// created_at) is only PARTITION-LOCAL — a webhook replayed on a later day
+	// lands in a different partition and would NOT raise 23505. This
+	// non-partitioned table's PK (operator_code, operator_transaction_id) is
+	// what makes a duplicate operator transaction collide regardless of when it
+	// arrives. Written in the SAME tx as the ledger_transactions row; the 23505
+	// it raises is what the engine catches for Ghost-Spin recovery (§6.A).
+	sqlInsertLedgerTxDedup = `
+		INSERT INTO ledger_transaction_dedup (
+			operator_code,
+			operator_transaction_id,
+			ledger_transaction_id
+		)
+		VALUES ($1, $2, $3)
+	`
+
 	// INSERT into ledger_entries: one row per debit or credit line.
 	// balance_after is NULL for HOUSE_* rows (per CHECK constraint).
 	sqlInsertLedgerEntry = `

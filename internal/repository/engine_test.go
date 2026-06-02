@@ -152,7 +152,8 @@ var (
 	rxSelectForUpdate   = regexp.QuoteMeta("FOR UPDATE")
 	rxSelectBalances    = `SELECT gc_balance.*FROM wallets`
 	rxUpdateWallet      = `UPDATE wallets`
-	rxInsertLedgerTx    = `INSERT INTO ledger_transactions`
+	rxInsertLedgerTx    = `INSERT INTO ledger_transactions \(`
+	rxInsertDedup       = `INSERT INTO ledger_transaction_dedup`
 	rxInsertLedgerEntry = `INSERT INTO ledger_entries`
 	rxSelectLedgerByOp  = `SELECT id, player_id, transaction_type.*FROM ledger_transactions`
 )
@@ -182,6 +183,10 @@ func TestProcessBet_GC_HappyPath(t *testing.T) {
 	mock.ExpectQuery(rxInsertLedgerTx).
 		WithArgs(operatorCode, "op-bet-1", playerID, "BET", gameID, roundID, nil, json.RawMessage("{}")).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(ledgerTxID))
+	// Global idempotency anchor (migration 000005), same tx.
+	mock.ExpectExec(rxInsertDedup).
+		WithArgs(operatorCode, "op-bet-1", ledgerTxID).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	// Player wallet debit
 	mock.ExpectExec(rxInsertLedgerEntry).
 		WithArgs(ledgerTxID, playerID, "PLAYER_WALLET", "GC", "DEBIT", dec("10.0000"), dec("90.0000")).
@@ -248,6 +253,9 @@ func TestProcessBet_SC_SplitsUnplayedThenRedeemable(t *testing.T) {
 	mock.ExpectQuery(rxInsertLedgerTx).
 		WithArgs(operatorCode, "op-bet-2", playerID, "BET", nil, nil, nil, json.RawMessage("{}")).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(ledgerTxID))
+	mock.ExpectExec(rxInsertDedup).
+		WithArgs(operatorCode, "op-bet-2", ledgerTxID).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 
 	// First debit: SC_UNPLAYED 30, balance_after 0
 	mock.ExpectExec(rxInsertLedgerEntry).
@@ -304,6 +312,9 @@ func TestProcessWin_SC_AlwaysRoutesToRedeemable(t *testing.T) {
 	mock.ExpectQuery(rxInsertLedgerTx).
 		WithArgs(operatorCode, "op-win-1", playerID, "WIN", gameID, roundID, nil, json.RawMessage("{}")).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(ledgerTxID))
+	mock.ExpectExec(rxInsertDedup).
+		WithArgs(operatorCode, "op-win-1", ledgerTxID).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectExec(rxInsertLedgerEntry).
 		WithArgs(ledgerTxID, playerID, "PLAYER_WALLET", "SC_REDEEMABLE", "CREDIT", dec("7.0000"), dec("17.0000")).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
@@ -483,12 +494,16 @@ func TestProcessBet_GhostSpinRecovery_OnUniqueViolation(t *testing.T) {
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("80.0000"), dec("0.0000"), dec("0.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
-	// The INSERT into ledger_transactions hits the operator UNIQUE index.
+	// ledger_transactions insert succeeds (its unique is only partition-local);
+	// the GLOBAL dedup insert is what raises 23505 on the duplicate.
 	mock.ExpectQuery(rxInsertLedgerTx).
 		WithArgs(operatorCode, "op-ghost", playerID, "BET", nil, nil, nil, json.RawMessage("{}")).
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(uuid.New()))
+	mock.ExpectExec(rxInsertDedup).
+		WithArgs(operatorCode, "op-ghost", pgxmock.AnyArg()).
 		WillReturnError(&pgconn.PgError{
 			Code:           pgerrcode.UniqueViolation,
-			ConstraintName: "ledger_tx_operator_unique",
+			ConstraintName: "ledger_transaction_dedup_pkey",
 		})
 	// Engine rolls the (now stale) tx back.
 	mock.ExpectRollback()
@@ -547,6 +562,9 @@ func TestProcessBet_GhostSpin_RejectsTxIDReuseAcrossPlayers(t *testing.T) {
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectQuery(rxInsertLedgerTx).
 		WithArgs(operatorCode, "op-reuse", playerA, "BET", nil, nil, nil, json.RawMessage("{}")).
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(uuid.New()))
+	mock.ExpectExec(rxInsertDedup).
+		WithArgs(operatorCode, "op-reuse", pgxmock.AnyArg()).
 		WillReturnError(&pgconn.PgError{Code: pgerrcode.UniqueViolation})
 	mock.ExpectRollback()
 	// Recovery lookup returns a DIFFERENT player — the operator violated the contract.
@@ -823,6 +841,9 @@ func TestProcessWin_GhostSpinRecovery(t *testing.T) {
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectQuery(rxInsertLedgerTx).
 		WithArgs(operatorCode, "op-win-ghost", playerID, "WIN", nil, nil, referenceID, json.RawMessage("{}")).
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(uuid.New()))
+	mock.ExpectExec(rxInsertDedup).
+		WithArgs(operatorCode, "op-win-ghost", pgxmock.AnyArg()).
 		WillReturnError(&pgconn.PgError{Code: pgerrcode.UniqueViolation})
 	mock.ExpectRollback()
 	mock.ExpectQuery(rxSelectLedgerByOp).
@@ -887,6 +908,9 @@ func TestProcessBet_CommitFails(t *testing.T) {
 	mock.ExpectQuery(rxInsertLedgerTx).
 		WithArgs(operatorCode, "op-cf", playerID, "BET", nil, nil, nil, json.RawMessage("{}")).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(ledgerTxID))
+	mock.ExpectExec(rxInsertDedup).
+		WithArgs(operatorCode, "op-cf", ledgerTxID).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectExec(rxInsertLedgerEntry).
 		WithArgs(ledgerTxID, playerID, "PLAYER_WALLET", "GC", "DEBIT", dec("10.0000"), dec("90.0000")).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
@@ -944,6 +968,9 @@ func TestProcessBet_GhostSpin_LedgerLookupMisses(t *testing.T) {
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectQuery(rxInsertLedgerTx).
 		WithArgs(operatorCode, "op-gone", playerID, "BET", nil, nil, nil, json.RawMessage("{}")).
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(uuid.New()))
+	mock.ExpectExec(rxInsertDedup).
+		WithArgs(operatorCode, "op-gone", pgxmock.AnyArg()).
 		WillReturnError(&pgconn.PgError{Code: pgerrcode.UniqueViolation})
 	mock.ExpectRollback()
 	// The recovery lookup returns nothing — should map to ErrTransactionConflict.
@@ -1005,6 +1032,9 @@ func TestProcessRollback_HappyPath_RestoresFunds(t *testing.T) {
 	mock.ExpectQuery(rxInsertLedgerTx).
 		WithArgs(operatorCode, "op-rb-1", playerID, "ROLLBACK", nil, nil, originalTxID, json.RawMessage("{}")).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(rollbackTxID))
+	mock.ExpectExec(rxInsertDedup).
+		WithArgs(operatorCode, "op-rb-1", rollbackTxID).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	// INSERT reverse entries: CREDIT to player, DEBIT to house bet pool.
 	mock.ExpectExec(rxInsertLedgerEntry).
 		WithArgs(rollbackTxID, playerID, "PLAYER_WALLET", "SC_REDEEMABLE", "CREDIT", dec("30.0000"), dec("100.0000")).

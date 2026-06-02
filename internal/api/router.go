@@ -13,7 +13,11 @@ import (
 // Config bundles the dependencies needed to build the HTTP router. All are
 // required except Logger (defaults to slog.Default).
 type Config struct {
-	Engine  repository.Engine
+	Engine repository.Engine
+	// Casino wires the real-money wrapper endpoints (player/create,
+	// store/purchase, store/redeem). Optional: when nil those routes are not
+	// registered (keeps the core-engine-only configuration valid).
+	Casino  repository.CasinoEngine
 	Redis   redis.UniversalClient
 	Secrets map[string]string // operator_code → HMAC-SHA256 shared secret
 	Logger  *slog.Logger
@@ -59,6 +63,14 @@ func NewRouter(cfg Config) *gin.Engine {
 		v1.POST("/win", handlers.Win)
 		v1.POST("/rollback", handlers.Rollback)
 		v1.GET("/session", handlers.Session)
+
+		// Real-money wrapper endpoints share the same HMAC + replay stack.
+		if cfg.Casino != nil {
+			casino := NewCasinoHandlers(cfg.Casino)
+			v1.POST("/player/create", casino.CreatePlayer)
+			v1.POST("/store/purchase", casino.Purchase)
+			v1.POST("/store/redeem", casino.Redeem)
+		}
 	}
 
 	return r

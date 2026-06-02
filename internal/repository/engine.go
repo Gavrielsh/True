@@ -642,6 +642,19 @@ func insertLedgerTx(ctx context.Context, tx pgx.Tx, p ledgerTxParams) (uuid.UUID
 		nullableUUID(p.Reference),
 		metadata,
 	).Scan(&id)
+	if err != nil {
+		// May still be 23505 from the partition-LOCAL composite unique on a
+		// same-instant retry; the caller treats any unique violation as a
+		// Ghost-Spin and recovers.
+		return id, err
+	}
+
+	// GLOBAL idempotency anchor (migration 000005). ledger_transactions is
+	// partitioned by created_at, so its unique is only partition-local; this
+	// non-partitioned dedup row is what makes a duplicate operator transaction
+	// collide no matter when the retry arrives. A 23505 here is THE durable
+	// Ghost-Spin signal — caller distinguishes it from other failures.
+	_, err = tx.Exec(ctx, sqlInsertLedgerTxDedup, p.OperatorCode, p.OperatorTransactionID, id)
 	return id, err // raw — caller distinguishes 23505 vs other failures.
 }
 

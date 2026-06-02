@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	"github.com/Gavrielsh/True/internal/cache"
 	"github.com/Gavrielsh/True/internal/config"
 	"github.com/Gavrielsh/True/internal/repository"
+	"github.com/Gavrielsh/True/internal/worker"
 )
 
 func main() {
@@ -73,8 +75,10 @@ func run() error {
 	// --- Wiring -------------------------------------------------------------
 	idem := cache.NewRedis(rdb)
 	eng := repository.New(pool, idem, logger)
+	casinoEng := repository.NewCasino(pool, idem, logger)
 	router := api.NewRouter(api.Config{
 		Engine:  eng,
+		Casino:  casinoEng,
 		Redis:   rdb,
 		Secrets: cfg.OperatorSecrets,
 		Logger:  logger,
@@ -93,6 +97,22 @@ func run() error {
 	// signal.NotifyContext cancels ctx on SIGINT/SIGTERM.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// --- Background workers -------------------------------------------------
+	// GGR aggregator: derives platform revenue from the ledger on an interval so
+	// gameplay never contends on a single platform-wallet row (architecture
+	// §6.C). It observes ctx and stops cleanly on signal; we wait for its
+	// in-flight cycle during shutdown. A cycle that fails (e.g. migration 000007
+	// not yet applied) is logged and retried — never fatal to the server.
+	aggregator := worker.New(pool, logger)
+	var workersWG sync.WaitGroup
+	workersWG.Add(1)
+	go func() {
+		defer workersWG.Done()
+		if err := aggregator.Run(ctx); err != nil {
+			logger.Error("ggr aggregator exited", slog.String("error", err.Error()))
+		}
+	}()
 
 	serverErr := make(chan error, 1)
 	go func() {
@@ -118,6 +138,11 @@ func run() error {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("graceful shutdown: %w", err)
 	}
+
+	// ctx (cancelled by the signal) also stops the aggregator; wait for its
+	// current cycle to unwind before the deferred pool.Close() runs.
+	workersWG.Wait()
+
 	logger.Info("server stopped cleanly")
 	return nil
 }
