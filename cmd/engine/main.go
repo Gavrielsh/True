@@ -26,6 +26,7 @@ import (
 	"github.com/Gavrielsh/True/internal/cache"
 	"github.com/Gavrielsh/True/internal/config"
 	"github.com/Gavrielsh/True/internal/repository"
+	"github.com/Gavrielsh/True/internal/telemetry"
 	"github.com/Gavrielsh/True/internal/worker"
 )
 
@@ -52,6 +53,15 @@ func run() error {
 	// Boot context: bounds the time we'll wait to establish connections.
 	bootCtx, cancelBoot := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancelBoot()
+
+	// --- Distributed tracing --------------------------------------------------
+	// Before everything else so every dependency below is born instrumented.
+	// An empty OTEL_EXPORTER_OTLP_ENDPOINT yields a no-op tracer (dev mode).
+	otelShutdown, err := telemetry.Init(bootCtx, "true-engine")
+	if err != nil {
+		return fmt.Errorf("telemetry: %w", err)
+	}
+	defer otelShutdown()
 
 	// --- Postgres -----------------------------------------------------------
 	pool, err := newPostgresPool(bootCtx, cfg)

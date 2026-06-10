@@ -5,9 +5,11 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/Gavrielsh/True/internal/domain"
 	"github.com/Gavrielsh/True/internal/repository"
+	"github.com/Gavrielsh/True/internal/telemetry"
 	"github.com/Gavrielsh/True/pkg/errors"
 )
 
@@ -123,7 +125,14 @@ func (h *CasinoHandlers) Purchase(c *gin.Context) {
 		return
 	}
 
-	result, err := h.casino.ProcessPurchase(c.Request.Context(), repository.PurchaseRequest{
+	// §9 DATA PRIVACY: identifiers only — never raw amounts in attributes.
+	ctx, span := telemetry.StartSpan(c.Request.Context(), "http.purchase",
+		attribute.String("player_id", playerID.String()),
+		attribute.String("operator_code", OperatorCodeFromContext(c.Request.Context())),
+		attribute.String("operator_transaction_id", dto.OperatorTransactionID),
+	)
+
+	result, err := h.casino.ProcessPurchase(ctx, repository.PurchaseRequest{
 		OperatorCode:          OperatorCodeFromContext(c.Request.Context()),
 		OperatorTransactionID: dto.OperatorTransactionID,
 		PlayerID:              playerID,
@@ -131,6 +140,7 @@ func (h *CasinoHandlers) Purchase(c *gin.Context) {
 		SCPromoAmount:         scPromo,
 		Metadata:              dto.Metadata,
 	})
+	telemetry.EndSpan(span, err)
 	if err != nil {
 		respondError(c, err)
 		return
@@ -155,13 +165,21 @@ func (h *CasinoHandlers) Redeem(c *gin.Context) {
 		return
 	}
 
-	result, err := h.casino.ProcessRedeem(c.Request.Context(), repository.RedeemRequest{
+	// §9 DATA PRIVACY: identifiers only — never raw amounts in attributes.
+	ctx, span := telemetry.StartSpan(c.Request.Context(), "http.redeem",
+		attribute.String("player_id", playerID.String()),
+		attribute.String("operator_code", OperatorCodeFromContext(c.Request.Context())),
+		attribute.String("operator_transaction_id", dto.OperatorTransactionID),
+	)
+
+	result, err := h.casino.ProcessRedeem(ctx, repository.RedeemRequest{
 		OperatorCode:          OperatorCodeFromContext(c.Request.Context()),
 		OperatorTransactionID: dto.OperatorTransactionID,
 		PlayerID:              playerID,
 		Amount:                amount,
 		Metadata:              dto.Metadata,
 	})
+	telemetry.EndSpan(span, err)
 	if err != nil {
 		respondError(c, err)
 		return

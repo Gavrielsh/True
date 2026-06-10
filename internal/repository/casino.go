@@ -27,9 +27,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/shopspring/decimal"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/Gavrielsh/True/internal/cache"
 	"github.com/Gavrielsh/True/internal/domain"
+	"github.com/Gavrielsh/True/internal/telemetry"
 	errs "github.com/Gavrielsh/True/pkg/errors"
 )
 
@@ -241,7 +243,12 @@ func (e *engine) ProcessPurchase(ctx context.Context, req PurchaseRequest) (TxRe
 	return result, nil
 }
 
-func (e *engine) processPurchaseTx(ctx context.Context, req PurchaseRequest) (TxResult, error) {
+func (e *engine) processPurchaseTx(ctx context.Context, req PurchaseRequest) (result TxResult, err error) {
+	// §9: player_id is a UUID (not PII); the amounts are deliberately omitted.
+	ctx, span := telemetry.StartSpan(ctx, "db.purchase_tx",
+		attribute.String("player_id", req.PlayerID.String()))
+	defer func() { telemetry.EndSpan(span, err) }()
+
 	tx, err := e.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return TxResult{}, fmt.Errorf("begin tx: %w", err)
@@ -283,6 +290,7 @@ func (e *engine) processPurchaseTx(ctx context.Context, req PurchaseRequest) (Tx
 		}
 		return TxResult{}, fmt.Errorf("insert ledger tx: %w", err)
 	}
+	span.SetAttributes(attribute.String("ledger_transaction_id", ledgerTxID.String()))
 
 	// Double-entry: each issued currency is a player CREDIT balanced by a
 	// HOUSE_ISSUANCE_POOL DEBIT of the same amount.
@@ -343,7 +351,11 @@ func (e *engine) ProcessRedeem(ctx context.Context, req RedeemRequest) (TxResult
 	return result, nil
 }
 
-func (e *engine) processRedeemTx(ctx context.Context, req RedeemRequest) (TxResult, error) {
+func (e *engine) processRedeemTx(ctx context.Context, req RedeemRequest) (result TxResult, err error) {
+	ctx, span := telemetry.StartSpan(ctx, "db.redeem_tx",
+		attribute.String("player_id", req.PlayerID.String()))
+	defer func() { telemetry.EndSpan(span, err) }()
+
 	tx, err := e.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return TxResult{}, fmt.Errorf("begin tx: %w", err)
@@ -387,6 +399,7 @@ func (e *engine) processRedeemTx(ctx context.Context, req RedeemRequest) (TxResu
 		}
 		return TxResult{}, fmt.Errorf("insert ledger tx: %w", err)
 	}
+	span.SetAttributes(attribute.String("ledger_transaction_id", ledgerTxID.String()))
 
 	// Double-entry: player SC_REDEEMABLE DEBIT balanced by HOUSE_REDEMPTION_POOL CREDIT.
 	balanceAfter := post.BalanceFor(alloc.Debit.Currency)

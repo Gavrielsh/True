@@ -7,9 +7,11 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/Gavrielsh/True/internal/domain"
 	"github.com/Gavrielsh/True/internal/repository"
+	"github.com/Gavrielsh/True/internal/telemetry"
 	"github.com/Gavrielsh/True/pkg/errors"
 )
 
@@ -56,12 +58,6 @@ func NewHandlersWithTimeouts(engine repository.Engine, tx, read time.Duration) *
 	return h
 }
 
-// txContext derives a strictly-bounded context from the request context for a
-// state-mutating (locking) operation. The caller MUST defer the returned cancel.
-func (h *Handlers) txContext(c *gin.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(c.Request.Context(), h.txTimeout)
-}
-
 // Bet handles POST /api/v1/bet.
 func (h *Handlers) Bet(c *gin.Context) {
 	var dto betRequestDTO
@@ -83,7 +79,16 @@ func (h *Handlers) Bet(c *gin.Context) {
 		return
 	}
 
-	ctx, cancel := h.txContext(c)
+	// Span attributes follow cursor rule §9 (DATA PRIVACY): identifiers only —
+	// player_id is a UUID (not PII), and raw amounts are NEVER attached.
+	spanCtx, span := telemetry.StartSpan(c.Request.Context(), "http.bet",
+		attribute.String("player_id", playerID.String()),
+		attribute.String("operator_code", OperatorCodeFromContext(c.Request.Context())),
+		attribute.String("operator_transaction_id", dto.OperatorTransactionID),
+		attribute.String("currency", family.String()),
+	)
+
+	ctx, cancel := context.WithTimeout(spanCtx, h.txTimeout)
 	defer cancel()
 	result, err := h.engine.ProcessBet(ctx, repository.BetRequest{
 		OperatorCode:          OperatorCodeFromContext(c.Request.Context()),
@@ -95,6 +100,7 @@ func (h *Handlers) Bet(c *gin.Context) {
 		RoundID:               dto.RoundID,
 		Metadata:              dto.Metadata,
 	})
+	telemetry.EndSpan(span, err)
 	if err != nil {
 		respondError(c, err)
 		return
@@ -134,7 +140,14 @@ func (h *Handlers) Win(c *gin.Context) {
 		reference = ref
 	}
 
-	ctx, cancel := h.txContext(c)
+	spanCtx, span := telemetry.StartSpan(c.Request.Context(), "http.win",
+		attribute.String("player_id", playerID.String()),
+		attribute.String("operator_code", OperatorCodeFromContext(c.Request.Context())),
+		attribute.String("operator_transaction_id", dto.OperatorTransactionID),
+		attribute.String("currency", family.String()),
+	)
+
+	ctx, cancel := context.WithTimeout(spanCtx, h.txTimeout)
 	defer cancel()
 	result, err := h.engine.ProcessWin(ctx, repository.WinRequest{
 		OperatorCode:           OperatorCodeFromContext(c.Request.Context()),
@@ -147,6 +160,7 @@ func (h *Handlers) Win(c *gin.Context) {
 		ReferenceTransactionID: reference,
 		Metadata:               dto.Metadata,
 	})
+	telemetry.EndSpan(span, err)
 	if err != nil {
 		respondError(c, err)
 		return
@@ -172,7 +186,14 @@ func (h *Handlers) Rollback(c *gin.Context) {
 		return
 	}
 
-	ctx, cancel := h.txContext(c)
+	spanCtx, span := telemetry.StartSpan(c.Request.Context(), "http.rollback",
+		attribute.String("player_id", playerID.String()),
+		attribute.String("operator_code", OperatorCodeFromContext(c.Request.Context())),
+		attribute.String("operator_transaction_id", dto.OperatorTransactionID),
+		attribute.String("reference_transaction_id", reference.String()),
+	)
+
+	ctx, cancel := context.WithTimeout(spanCtx, h.txTimeout)
 	defer cancel()
 	result, err := h.engine.ProcessRollback(ctx, repository.RollbackRequest{
 		OperatorCode:           OperatorCodeFromContext(c.Request.Context()),
@@ -181,6 +202,7 @@ func (h *Handlers) Rollback(c *gin.Context) {
 		ReferenceTransactionID: reference,
 		Metadata:               dto.Metadata,
 	})
+	telemetry.EndSpan(span, err)
 	if err != nil {
 		respondError(c, err)
 		return

@@ -21,10 +21,12 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/shopspring/decimal"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/Gavrielsh/True/internal/cache"
 	"github.com/Gavrielsh/True/internal/domain"
 	"github.com/Gavrielsh/True/internal/metrics"
+	"github.com/Gavrielsh/True/internal/telemetry"
 	errs "github.com/Gavrielsh/True/pkg/errors"
 )
 
@@ -118,8 +120,13 @@ func (e *engine) ProcessBet(ctx context.Context, req BetRequest) (TxResult, erro
 	return result, nil
 }
 
-func (e *engine) processBetTx(ctx context.Context, req BetRequest) (TxResult, error) {
+func (e *engine) processBetTx(ctx context.Context, req BetRequest) (result TxResult, err error) {
 	defer metrics.ObserveDBLockDuration(metrics.OpBet, time.Now())
+	// §9: player_id is a UUID (not PII); the amount is deliberately omitted.
+	ctx, span := telemetry.StartSpan(ctx, "db.bet_tx",
+		attribute.String("player_id", req.PlayerID.String()))
+	defer func() { telemetry.EndSpan(span, err) }()
+
 	tx, err := e.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return TxResult{}, fmt.Errorf("begin tx: %w", err)
@@ -179,6 +186,7 @@ func (e *engine) processBetTx(ctx context.Context, req BetRequest) (TxResult, er
 		}
 		return TxResult{}, fmt.Errorf("insert ledger tx: %w", err)
 	}
+	span.SetAttributes(attribute.String("ledger_transaction_id", ledgerTxID.String()))
 
 	// 5. INSERT ledger_entries — one debit row per Debit, plus one balancing
 	//    credit row against HOUSE_BET_POOL per debit currency.
@@ -242,8 +250,12 @@ func (e *engine) ProcessWin(ctx context.Context, req WinRequest) (TxResult, erro
 	return result, nil
 }
 
-func (e *engine) processWinTx(ctx context.Context, req WinRequest) (TxResult, error) {
+func (e *engine) processWinTx(ctx context.Context, req WinRequest) (result TxResult, err error) {
 	defer metrics.ObserveDBLockDuration(metrics.OpWin, time.Now())
+	ctx, span := telemetry.StartSpan(ctx, "db.win_tx",
+		attribute.String("player_id", req.PlayerID.String()))
+	defer func() { telemetry.EndSpan(span, err) }()
+
 	tx, err := e.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return TxResult{}, fmt.Errorf("begin tx: %w", err)
@@ -287,6 +299,7 @@ func (e *engine) processWinTx(ctx context.Context, req WinRequest) (TxResult, er
 		}
 		return TxResult{}, fmt.Errorf("insert ledger tx: %w", err)
 	}
+	span.SetAttributes(attribute.String("ledger_transaction_id", ledgerTxID.String()))
 
 	// One credit row for the player, one balancing debit against HOUSE_WIN_POOL.
 	balanceAfter := post.BalanceFor(credit.Credit.Currency)
@@ -345,8 +358,12 @@ func (e *engine) ProcessRollback(ctx context.Context, req RollbackRequest) (TxRe
 	return result, nil
 }
 
-func (e *engine) processRollbackTx(ctx context.Context, req RollbackRequest) (TxResult, error) {
+func (e *engine) processRollbackTx(ctx context.Context, req RollbackRequest) (result TxResult, err error) {
 	defer metrics.ObserveDBLockDuration(metrics.OpRollback, time.Now())
+	ctx, span := telemetry.StartSpan(ctx, "db.rollback_tx",
+		attribute.String("player_id", req.PlayerID.String()))
+	defer func() { telemetry.EndSpan(span, err) }()
+
 	tx, err := e.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return TxResult{}, fmt.Errorf("begin tx: %w", err)
@@ -460,6 +477,7 @@ func (e *engine) processRollbackTx(ctx context.Context, req RollbackRequest) (Tx
 		}
 		return TxResult{}, fmt.Errorf("insert rollback tx: %w", err)
 	}
+	span.SetAttributes(attribute.String("ledger_transaction_id", ledgerTxID.String()))
 
 	// 8. INSERT reverse ledger_entries — one CREDIT per original DEBIT.
 	for _, ent := range entries {

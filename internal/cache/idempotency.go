@@ -24,6 +24,9 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel/attribute"
+
+	"github.com/Gavrielsh/True/internal/telemetry"
 )
 
 // AcquireStatus enumerates the three outcomes of an Acquire call.
@@ -123,7 +126,14 @@ return {3, existing}
 // there is no SETNX-then-GET window for the TTL to expire through — the race
 // the previous implementation papered over with a "treat phantom miss as
 // Pending" branch simply cannot occur.
-func (r *Redis) Acquire(ctx context.Context, opTxID string) (AcquireStatus, string, error) {
+func (r *Redis) Acquire(ctx context.Context, opTxID string) (status AcquireStatus, payload string, err error) {
+	// The idempotency key is operator_code:operator_transaction_id — an
+	// identifier, not PII (§9), and the single most useful pivot when
+	// debugging a Ghost-Spin.
+	ctx, span := telemetry.StartSpan(ctx, "redis.idempotency_acquire",
+		attribute.String("idempotency_key", keyFor(opTxID)))
+	defer func() { telemetry.EndSpan(span, err) }()
+
 	if opTxID == "" {
 		return StatusUnknown, "", errors.New("idempotency: empty operator_transaction_id")
 	}
