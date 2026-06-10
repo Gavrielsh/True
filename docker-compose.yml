@@ -1,0 +1,68 @@
+# Dev/demo stack for the True Engine. NOT a production deployment: secrets
+# are inline defaults here for one-command bring-up; override them via a
+# .env file (gitignored) or your orchestrator's secret store.
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-true_engine}
+      POSTGRES_USER: ${POSTGRES_USER:-casino}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-casino-dev-password}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-casino} -d ${POSTGRES_DB:-true_engine}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports:
+      - "6379:6379"
+
+  engine:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    environment:
+      PORT: "8080"
+      POSTGRES_URL: postgres://${POSTGRES_USER:-casino}:${POSTGRES_PASSWORD:-casino-dev-password}@postgres:5432/${POSTGRES_DB:-true_engine}?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      # operator_code:hmac_secret pairs — dev values only.
+      OPERATOR_SECRETS: ${OPERATOR_SECRETS:-PRAGMATIC:dev-secret-pragmatic,HACKSAW:dev-secret-hacksaw}
+      ADMIN_PORT: "9090"
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-dev-admin-key}
+      RATE_LIMIT_RPS: "5000"
+      # Empty GEOIP_DB_PATH = geofence disabled (dev mode, WARN at boot).
+      GEOIP_DB_PATH: ${GEOIP_DB_PATH:-}
+      BLOCKED_REGIONS: ${BLOCKED_REGIONS:-US-WA,US-UT,US-ID,US-MI,US-NV}
+      OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "8080:8080" # operator API
+      - "9090:9090" # admin API
+    restart: unless-stopped
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317" # OTLP gRPC
+
+volumes:
+  postgres-data:

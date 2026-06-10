@@ -1,0 +1,16 @@
+# Minimal dev-mode collector: receive OTLP gRPC, log spans to stdout.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+exporters:
+  debug:
+    verbosity: normal
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [debug]
