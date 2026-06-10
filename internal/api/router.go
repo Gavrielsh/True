@@ -26,7 +26,10 @@ type Config struct {
 	// GeoFence rejects blocked jurisdictions on /api/v1. Optional: nil (or a
 	// disabled fence) skips geo-checking entirely (dev mode).
 	GeoFence *GeoFence
-	Logger   *slog.Logger
+	// RateLimiter enforces operator- and player-scope sliding windows.
+	// Optional: nil disables rate limiting.
+	RateLimiter *RateLimiter
+	Logger      *slog.Logger
 }
 
 // NewRouter assembles the gin.Engine with the full middleware stack.
@@ -63,12 +66,19 @@ func NewRouter(cfg Config) *gin.Engine {
 	// instruments at init.
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
-	handlers := NewHandlers(cfg.Engine)
+	handlers := NewHandlers(cfg.Engine).WithRateLimiter(cfg.RateLimiter)
 	hmacMW := NewHMACVerifier(cfg.Secrets).Middleware()
 	replayMW := NewReplayGuard(cfg.Redis).Middleware()
 
 	v1 := r.Group("/api/v1")
-	v1.Use(hmacMW, replayMW)
+	// Operator-scope rate limiting sits AFTER HMAC (operator_code is verified,
+	// never client-claimed) and BEFORE the replay guard (a throttled retry
+	// must not burn its nonce).
+	v1.Use(hmacMW)
+	if cfg.RateLimiter != nil {
+		v1.Use(cfg.RateLimiter.OperatorMiddleware())
+	}
+	v1.Use(replayMW)
 	// Geo-fence runs AFTER HMAC + replay: only authenticated, non-replayed
 	// operator traffic reaches the jurisdiction check, so the fence can never
 	// be used as an unauthenticated region-probing oracle.

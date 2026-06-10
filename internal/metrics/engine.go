@@ -42,6 +42,13 @@ var (
 		Help: "Requests rejected by the geo-fence, by blocked ISO-3166-2 region.",
 	}, []string{"region"})
 
+	// RateLimitedRequests counts 429 rejections by scope (operator|player) —
+	// a bounded two-value label.
+	RateLimitedRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "engine_rate_limited_requests_total",
+		Help: "Requests rejected by the sliding-window rate limiter, by scope.",
+	}, []string{"scope"})
+
 	// DBLockDuration measures one full DB execution window — BEGIN through
 	// COMMIT/ROLLBACK — for the money-moving paths. Because the wallet row is
 	// locked FOR UPDATE for almost this entire window, this histogram is the

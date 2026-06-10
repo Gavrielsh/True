@@ -33,6 +33,7 @@ const (
 // safe for concurrent use.
 type Handlers struct {
 	engine      repository.Engine
+	limiter     *RateLimiter // nil = player-scope rate limiting disabled
 	txTimeout   time.Duration
 	readTimeout time.Duration
 }
@@ -43,6 +44,13 @@ func NewHandlers(engine repository.Engine) *Handlers {
 		txTimeout:   defaultTxTimeout,
 		readTimeout: defaultReadTimeout,
 	}
+}
+
+// WithRateLimiter enables the per-player sliding window inside each money
+// handler. Returns h for chaining at wire-up time.
+func (h *Handlers) WithRateLimiter(rl *RateLimiter) *Handlers {
+	h.limiter = rl
+	return h
 }
 
 // NewHandlersWithTimeouts overrides the per-request DB deadlines (e.g. from
@@ -76,6 +84,11 @@ func (h *Handlers) Bet(c *gin.Context) {
 	}
 	amount, ok := parseAmount(c, dto.Amount)
 	if !ok {
+		return
+	}
+
+	// Player-scope rate limit: body is parsed (player_id is signed/verified).
+	if playerLimited(c, h.limiter, "bet", playerID) {
 		return
 	}
 
@@ -140,6 +153,11 @@ func (h *Handlers) Win(c *gin.Context) {
 		reference = ref
 	}
 
+	// Player-scope rate limit: body is parsed (player_id is signed/verified).
+	if playerLimited(c, h.limiter, "win", playerID) {
+		return
+	}
+
 	spanCtx, span := telemetry.StartSpan(c.Request.Context(), "http.win",
 		attribute.String("player_id", playerID.String()),
 		attribute.String("operator_code", OperatorCodeFromContext(c.Request.Context())),
@@ -183,6 +201,11 @@ func (h *Handlers) Rollback(c *gin.Context) {
 	reference, err := uuid.Parse(dto.ReferenceTransactionID)
 	if err != nil {
 		respondErrorCode(c, http.StatusBadRequest, errors.CodeInvalidAmount, "invalid reference_transaction_id")
+		return
+	}
+
+	// Player-scope rate limit: body is parsed (player_id is signed/verified).
+	if playerLimited(c, h.limiter, "rollback", playerID) {
 		return
 	}
 

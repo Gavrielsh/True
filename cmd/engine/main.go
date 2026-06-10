@@ -108,14 +108,17 @@ func run() error {
 		}
 	}()
 
+	limiter := api.NewRateLimiter(rdb, logger, api.WithOperatorRPS(cfg.RateLimitRPS))
+
 	router := api.NewRouter(api.Config{
-		Engine:   eng,
-		Casino:   casinoEng,
-		DB:       pool,
-		Redis:    rdb,
-		Secrets:  cfg.OperatorSecrets,
-		GeoFence: geoFence,
-		Logger:   logger,
+		Engine:      eng,
+		Casino:      casinoEng,
+		DB:          pool,
+		Redis:       rdb,
+		Secrets:     cfg.OperatorSecrets,
+		GeoFence:    geoFence,
+		RateLimiter: limiter,
+		Logger:      logger,
 	})
 
 	srv := &http.Server{
