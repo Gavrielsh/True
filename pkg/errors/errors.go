@@ -42,7 +42,10 @@ const (
 	CodeRollbackNotFound    Code = "ROLLBACK_NOT_FOUND"
 	CodeRollbackAlready     Code = "ROLLBACK_ALREADY"
 	CodeRollbackUnsupported Code = "ROLLBACK_UNSUPPORTED"
-	CodeInternal            Code = "INTERNAL_ERROR"
+	// CodeGeoBlocked is returned by the jurisdiction fence (no sentinel error:
+	// the middleware rejects before any domain call).
+	CodeGeoBlocked Code = "GEO_BLOCKED"
+	CodeInternal   Code = "INTERNAL_ERROR"
 )
 
 // CodeFor maps any error to its public code. Returns CodeOK for nil and

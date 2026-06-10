@@ -23,7 +23,10 @@ type Config struct {
 	DB      Pinger
 	Redis   redis.UniversalClient
 	Secrets map[string]string // operator_code → HMAC-SHA256 shared secret
-	Logger  *slog.Logger
+	// GeoFence rejects blocked jurisdictions on /api/v1. Optional: nil (or a
+	// disabled fence) skips geo-checking entirely (dev mode).
+	GeoFence *GeoFence
+	Logger   *slog.Logger
 }
 
 // NewRouter assembles the gin.Engine with the full middleware stack.
@@ -66,6 +69,12 @@ func NewRouter(cfg Config) *gin.Engine {
 
 	v1 := r.Group("/api/v1")
 	v1.Use(hmacMW, replayMW)
+	// Geo-fence runs AFTER HMAC + replay: only authenticated, non-replayed
+	// operator traffic reaches the jurisdiction check, so the fence can never
+	// be used as an unauthenticated region-probing oracle.
+	if cfg.GeoFence.Enabled() {
+		v1.Use(cfg.GeoFence.Middleware())
+	}
 	{
 		v1.POST("/bet", handlers.Bet)
 		v1.POST("/win", handlers.Win)

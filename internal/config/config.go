@@ -38,6 +38,13 @@ type Config struct {
 	// requests to drain before forcing the server closed.
 	ShutdownTimeout time.Duration
 
+	// GeoIPDBPath locates the MaxMind GeoLite2 database. Empty disables
+	// geo-fencing (dev mode; logged as WARN at startup).
+	GeoIPDBPath string
+	// BlockedRegions are ISO-3166-2 codes (e.g. US-WA) rejected by the
+	// geo-fence. Parsed from comma-separated BLOCKED_REGIONS.
+	BlockedRegions []string
+
 	// DB holds the HFT-ready pgxpool tuning (see DBConfig).
 	DB DBConfig
 }
@@ -103,6 +110,8 @@ func Load() (Config, error) {
 		WriteTimeout:      l.duration("HTTP_WRITE_TIMEOUT", 15*time.Second),
 		IdleTimeout:       l.duration("HTTP_IDLE_TIMEOUT", 60*time.Second),
 		ShutdownTimeout:   l.duration("SHUTDOWN_TIMEOUT", 30*time.Second),
+		GeoIPDBPath:       l.str("GEOIP_DB_PATH", ""),
+		BlockedRegions:    splitCSV(l.str("BLOCKED_REGIONS", "")),
 		DB:                l.dbConfig(),
 	}
 	rawSecrets := l.required("OPERATOR_SECRETS")
@@ -178,6 +187,18 @@ func parseOperatorSecrets(raw string) (map[string]string, error) {
 		out[code] = secret
 	}
 	return validateSecrets(out)
+}
+
+// splitCSV splits a comma-separated list, trimming whitespace and dropping
+// empty entries. Returns nil for an empty input.
+func splitCSV(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func validateSecrets(m map[string]string) (map[string]string, error) {

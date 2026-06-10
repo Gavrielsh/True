@@ -85,13 +85,27 @@ func run() error {
 	idem := cache.NewRedis(rdb)
 	eng := repository.New(pool, idem, logger)
 	casinoEng := repository.NewCasino(pool, idem, logger)
+
+	// Geo-fence: jurisdiction blocking for restricted US states. An empty
+	// GEOIP_DB_PATH disables it with a startup WARN (dev mode).
+	geoFence, err := api.NewGeoFence(cfg.GeoIPDBPath, cfg.BlockedRegions, logger)
+	if err != nil {
+		return fmt.Errorf("geofence: %w", err)
+	}
+	defer func() {
+		if cerr := geoFence.Close(); cerr != nil {
+			logger.Warn("geofence close", slog.String("error", cerr.Error()))
+		}
+	}()
+
 	router := api.NewRouter(api.Config{
-		Engine:  eng,
-		Casino:  casinoEng,
-		DB:      pool,
-		Redis:   rdb,
-		Secrets: cfg.OperatorSecrets,
-		Logger:  logger,
+		Engine:   eng,
+		Casino:   casinoEng,
+		DB:       pool,
+		Redis:    rdb,
+		Secrets:  cfg.OperatorSecrets,
+		GeoFence: geoFence,
+		Logger:   logger,
 	})
 
 	srv := &http.Server{

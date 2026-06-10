@@ -34,6 +34,14 @@ var (
 		Help: "Total ledger 23505 conflicts successfully replayed via Ghost-Spin recovery.",
 	})
 
+	// GeoBlockedRequests counts requests rejected by the jurisdiction fence,
+	// per ISO-3166-2 region. Region codes come from the operator-configured
+	// blocklist — a small bounded set, safe as a label.
+	GeoBlockedRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "engine_geo_blocked_requests_total",
+		Help: "Requests rejected by the geo-fence, by blocked ISO-3166-2 region.",
+	}, []string{"region"})
+
 	// DBLockDuration measures one full DB execution window — BEGIN through
 	// COMMIT/ROLLBACK — for the money-moving paths. Because the wallet row is
 	// locked FOR UPDATE for almost this entire window, this histogram is the
