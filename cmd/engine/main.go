@@ -184,14 +184,18 @@ func run() error {
 	// runWorker adds an outermost defensive recover so a panic in the worker
 	// scaffolding itself can never crash the HTTP server. A failed cycle (e.g.
 	// migration 000007 not yet applied) is logged and retried — never fatal.
+	// Reconciler: re-derives every wallet balance from the append-only ledger
+	// and alerts (never corrects) on divergence — the integrity audit.
 	aggregator := worker.New(pool, logger)
 	pruner := worker.NewDedupPruner(pool, logger)
 	partitioner := worker.NewPartitioner(pool, logger)
+	reconciler := worker.NewReconciler(pool, logger)
 
 	var workersWG sync.WaitGroup
 	runWorker(ctx, &workersWG, logger, "ggr_aggregator", aggregator.Run)
 	runWorker(ctx, &workersWG, logger, "dedup_pruner", pruner.Run)
 	runWorker(ctx, &workersWG, logger, "partitioner", partitioner.Run)
+	runWorker(ctx, &workersWG, logger, "reconciler", reconciler.Run)
 
 	serverErr := make(chan error, 1)
 	go func() {

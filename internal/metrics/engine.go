@@ -42,6 +42,15 @@ var (
 		Help: "Requests rejected by the geo-fence, by blocked ISO-3166-2 region.",
 	}, []string{"region"})
 
+	// ReconciliationMismatches counts (player, currency) pairs whose wallets
+	// cache diverged from the ledger-derived balance. ANY increment is a
+	// page-the-humans event — the ledger is the source of truth and the
+	// reconciler never auto-corrects.
+	ReconciliationMismatches = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "engine_reconciliation_mismatches_total",
+		Help: "Wallet-vs-ledger balance mismatches found by the reconciliation worker, by currency.",
+	}, []string{"currency"})
+
 	// RateLimitedRequests counts 429 rejections by scope (operator|player) —
 	// a bounded two-value label.
 	RateLimitedRequests = promauto.NewCounterVec(prometheus.CounterOpts{
