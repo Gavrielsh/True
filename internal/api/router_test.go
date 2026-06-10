@@ -142,6 +142,24 @@ func TestRouter_Healthz(t *testing.T) {
 	}
 }
 
+// /metrics must be reachable WITHOUT HMAC headers (the scraper has none) and
+// must serve the engine instruments from the default registry.
+func TestRouter_Metrics(t *testing.T) {
+	t.Parallel()
+	srv := fullStack(t, &fakeEngine{}, "s")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("metrics: got %d want 200; body=%s", w.Code, w.Body.String())
+	}
+	// The plain counter is exported even at zero, so its presence proves the
+	// engine instruments are registered where promhttp serves from. (The
+	// histogram vec only appears once a labelled series has been observed.)
+	if !strings.Contains(w.Body.String(), "engine_ghost_spins_recovered_total") {
+		t.Errorf("metrics body missing engine_ghost_spins_recovered_total:\n%s", w.Body.String())
+	}
+}
+
 // small money helpers local to this file
 func m(t *testing.T, s string) domain.Money { return mustMoney(t, s) }
 func mzero(t *testing.T) domain.Money       { return mustMoney(t, "0.0000") }

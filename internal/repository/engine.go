@@ -24,6 +24,7 @@ import (
 
 	"github.com/Gavrielsh/True/internal/cache"
 	"github.com/Gavrielsh/True/internal/domain"
+	"github.com/Gavrielsh/True/internal/metrics"
 	errs "github.com/Gavrielsh/True/pkg/errors"
 )
 
@@ -118,6 +119,7 @@ func (e *engine) ProcessBet(ctx context.Context, req BetRequest) (TxResult, erro
 }
 
 func (e *engine) processBetTx(ctx context.Context, req BetRequest) (TxResult, error) {
+	defer metrics.ObserveDBTransaction(metrics.OpBet, time.Now())
 	tx, err := e.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return TxResult{}, fmt.Errorf("begin tx: %w", err)
@@ -236,6 +238,7 @@ func (e *engine) ProcessWin(ctx context.Context, req WinRequest) (TxResult, erro
 }
 
 func (e *engine) processWinTx(ctx context.Context, req WinRequest) (TxResult, error) {
+	defer metrics.ObserveDBTransaction(metrics.OpWin, time.Now())
 	tx, err := e.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return TxResult{}, fmt.Errorf("begin tx: %w", err)
@@ -333,6 +336,7 @@ func (e *engine) ProcessRollback(ctx context.Context, req RollbackRequest) (TxRe
 }
 
 func (e *engine) processRollbackTx(ctx context.Context, req RollbackRequest) (TxResult, error) {
+	defer metrics.ObserveDBTransaction(metrics.OpRollback, time.Now())
 	tx, err := e.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return TxResult{}, fmt.Errorf("begin tx: %w", err)
@@ -586,6 +590,7 @@ func (e *engine) recoverGhostSpin(
 
 	// Best-effort cache write so the next retry hits the fast Cached path.
 	e.cacheResultQuietly(ctx, idempotencyKey(operatorCode, opTxID), result)
+	metrics.GhostSpinsRecovered.Inc()
 	return result, nil
 }
 

@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Gavrielsh/True/internal/repository"
@@ -51,6 +52,12 @@ func NewRouter(cfg Config) *gin.Engine {
 	r.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
+
+	// Prometheus scrape endpoint. Unauthenticated like /healthz — exposed for
+	// the cluster-internal scraper, NOT routed through the operator gateway.
+	// Serves the default registry, where internal/metrics registers the engine
+	// instruments at init.
+	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	handlers := NewHandlers(cfg.Engine)
 	hmacMW := NewHMACVerifier(cfg.Secrets).Middleware()

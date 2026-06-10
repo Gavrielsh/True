@@ -15,10 +15,12 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/pashagolub/pgxmock/v4"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/shopspring/decimal"
 
 	"github.com/Gavrielsh/True/internal/cache"
 	"github.com/Gavrielsh/True/internal/domain"
+	"github.com/Gavrielsh/True/internal/metrics"
 	errs "github.com/Gavrielsh/True/pkg/errors"
 )
 
@@ -490,6 +492,7 @@ func TestProcessBet_GhostSpinRecovery_OnUniqueViolation(t *testing.T) {
 	e, mock, idem := newEngine(t)
 	playerID := uuid.New()
 	committedLedgerID := uuid.New() // the tx id from the first (committed) attempt
+	ghostsBefore := testutil.ToFloat64(metrics.GhostSpinsRecovered)
 
 	mock.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	mock.ExpectQuery(rxSelectForUpdate).
@@ -545,6 +548,12 @@ func TestProcessBet_GhostSpinRecovery_OnUniqueViolation(t *testing.T) {
 	idemKey := idempotencyKey(operatorCode, "op-ghost")
 	if _, ok := idem.stored[idemKey]; !ok {
 		t.Errorf("ghost recovery must populate the idempotency cache")
+	}
+
+	// Successful recovery must be observable. The counter is global and other
+	// parallel ghost tests may also increment it, so assert >= +1, not == +1.
+	if got := testutil.ToFloat64(metrics.GhostSpinsRecovered); got < ghostsBefore+1 {
+		t.Errorf("engine_ghost_spins_recovered_total: got %v want >= %v", got, ghostsBefore+1)
 	}
 }
 
