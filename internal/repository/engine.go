@@ -133,6 +133,11 @@ func (e *engine) processBetTx(ctx context.Context, req BetRequest) (TxResult, er
 		return TxResult{}, err
 	}
 
+	// 1b. KYC/compliance guard — same tx handle, serialized by the lock above.
+	if err := requirePlayerActive(ctx, tx, req.PlayerID); err != nil {
+		return TxResult{}, err
+	}
+
 	// 2. Pure domain math — runs entirely in CPU, no I/O. The lock window
 	//    therefore stays bounded by the surrounding SQL roundtrips, not by
 	//    any allocator or formatting code.
@@ -247,6 +252,11 @@ func (e *engine) processWinTx(ctx context.Context, req WinRequest) (TxResult, er
 
 	wallet, err := selectWalletForUpdate(ctx, tx, req.PlayerID)
 	if err != nil {
+		return TxResult{}, err
+	}
+
+	// KYC/compliance guard — same tx handle, serialized by the lock above.
+	if err := requirePlayerActive(ctx, tx, req.PlayerID); err != nil {
 		return TxResult{}, err
 	}
 
@@ -608,6 +618,28 @@ func selectWalletForUpdate(ctx context.Context, tx pgx.Tx, playerID uuid.UUID) (
 		return domain.Wallet{}, fmt.Errorf("select for update: %w", err)
 	}
 	return walletFromDecimals(playerID, gc, scU, scR)
+}
+
+// requirePlayerActive is the KYC/compliance guard: only ACTIVE players may
+// move money. It MUST run on the same tx handle, after selectWalletForUpdate,
+// so the check is serialized with concurrent status changes by the wallet
+// row lock — never on a fresh pool connection, which could read a snapshot
+// unordered with respect to this player's queued transactions.
+func requirePlayerActive(ctx context.Context, tx pgx.Tx, playerID uuid.UUID) error {
+	var status string
+	err := tx.QueryRow(ctx, sqlSelectPlayerStatus, playerID).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Wallet row exists but the user row doesn't — a provisioning bug, but
+		// to the operator the player simply isn't playable.
+		return errs.ErrPlayerNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("select player status: %w", err)
+	}
+	if status != "ACTIVE" {
+		return fmt.Errorf("%w: player status is %s", errs.ErrPlayerNotActive, status)
+	}
+	return nil
 }
 
 func updateWalletBalances(ctx context.Context, tx pgx.Tx, playerID uuid.UUID, post domain.Wallet) error {

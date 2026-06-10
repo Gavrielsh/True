@@ -169,6 +169,18 @@ func walletRows(gc, scU, scR string) *pgxmock.Rows {
 		AddRow(decimal.RequireFromString(gc), decimal.RequireFromString(scU), decimal.RequireFromString(scR))
 }
 
+// rxSelectPlayerStatus matches the KYC guard query that runs right after the
+// wallet FOR UPDATE in every money-moving flow.
+var rxSelectPlayerStatus = `SELECT status FROM users WHERE id`
+
+// expectPlayerStatus registers the KYC guard expectation returning the given
+// user_status for playerID.
+func expectPlayerStatus(mock pgxmock.PgxPoolIface, playerID uuid.UUID, status string) {
+	mock.ExpectQuery(rxSelectPlayerStatus).
+		WithArgs(playerID).
+		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow(status))
+}
+
 // ----------------------------------------------------------------------------
 // Happy path: GC bet (single debit, no SC split)
 // ----------------------------------------------------------------------------
@@ -183,6 +195,7 @@ func TestProcessBet_GC_HappyPath(t *testing.T) {
 	mock.ExpectQuery(rxSelectForUpdate).
 		WithArgs(playerID).
 		WillReturnRows(walletRows("100.0000", "0.0000", "0.0000"))
+	expectPlayerStatus(mock, playerID, "ACTIVE")
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("90.0000"), dec("0.0000"), dec("0.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
@@ -252,6 +265,7 @@ func TestProcessBet_SC_SplitsUnplayedThenRedeemable(t *testing.T) {
 	mock.ExpectQuery(rxSelectForUpdate).
 		WithArgs(playerID).
 		WillReturnRows(walletRows("0.0000", "30.0000", "100.0000"))
+	expectPlayerStatus(mock, playerID, "ACTIVE")
 	// Post-state: 0/0/80 — debit 30 from unplayed, 20 from redeemable.
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("0.0000"), dec("0.0000"), dec("80.0000"), playerID).
@@ -311,6 +325,7 @@ func TestProcessWin_SC_AlwaysRoutesToRedeemable(t *testing.T) {
 	mock.ExpectQuery(rxSelectForUpdate).
 		WithArgs(playerID).
 		WillReturnRows(walletRows("0.0000", "5.0000", "10.0000"))
+	expectPlayerStatus(mock, playerID, "ACTIVE")
 	// Win 7 → SC_REDEEMABLE 10 -> 17 (NOT split into unplayed).
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("0.0000"), dec("5.0000"), dec("17.0000"), playerID).
@@ -362,6 +377,7 @@ func TestProcessBet_InsufficientFunds_ReleasesLockAndRollsBack(t *testing.T) {
 	mock.ExpectQuery(rxSelectForUpdate).
 		WithArgs(playerID).
 		WillReturnRows(walletRows("5.0000", "0.0000", "0.0000"))
+	expectPlayerStatus(mock, playerID, "ACTIVE")
 	// No UPDATE, no INSERTs — the allocator rejects before any mutating SQL.
 	mock.ExpectRollback()
 
@@ -498,6 +514,7 @@ func TestProcessBet_GhostSpinRecovery_OnUniqueViolation(t *testing.T) {
 	mock.ExpectQuery(rxSelectForUpdate).
 		WithArgs(playerID).
 		WillReturnRows(walletRows("90.0000", "0.0000", "0.0000")) // post-state of original commit
+	expectPlayerStatus(mock, playerID, "ACTIVE")
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("80.0000"), dec("0.0000"), dec("0.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
@@ -570,6 +587,7 @@ func TestProcessBet_GhostSpin_RejectsTxIDReuseAcrossPlayers(t *testing.T) {
 	mock.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerA).
 		WillReturnRows(walletRows("100.0000", "0.0000", "0.0000"))
+	expectPlayerStatus(mock, playerA, "ACTIVE")
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("90.0000"), dec("0.0000"), dec("0.0000"), playerA).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
@@ -849,6 +867,7 @@ func TestProcessWin_GhostSpinRecovery(t *testing.T) {
 	mock.ExpectQuery(rxSelectForUpdate).
 		WithArgs(playerID).
 		WillReturnRows(walletRows("0.0000", "0.0000", "10.0000"))
+	expectPlayerStatus(mock, playerID, "ACTIVE")
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("0.0000"), dec("0.0000"), dec("15.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
@@ -915,6 +934,7 @@ func TestProcessBet_CommitFails(t *testing.T) {
 	mock.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("100.0000", "0.0000", "0.0000"))
+	expectPlayerStatus(mock, playerID, "ACTIVE")
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("90.0000"), dec("0.0000"), dec("0.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
@@ -954,6 +974,7 @@ func TestProcessBet_UpdateZeroRowsAffected_FailsClosed(t *testing.T) {
 	mock.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("100.0000", "0.0000", "0.0000"))
+	expectPlayerStatus(mock, playerID, "ACTIVE")
 	// UPDATE returns 0 rows: schema corruption / bad routing — engine must reject.
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("90.0000"), dec("0.0000"), dec("0.0000"), playerID).
@@ -976,6 +997,7 @@ func TestProcessBet_GhostSpin_LedgerLookupMisses(t *testing.T) {
 	mock.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("100.0000", "0.0000", "0.0000"))
+	expectPlayerStatus(mock, playerID, "ACTIVE")
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("90.0000"), dec("0.0000"), dec("0.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
@@ -1269,3 +1291,138 @@ func TestProcessRollback_Validation(t *testing.T) {
 		})
 	}
 }
+
+// ----------------------------------------------------------------------------
+// KYC / player status guard: only ACTIVE players may move money. The check
+// runs on the SAME tx handle, after the wallet FOR UPDATE, in every flow.
+// ----------------------------------------------------------------------------
+
+// TestProcessBet_PlayerStatusGuard drives the full status table through the
+// bet flow: ACTIVE proceeds to commit; every other lifecycle state aborts
+// before any mutating SQL with ErrPlayerNotActive.
+func TestProcessBet_PlayerStatusGuard(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		status  string
+		blocked bool
+	}{
+		{"ACTIVE", false},
+		{"KYC_PENDING", true},
+		{"SUSPENDED", true},
+		{"CLOSED", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.status, func(t *testing.T) {
+			t.Parallel()
+			e, mock, idem := newEngine(t)
+			playerID := uuid.New()
+			ledgerTxID := uuid.New()
+			opTxID := "op-status-" + tc.status
+
+			mock.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+			mock.ExpectQuery(rxSelectForUpdate).
+				WithArgs(playerID).
+				WillReturnRows(walletRows("100.0000", "0.0000", "0.0000"))
+			expectPlayerStatus(mock, playerID, tc.status)
+			if tc.blocked {
+				// Guard aborts BEFORE any UPDATE/INSERT — only the rollback follows.
+				mock.ExpectRollback()
+			} else {
+				mock.ExpectExec(rxUpdateWallet).
+					WithArgs(dec("90.0000"), dec("0.0000"), dec("0.0000"), playerID).
+					WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+				mock.ExpectQuery(rxInsertLedgerTx).
+					WithArgs(operatorCode, opTxID, playerID, "BET", nil, nil, nil, json.RawMessage("{}")).
+					WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(ledgerTxID))
+				mock.ExpectExec(rxInsertDedup).
+					WithArgs(operatorCode, opTxID, ledgerTxID).
+					WillReturnResult(pgxmock.NewResult("INSERT", 1))
+				mock.ExpectExec(rxInsertLedgerEntry).
+					WithArgs(ledgerTxID, playerID, "PLAYER_WALLET", "GC", "DEBIT", dec("10.0000"), dec("90.0000")).
+					WillReturnResult(pgxmock.NewResult("INSERT", 1))
+				mock.ExpectExec(rxInsertLedgerEntry).
+					WithArgs(ledgerTxID, nil, "HOUSE_BET_POOL", "GC", "CREDIT", dec("10.0000"), nil).
+					WillReturnResult(pgxmock.NewResult("INSERT", 1))
+				mock.ExpectCommit()
+			}
+
+			_, err := e.ProcessBet(context.Background(), BetRequest{
+				OperatorCode:          operatorCode,
+				OperatorTransactionID: opTxID,
+				PlayerID:              playerID,
+				Family:                domain.FamilyGC,
+				Amount:                mustMoney(t, "10.0000"),
+			})
+			if tc.blocked {
+				if !errors.Is(err, errs.ErrPlayerNotActive) {
+					t.Fatalf("err: got %v want wrapping ErrPlayerNotActive", err)
+				}
+				idemKey := idempotencyKey(operatorCode, opTxID)
+				if cnt := idem.released[idemKey]; cnt != 1 {
+					t.Errorf("Release count: got %d want 1 (PROCESSING must be cleared)", cnt)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ProcessBet (ACTIVE): %v", err)
+			}
+		})
+	}
+}
+
+// TestPlayerStatusGuard_AllMoneyFlowsBlocked proves the guard is wired into
+// every money-moving flow (win, purchase, redeem — bet covered above): a
+// SUSPENDED player is rejected right after the wallet lock with no mutation.
+func TestPlayerStatusGuard_AllMoneyFlowsBlocked(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		call func(e Engine, ce CasinoEngine, playerID uuid.UUID) error
+	}{
+		{"win", func(e Engine, _ CasinoEngine, playerID uuid.UUID) error {
+			_, err := e.ProcessWin(context.Background(), WinRequest{
+				OperatorCode: operatorCode, OperatorTransactionID: "op-st-win",
+				PlayerID: playerID, Family: domain.FamilySC,
+				Amount: decimalMoney(t, "5.0000"),
+			})
+			return err
+		}},
+		{"purchase", func(_ Engine, ce CasinoEngine, playerID uuid.UUID) error {
+			_, err := ce.ProcessPurchase(context.Background(), PurchaseRequest{
+				OperatorCode: operatorCode, OperatorTransactionID: "op-st-pur",
+				PlayerID: playerID, GCAmount: decimalMoney(t, "100.0000"),
+			})
+			return err
+		}},
+		{"redeem", func(_ Engine, ce CasinoEngine, playerID uuid.UUID) error {
+			_, err := ce.ProcessRedeem(context.Background(), RedeemRequest{
+				OperatorCode: operatorCode, OperatorTransactionID: "op-st-red",
+				PlayerID: playerID, Amount: decimalMoney(t, "5.0000"),
+			})
+			return err
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			e, mock, _ := newEngine(t)
+			playerID := uuid.New()
+
+			mock.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+			mock.ExpectQuery(rxSelectForUpdate).
+				WithArgs(playerID).
+				WillReturnRows(walletRows("100.0000", "100.0000", "100.0000"))
+			expectPlayerStatus(mock, playerID, "SUSPENDED")
+			mock.ExpectRollback()
+
+			// The same concrete *engine implements both interfaces.
+			err := tc.call(e, e, playerID)
+			if !errors.Is(err, errs.ErrPlayerNotActive) {
+				t.Fatalf("err: got %v want wrapping ErrPlayerNotActive", err)
+			}
+		})
+	}
+}
+
+// decimalMoney is a tiny alias of mustMoney for the status-guard tables.
+func decimalMoney(t *testing.T, s string) domain.Money { return mustMoney(t, s) }

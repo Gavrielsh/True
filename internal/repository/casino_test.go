@@ -140,6 +140,7 @@ func TestProcessPurchase_GCWithPromo(t *testing.T) {
 	mock.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("0.0000", "0.0000", "0.0000"))
+	expectPlayerStatus(mock, playerID, "ACTIVE")
 	// Post: GC 100, SC_UNPLAYED 5, SC_REDEEMABLE untouched.
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("100.0000"), dec("5.0000"), dec("0.0000"), playerID).
@@ -196,6 +197,7 @@ func TestProcessPurchase_GhostSpinRecovery(t *testing.T) {
 	mock.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("0.0000", "0.0000", "0.0000"))
+	expectPlayerStatus(mock, playerID, "ACTIVE")
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("100.0000"), dec("0.0000"), dec("0.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
@@ -271,6 +273,7 @@ func TestProcessRedeem_HappyPath_DrawsRedeemableOnly(t *testing.T) {
 	mock.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("0.0000", "0.0000", "50.0000"))
+	expectPlayerStatus(mock, playerID, "ACTIVE")
 	// Redeem 20 → SC_REDEEMABLE 50 → 30. GC/SC_UNPLAYED untouched.
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("0.0000"), dec("0.0000"), dec("30.0000"), playerID).
@@ -315,6 +318,7 @@ func TestProcessRedeem_InsufficientRedeemable_RollsBack(t *testing.T) {
 	// Lots of SC_UNPLAYED, little SC_REDEEMABLE: redeem must still fail.
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("0.0000", "1000.0000", "5.0000"))
+	expectPlayerStatus(mock, playerID, "ACTIVE")
 	mock.ExpectRollback() // allocator rejects before any mutating SQL
 
 	_, err := e.ProcessRedeem(context.Background(), RedeemRequest{

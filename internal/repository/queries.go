@@ -23,6 +23,13 @@ const (
 		WHERE player_id = $1
 	`
 
+	// KYC/compliance guard: the player's lifecycle status, read INSIDE the
+	// open transaction right after the wallets FOR UPDATE. READ COMMITTED sees
+	// the latest committed status, and the wallet lock serializes the check
+	// against any concurrent money movement for the same player — a suspension
+	// committed mid-flight is observed by every queued spin behind the lock.
+	sqlSelectPlayerStatus = `SELECT status FROM users WHERE id = $1`
+
 	// UPDATE wallets: precise per-column assignment of the post-state values
 	// the domain layer just computed. updated_at is bumped by the trigger.
 	sqlUpdateWallet = `

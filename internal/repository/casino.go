@@ -253,6 +253,11 @@ func (e *engine) processPurchaseTx(ctx context.Context, req PurchaseRequest) (Tx
 		return TxResult{}, err
 	}
 
+	// KYC/compliance guard — same tx handle, serialized by the lock above.
+	if err := requirePlayerActive(ctx, tx, req.PlayerID); err != nil {
+		return TxResult{}, err
+	}
+
 	alloc, err := wallet.AllocatePurchase(req.GCAmount, req.SCPromoAmount)
 	if err != nil {
 		return TxResult{}, err
@@ -347,6 +352,11 @@ func (e *engine) processRedeemTx(ctx context.Context, req RedeemRequest) (TxResu
 
 	wallet, err := selectWalletForUpdate(ctx, tx, req.PlayerID)
 	if err != nil {
+		return TxResult{}, err
+	}
+
+	// KYC/compliance guard — same tx handle, serialized by the lock above.
+	if err := requirePlayerActive(ctx, tx, req.PlayerID); err != nil {
 		return TxResult{}, err
 	}
 
