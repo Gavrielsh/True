@@ -133,15 +133,7 @@ func TestRouter_FullStack_ReplayRejectedOnSecondCall(t *testing.T) {
 	}
 }
 
-func TestRouter_Healthz(t *testing.T) {
-	t.Parallel()
-	srv := fullStack(t, &fakeEngine{}, "s")
-	w := httptest.NewRecorder()
-	srv.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/healthz", nil))
-	if w.Code != http.StatusOK {
-		t.Errorf("healthz: got %d want 200", w.Code)
-	}
-}
+// Healthz coverage lives in health_test.go (deep probe: pg + redis).
 
 // /metrics must be reachable WITHOUT HMAC headers (the scraper has none) and
 // must serve the engine instruments from the default registry.

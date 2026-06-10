@@ -82,6 +82,7 @@ func run() error {
 	router := api.NewRouter(api.Config{
 		Engine:  eng,
 		Casino:  casinoEng,
+		DB:      pool,
 		Redis:   rdb,
 		Secrets: cfg.OperatorSecrets,
 		Logger:  logger,

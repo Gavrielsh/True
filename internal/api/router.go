@@ -2,7 +2,6 @@ package api
 
 import (
 	"log/slog"
-	"net/http"
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -18,7 +17,10 @@ type Config struct {
 	// Casino wires the real-money wrapper endpoints (player/create,
 	// store/purchase, store/redeem). Optional: when nil those routes are not
 	// registered (keeps the core-engine-only configuration valid).
-	Casino  repository.CasinoEngine
+	Casino repository.CasinoEngine
+	// DB is the Postgres pool surface used by the deep health probe. A nil DB
+	// makes /healthz report postgres as down (fail closed).
+	DB      Pinger
 	Redis   redis.UniversalClient
 	Secrets map[string]string // operator_code → HMAC-SHA256 shared secret
 	Logger  *slog.Logger
@@ -48,10 +50,9 @@ func NewRouter(cfg Config) *gin.Engine {
 	r.Use(Recovery(logger))
 	r.Use(Telemetry(logger))
 
-	// Liveness probe — unauthenticated, intentionally trivial.
-	r.GET("/healthz", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
-	})
+	// Deep health probe — unauthenticated; verifies Postgres + Redis with a
+	// bounded deadline and fails closed (503) when either is degraded.
+	r.GET("/healthz", NewHealthHandler(cfg.DB, cfg.Redis, logger))
 
 	// Prometheus scrape endpoint. Unauthenticated like /healthz — exposed for
 	// the cluster-internal scraper, NOT routed through the operator gateway.
