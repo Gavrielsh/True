@@ -119,7 +119,7 @@ func (e *engine) ProcessBet(ctx context.Context, req BetRequest) (TxResult, erro
 }
 
 func (e *engine) processBetTx(ctx context.Context, req BetRequest) (TxResult, error) {
-	defer metrics.ObserveDBTransaction(metrics.OpBet, time.Now())
+	defer metrics.ObserveDBLockDuration(metrics.OpBet, time.Now())
 	tx, err := e.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return TxResult{}, fmt.Errorf("begin tx: %w", err)
@@ -238,7 +238,7 @@ func (e *engine) ProcessWin(ctx context.Context, req WinRequest) (TxResult, erro
 }
 
 func (e *engine) processWinTx(ctx context.Context, req WinRequest) (TxResult, error) {
-	defer metrics.ObserveDBTransaction(metrics.OpWin, time.Now())
+	defer metrics.ObserveDBLockDuration(metrics.OpWin, time.Now())
 	tx, err := e.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return TxResult{}, fmt.Errorf("begin tx: %w", err)
@@ -336,7 +336,7 @@ func (e *engine) ProcessRollback(ctx context.Context, req RollbackRequest) (TxRe
 }
 
 func (e *engine) processRollbackTx(ctx context.Context, req RollbackRequest) (TxResult, error) {
-	defer metrics.ObserveDBTransaction(metrics.OpRollback, time.Now())
+	defer metrics.ObserveDBLockDuration(metrics.OpRollback, time.Now())
 	tx, err := e.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return TxResult{}, fmt.Errorf("begin tx: %w", err)

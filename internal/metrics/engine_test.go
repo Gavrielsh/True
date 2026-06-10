@@ -51,17 +51,18 @@ func TestGhostSpinsRecovered_RegisteredAndCounts(t *testing.T) {
 	}
 }
 
-// ObserveDBTransaction must create the labelled series on the default registry
-// and record one sample with a plausible (non-negative, sub-second) value.
-func TestObserveDBTransaction_RecordsLabelledSample(t *testing.T) {
+// ObserveDBLockDuration must create the labelled series on the default
+// registry and record one sample with a plausible (non-negative, sub-second)
+// value.
+func TestObserveDBLockDuration_RecordsLabelledSample(t *testing.T) {
 	start := time.Now().Add(-5 * time.Millisecond)
 	for _, op := range []string{OpBet, OpWin, OpRollback} {
-		ObserveDBTransaction(op, start)
+		ObserveDBLockDuration(op, start)
 	}
 
-	fam := gatherFamily(t, "engine_db_transaction_duration_seconds")
+	fam := gatherFamily(t, "engine_db_lock_duration_seconds")
 	if fam == nil {
-		t.Fatal("engine_db_transaction_duration_seconds not registered on the default registry")
+		t.Fatal("engine_db_lock_duration_seconds not registered on the default registry")
 	}
 	for _, op := range []string{OpBet, OpWin, OpRollback} {
 		key := "operation=" + op + ";"

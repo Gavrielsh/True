@@ -17,6 +17,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Gavrielsh/True/internal/domain"
+	"github.com/Gavrielsh/True/internal/metrics"
 	"github.com/Gavrielsh/True/internal/repository"
 	errs "github.com/Gavrielsh/True/pkg/errors"
 )
@@ -146,17 +147,25 @@ func TestRouter_Healthz(t *testing.T) {
 // must serve the engine instruments from the default registry.
 func TestRouter_Metrics(t *testing.T) {
 	t.Parallel()
+	// The histogram vec only appears in scrape output once a labelled series
+	// has been observed; record one sample so the scrape proves end-to-end
+	// exposure under the realigned name.
+	metrics.ObserveDBLockDuration(metrics.OpBet, time.Now())
+
 	srv := fullStack(t, &fakeEngine{}, "s")
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	if w.Code != http.StatusOK {
 		t.Fatalf("metrics: got %d want 200; body=%s", w.Code, w.Body.String())
 	}
+	body := w.Body.String()
 	// The plain counter is exported even at zero, so its presence proves the
-	// engine instruments are registered where promhttp serves from. (The
-	// histogram vec only appears once a labelled series has been observed.)
-	if !strings.Contains(w.Body.String(), "engine_ghost_spins_recovered_total") {
-		t.Errorf("metrics body missing engine_ghost_spins_recovered_total:\n%s", w.Body.String())
+	// engine instruments are registered where promhttp serves from.
+	if !strings.Contains(body, "engine_ghost_spins_recovered_total") {
+		t.Errorf("metrics body missing engine_ghost_spins_recovered_total:\n%s", body)
+	}
+	if !strings.Contains(body, "engine_db_lock_duration_seconds") {
+		t.Errorf("metrics body missing engine_db_lock_duration_seconds:\n%s", body)
 	}
 }
 

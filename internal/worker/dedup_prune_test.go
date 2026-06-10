@@ -214,6 +214,15 @@ func TestPruneSweep_IssuesBatchedDelete(t *testing.T) {
 	}
 }
 
+// The 7-day default is a design parameter (keeps the global dedup index hot in
+// memory at 10k+ TPS) — pin it so a future change is a deliberate decision.
+func TestPrune_DefaultRetentionIsSevenDays(t *testing.T) {
+	t.Parallel()
+	if defaultPruneRetention != 7*24*time.Hour {
+		t.Errorf("defaultPruneRetention: got %v want %v", defaultPruneRetention, 7*24*time.Hour)
+	}
+}
+
 func TestPrune_OptionGuards(t *testing.T) {
 	t.Parallel()
 	p := NewDedupPruner(&fakeExecDB{}, discardLogger(),

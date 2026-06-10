@@ -18,9 +18,11 @@ type ExecDB interface {
 }
 
 const (
-	// 30-day retention is far beyond any operator's webhook retry horizon
-	// (hours–days), so a duplicate can never arrive after its dedup row is gone.
-	defaultPruneRetention = 30 * 24 * time.Hour
+	// 7-day retention still exceeds any operator's webhook retry horizon
+	// (hours–days), so a duplicate can never arrive after its dedup row is
+	// gone, while keeping the GLOBAL dedup B-Tree small enough to stay hot in
+	// memory at 10k+ TPS.
+	defaultPruneRetention = 7 * 24 * time.Hour
 	// Daily cadence keeps the global dedup index bounded without churn.
 	defaultPruneInterval = 24 * time.Hour
 	// Small batches bound lock duration and B-Tree index bloat per statement.

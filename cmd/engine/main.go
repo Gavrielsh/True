@@ -110,17 +110,23 @@ func run() error {
 	// small batches so the GLOBAL idempotency index stays bounded at 50k TPS
 	// (architecture §6.B / migration 000005).
 	//
-	// Both observe ctx and stop cleanly on signal; we wait for their in-flight
+	// Partitioner: pre-creates daily ledger partitions for today plus a
+	// 14-day lookahead so a time-boundary INSERT can never fail on a missing
+	// partition (migration 000005's ensure_ledger_partitions, Go-side).
+	//
+	// All observe ctx and stop cleanly on signal; we wait for their in-flight
 	// cycles during shutdown. Each recovers per-cycle panics internally, and
 	// runWorker adds an outermost defensive recover so a panic in the worker
 	// scaffolding itself can never crash the HTTP server. A failed cycle (e.g.
 	// migration 000007 not yet applied) is logged and retried — never fatal.
 	aggregator := worker.New(pool, logger)
 	pruner := worker.NewDedupPruner(pool, logger)
+	partitioner := worker.NewPartitioner(pool, logger)
 
 	var workersWG sync.WaitGroup
 	runWorker(ctx, &workersWG, logger, "ggr_aggregator", aggregator.Run)
 	runWorker(ctx, &workersWG, logger, "dedup_pruner", pruner.Run)
+	runWorker(ctx, &workersWG, logger, "partitioner", partitioner.Run)
 
 	serverErr := make(chan error, 1)
 	go func() {

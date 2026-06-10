@@ -15,7 +15,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// Operation label values for DBTransactionDuration. Bounded set — never put
+// Operation label values for DBLockDuration. Bounded set — never put
 // unbounded values (player ids, tx ids) in a label.
 const (
 	OpBet      = "bet"
@@ -34,24 +34,24 @@ var (
 		Help: "Total ledger 23505 conflicts successfully replayed via Ghost-Spin recovery.",
 	})
 
-	// DBTransactionDuration measures one full DB transaction — BEGIN through
+	// DBLockDuration measures one full DB execution window — BEGIN through
 	// COMMIT/ROLLBACK — for the money-moving paths. Because the wallet row is
 	// locked FOR UPDATE for almost this entire window, this histogram is the
 	// per-player lock-hold-time distribution; its upper tail is the direct
 	// head-of-line blocking bound at 10k TPS.
-	DBTransactionDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Name: "engine_db_transaction_duration_seconds",
-		Help: "Duration of the core DB transaction (wallet FOR UPDATE lock window) per operation.",
+	DBLockDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "engine_db_lock_duration_seconds",
+		Help: "Duration of DB execution window from SELECT FOR UPDATE row lock acquisition until COMMIT or ROLLBACK.",
 		// Healthy transactions sit in single-digit milliseconds; the 5s ceiling
 		// matches the handlers' defaultTxTimeout, past which pgx cancels.
 		Buckets: []float64{.001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5},
 	}, []string{"operation"})
 )
 
-// ObserveDBTransaction records one DB transaction's elapsed time. Designed for
-// a one-line defer at the top of the tx function:
+// ObserveDBLockDuration records one DB lock window's elapsed time. Designed
+// for a one-line defer at the top of the tx function:
 //
-//	defer metrics.ObserveDBTransaction(metrics.OpBet, time.Now())
-func ObserveDBTransaction(operation string, start time.Time) {
-	DBTransactionDuration.WithLabelValues(operation).Observe(time.Since(start).Seconds())
+//	defer metrics.ObserveDBLockDuration(metrics.OpBet, time.Now())
+func ObserveDBLockDuration(operation string, start time.Time) {
+	DBLockDuration.WithLabelValues(operation).Observe(time.Since(start).Seconds())
 }
