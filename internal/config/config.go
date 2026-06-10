@@ -38,6 +38,13 @@ type Config struct {
 	// requests to drain before forcing the server closed.
 	ShutdownTimeout time.Duration
 
+	// AdminPort serves the standalone admin API (separate gin.Engine, never
+	// exposed through the operator gateway).
+	AdminPort string
+	// AdminAPIKey authenticates X-Admin-Key on the admin API. Empty disables
+	// the admin server entirely (never run it unauthenticated). Never logged.
+	AdminAPIKey string
+
 	// GeoIPDBPath locates the MaxMind GeoLite2 database. Empty disables
 	// geo-fencing (dev mode; logged as WARN at startup).
 	GeoIPDBPath string
@@ -110,6 +117,8 @@ func Load() (Config, error) {
 		WriteTimeout:      l.duration("HTTP_WRITE_TIMEOUT", 15*time.Second),
 		IdleTimeout:       l.duration("HTTP_IDLE_TIMEOUT", 60*time.Second),
 		ShutdownTimeout:   l.duration("SHUTDOWN_TIMEOUT", 30*time.Second),
+		AdminPort:         l.str("ADMIN_PORT", "9090"),
+		AdminAPIKey:       os.Getenv("ADMIN_API_KEY"),
 		GeoIPDBPath:       l.str("GEOIP_DB_PATH", ""),
 		BlockedRegions:    splitCSV(l.str("BLOCKED_REGIONS", "")),
 		DB:                l.dbConfig(),

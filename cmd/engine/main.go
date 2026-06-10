@@ -117,6 +117,37 @@ func run() error {
 		IdleTimeout:       cfg.IdleTimeout,
 	}
 
+	// --- Admin API (separate engine + port; never via the operator gateway) --
+	var adminSrv *http.Server
+	if cfg.AdminAPIKey == "" {
+		logger.Warn("admin API disabled: ADMIN_API_KEY is empty — " +
+			"the admin server never runs unauthenticated")
+	} else {
+		adminRouter := api.NewAdminRouter(api.AdminConfig{
+			APIKey: cfg.AdminAPIKey,
+			DB:     pool,
+			PoolStats: func() api.PoolStats {
+				s := pool.Stat()
+				return api.PoolStats{
+					TotalConns: s.TotalConns(),
+					IdleConns:  s.IdleConns(),
+					InUseConns: s.AcquiredConns(),
+					MaxConns:   s.MaxConns(),
+				}
+			},
+			Redis:  rdb,
+			Logger: logger,
+		})
+		adminSrv = &http.Server{
+			Addr:              addr(cfg.AdminPort),
+			Handler:           adminRouter,
+			ReadTimeout:       cfg.ReadTimeout,
+			ReadHeaderTimeout: cfg.ReadHeaderTimeout,
+			WriteTimeout:      cfg.WriteTimeout,
+			IdleTimeout:       cfg.IdleTimeout,
+		}
+	}
+
 	// --- Serve until signal -------------------------------------------------
 	// signal.NotifyContext cancels ctx on SIGINT/SIGTERM.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -156,6 +187,14 @@ func run() error {
 			serverErr <- err
 		}
 	}()
+	if adminSrv != nil {
+		go func() {
+			logger.Info("admin server listening", slog.String("addr", adminSrv.Addr))
+			if err := adminSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				serverErr <- fmt.Errorf("admin: %w", err)
+			}
+		}()
+	}
 
 	select {
 	case err := <-serverErr:
@@ -172,6 +211,11 @@ func run() error {
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("graceful shutdown: %w", err)
+	}
+	if adminSrv != nil {
+		if err := adminSrv.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("admin graceful shutdown", slog.String("error", err.Error()))
+		}
 	}
 
 	// ctx (cancelled by the signal) also stops the aggregator; wait for its
