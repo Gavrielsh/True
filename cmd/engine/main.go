@@ -63,6 +63,12 @@ func run() error {
 		slog.Int("max_conns", int(cfg.DB.MaxConns)),
 		slog.Int("min_conns", int(cfg.DB.MinConns)))
 
+	// --- Schema migrations ----------------------------------------------------
+	// FAIL FAST: never serve traffic against a stale or dirty schema.
+	if err := runMigrations(bootCtx, logger, cfg.PostgresURL); err != nil {
+		return fmt.Errorf("migrations: %w", err)
+	}
+
 	// --- Redis --------------------------------------------------------------
 	rdb, err := newRedisClient(bootCtx, cfg)
 	if err != nil {
