@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Gavrielsh/True/internal/domain"
 	"github.com/Gavrielsh/True/internal/repository"
@@ -92,19 +93,14 @@ func (h *Handlers) Bet(c *gin.Context) {
 		return
 	}
 
-	// Span attributes follow cursor rule §9 (DATA PRIVACY): identifiers only —
-	// player_id is a UUID (not PII), and raw amounts are NEVER attached.
-	spanCtx, span := telemetry.StartSpan(c.Request.Context(), "http.bet",
-		attribute.String("player_id", playerID.String()),
-		attribute.String("operator_code", OperatorCodeFromContext(c.Request.Context())),
-		attribute.String("operator_transaction_id", dto.OperatorTransactionID),
-		attribute.String("currency", family.String()),
-	)
+	operatorCode := OperatorCodeFromContext(c.Request.Context())
+	spanCtx, span := moneySpan(c, "http.bet", operatorCode, dto.OperatorTransactionID, playerID,
+		attribute.String("currency", family.String()))
 
 	ctx, cancel := context.WithTimeout(spanCtx, h.txTimeout)
 	defer cancel()
 	result, err := h.engine.ProcessBet(ctx, repository.BetRequest{
-		OperatorCode:          OperatorCodeFromContext(c.Request.Context()),
+		OperatorCode:          operatorCode,
 		OperatorTransactionID: dto.OperatorTransactionID,
 		PlayerID:              playerID,
 		Family:                family,
@@ -158,17 +154,14 @@ func (h *Handlers) Win(c *gin.Context) {
 		return
 	}
 
-	spanCtx, span := telemetry.StartSpan(c.Request.Context(), "http.win",
-		attribute.String("player_id", playerID.String()),
-		attribute.String("operator_code", OperatorCodeFromContext(c.Request.Context())),
-		attribute.String("operator_transaction_id", dto.OperatorTransactionID),
-		attribute.String("currency", family.String()),
-	)
+	operatorCode := OperatorCodeFromContext(c.Request.Context())
+	spanCtx, span := moneySpan(c, "http.win", operatorCode, dto.OperatorTransactionID, playerID,
+		attribute.String("currency", family.String()))
 
 	ctx, cancel := context.WithTimeout(spanCtx, h.txTimeout)
 	defer cancel()
 	result, err := h.engine.ProcessWin(ctx, repository.WinRequest{
-		OperatorCode:           OperatorCodeFromContext(c.Request.Context()),
+		OperatorCode:           operatorCode,
 		OperatorTransactionID:  dto.OperatorTransactionID,
 		PlayerID:               playerID,
 		Family:                 family,
@@ -209,17 +202,14 @@ func (h *Handlers) Rollback(c *gin.Context) {
 		return
 	}
 
-	spanCtx, span := telemetry.StartSpan(c.Request.Context(), "http.rollback",
-		attribute.String("player_id", playerID.String()),
-		attribute.String("operator_code", OperatorCodeFromContext(c.Request.Context())),
-		attribute.String("operator_transaction_id", dto.OperatorTransactionID),
-		attribute.String("reference_transaction_id", reference.String()),
-	)
+	operatorCode := OperatorCodeFromContext(c.Request.Context())
+	spanCtx, span := moneySpan(c, "http.rollback", operatorCode, dto.OperatorTransactionID, playerID,
+		attribute.String("reference_transaction_id", reference.String()))
 
 	ctx, cancel := context.WithTimeout(spanCtx, h.txTimeout)
 	defer cancel()
 	result, err := h.engine.ProcessRollback(ctx, repository.RollbackRequest{
-		OperatorCode:           OperatorCodeFromContext(c.Request.Context()),
+		OperatorCode:           operatorCode,
 		OperatorTransactionID:  dto.OperatorTransactionID,
 		PlayerID:               playerID,
 		ReferenceTransactionID: reference,
@@ -258,6 +248,24 @@ func (h *Handlers) Session(c *gin.Context) {
 			SCRedeemable: wallet.SCRedeemable,
 		},
 	})
+}
+
+// moneySpan opens the handler-level span for a money endpoint with the
+// standard attribute set. Centralizes cursor rule §9 (DATA PRIVACY) for every
+// money handler: identifiers only — player_id is a UUID (not PII) — and raw
+// amounts are NEVER attached, in extra or otherwise.
+func moneySpan(
+	c *gin.Context,
+	name, operatorCode, opTxID string,
+	playerID uuid.UUID,
+	extra ...attribute.KeyValue,
+) (context.Context, trace.Span) {
+	attrs := append([]attribute.KeyValue{
+		attribute.String("player_id", playerID.String()),
+		attribute.String("operator_code", operatorCode),
+		attribute.String("operator_transaction_id", opTxID),
+	}, extra...)
+	return telemetry.StartSpan(c.Request.Context(), name, attrs...)
 }
 
 // ----------------------------------------------------------------------------

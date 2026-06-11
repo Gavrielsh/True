@@ -5,7 +5,6 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
-	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/Gavrielsh/True/internal/domain"
 	"github.com/Gavrielsh/True/internal/repository"
@@ -125,15 +124,11 @@ func (h *CasinoHandlers) Purchase(c *gin.Context) {
 		return
 	}
 
-	// §9 DATA PRIVACY: identifiers only — never raw amounts in attributes.
-	ctx, span := telemetry.StartSpan(c.Request.Context(), "http.purchase",
-		attribute.String("player_id", playerID.String()),
-		attribute.String("operator_code", OperatorCodeFromContext(c.Request.Context())),
-		attribute.String("operator_transaction_id", dto.OperatorTransactionID),
-	)
+	operatorCode := OperatorCodeFromContext(c.Request.Context())
+	ctx, span := moneySpan(c, "http.purchase", operatorCode, dto.OperatorTransactionID, playerID)
 
 	result, err := h.casino.ProcessPurchase(ctx, repository.PurchaseRequest{
-		OperatorCode:          OperatorCodeFromContext(c.Request.Context()),
+		OperatorCode:          operatorCode,
 		OperatorTransactionID: dto.OperatorTransactionID,
 		PlayerID:              playerID,
 		GCAmount:              gcAmount,
@@ -165,15 +160,11 @@ func (h *CasinoHandlers) Redeem(c *gin.Context) {
 		return
 	}
 
-	// §9 DATA PRIVACY: identifiers only — never raw amounts in attributes.
-	ctx, span := telemetry.StartSpan(c.Request.Context(), "http.redeem",
-		attribute.String("player_id", playerID.String()),
-		attribute.String("operator_code", OperatorCodeFromContext(c.Request.Context())),
-		attribute.String("operator_transaction_id", dto.OperatorTransactionID),
-	)
+	operatorCode := OperatorCodeFromContext(c.Request.Context())
+	ctx, span := moneySpan(c, "http.redeem", operatorCode, dto.OperatorTransactionID, playerID)
 
 	result, err := h.casino.ProcessRedeem(ctx, repository.RedeemRequest{
-		OperatorCode:          OperatorCodeFromContext(c.Request.Context()),
+		OperatorCode:          operatorCode,
 		OperatorTransactionID: dto.OperatorTransactionID,
 		PlayerID:              playerID,
 		Amount:                amount,

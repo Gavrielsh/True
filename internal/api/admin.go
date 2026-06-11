@@ -110,20 +110,16 @@ type adminHandlers struct {
 // GET /admin/v1/ggr/daily?date=YYYY-MM-DD&currency=GC
 // ----------------------------------------------------------------------------
 
+// Both GGR variants share one base; the constants are composed at compile
+// time (no runtime SQL assembly, no input interpolation).
 const (
-	sqlAdminGGRByDate = `
+	adminGGRBase = `
 		SELECT gaming_date, currency, total_bets, total_wins, ggr
 		FROM daily_ggr
 		WHERE gaming_date = $1
-		ORDER BY currency
 	`
-	sqlAdminGGRByDateCurrency = `
-		SELECT gaming_date, currency, total_bets, total_wins, ggr
-		FROM daily_ggr
-		WHERE gaming_date = $1
-		  AND currency = $2
-		ORDER BY currency
-	`
+	sqlAdminGGRByDate         = adminGGRBase + ` ORDER BY currency`
+	sqlAdminGGRByDateCurrency = adminGGRBase + ` AND currency = $2 ORDER BY currency`
 )
 
 // ggrRow is one daily_ggr line. All money is decimal-as-string (zero floats).
@@ -220,8 +216,11 @@ func (h *adminHandlers) GGRDaily(c *gin.Context) {
 // Amount is derived from the PLAYER_WALLET entries (the header carries no
 // amount by design — the ledger entries are the source of truth). For a BET
 // split across SC_UNPLAYED/SC_REDEEMABLE this is the total player movement.
+// The first-page and cursor variants share one base and tail; only the
+// cursor predicate differs. Composed at compile time — no runtime SQL
+// assembly, no input interpolation.
 const (
-	sqlAdminPlayerLedger = `
+	adminLedgerBase = `
 		SELECT t.id, t.operator_transaction_id, t.transaction_type, t.status,
 		       t.created_at, COALESCE(SUM(e.amount), 0) AS amount
 		FROM ledger_transactions t
@@ -229,23 +228,14 @@ const (
 		  ON e.ledger_transaction_id = t.id
 		 AND e.account_type = 'PLAYER_WALLET'
 		WHERE t.player_id = $1
+	`
+	adminLedgerTail = `
 		GROUP BY t.id, t.operator_transaction_id, t.transaction_type, t.status, t.created_at
 		ORDER BY t.id DESC
 		LIMIT $2
 	`
-	sqlAdminPlayerLedgerAfter = `
-		SELECT t.id, t.operator_transaction_id, t.transaction_type, t.status,
-		       t.created_at, COALESCE(SUM(e.amount), 0) AS amount
-		FROM ledger_transactions t
-		LEFT JOIN ledger_entries e
-		  ON e.ledger_transaction_id = t.id
-		 AND e.account_type = 'PLAYER_WALLET'
-		WHERE t.player_id = $1
-		  AND t.id < $3
-		GROUP BY t.id, t.operator_transaction_id, t.transaction_type, t.status, t.created_at
-		ORDER BY t.id DESC
-		LIMIT $2
-	`
+	sqlAdminPlayerLedger      = adminLedgerBase + adminLedgerTail
+	sqlAdminPlayerLedgerAfter = adminLedgerBase + ` AND t.id < $3` + adminLedgerTail
 )
 
 type ledgerTxRow struct {

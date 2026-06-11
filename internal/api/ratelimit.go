@@ -23,7 +23,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -127,7 +129,11 @@ func NewRateLimiter(client redis.UniversalClient, logger *slog.Logger, opts ...R
 // limit. ANY Redis failure admits the request (fail open) after a WARN.
 func (rl *RateLimiter) allow(ctx context.Context, key string, limit int) (admitted bool, retryAfter time.Duration) {
 	nowMillis := rl.now().UnixMilli()
-	member := fmt.Sprintf("%d-%s", nowMillis, uuid.NewString())
+	// The ZADD member only needs to be unique within one key's window across
+	// every engine replica sharing this Redis: timestamp + 64 random bits is
+	// ample, far cheaper on this 10k-TPS path than a UUID (crypto/rand) and
+	// fmt.Sprintf (reflection).
+	member := strconv.FormatInt(nowMillis, 36) + "-" + strconv.FormatUint(rand.Uint64(), 36)
 
 	res, err := rateLimitScript.Run(ctx, rl.client, []string{key},
 		nowMillis, rl.window.Milliseconds(), limit, member).Result()
