@@ -48,6 +48,14 @@ type rollbackRequestDTO struct {
 	Metadata               json.RawMessage `json:"metadata,omitempty"`
 }
 
+// sessionRequestDTO is the wire format consumed by POST /api/v1/session.
+// The player id travels in the BODY — not the query string — so it is covered
+// by the raw-body HMAC signature (a GET's empty body would MAC to the constant
+// HMAC(secret, ""), binding the signature to nothing).
+type sessionRequestDTO struct {
+	PlayerID string `json:"player_id" binding:"required"`
+}
+
 // successResponse is the wire format returned on a 2xx response.
 // Embeds the engine's TxResult so Money fields keep their string encoding.
 type successResponse struct {
@@ -64,7 +72,7 @@ type errorResponse struct {
 	TraceID string      `json:"trace_id,omitempty"`
 }
 
-// balancesResponse is the GET /api/v1/session payload.
+// balancesResponse is the POST /api/v1/session payload.
 type balancesResponse struct {
 	Code     errors.Code               `json:"code"`
 	PlayerID string                    `json:"player_id"`

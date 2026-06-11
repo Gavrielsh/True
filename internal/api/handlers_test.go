@@ -72,7 +72,7 @@ func handlerRouter(eng repository.Engine) *gin.Engine {
 	g.POST("/bet", h.Bet)
 	g.POST("/win", h.Win)
 	g.POST("/rollback", h.Rollback)
-	g.GET("/session", h.Session)
+	g.POST("/session", h.Session)
 	return r
 }
 
@@ -323,7 +323,7 @@ func TestSessionHandler(t *testing.T) {
 		},
 	}
 	r := handlerRouter(eng)
-	w := doJSON(r, http.MethodGet, "/api/v1/session?player_id="+playerID.String(), "")
+	w := doJSON(r, http.MethodPost, "/api/v1/session", `{"player_id":"`+playerID.String()+`"}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status: got %d want 200; body=%s", w.Code, w.Body.String())
 	}
@@ -378,7 +378,7 @@ func TestHandlers_ApplyContextDeadline(t *testing.T) {
 	doJSON(r, http.MethodPost, "/api/v1/bet", `{"operator_transaction_id":"op","player_id":"`+pid+`","currency":"GC","amount":"1.0000"}`)
 	doJSON(r, http.MethodPost, "/api/v1/win", `{"operator_transaction_id":"op","player_id":"`+pid+`","currency":"GC","amount":"1.0000"}`)
 	doJSON(r, http.MethodPost, "/api/v1/rollback", `{"operator_transaction_id":"op","player_id":"`+pid+`","reference_transaction_id":"`+ref+`"}`)
-	doJSON(r, http.MethodGet, "/api/v1/session?player_id="+pid, "")
+	doJSON(r, http.MethodPost, "/api/v1/session", `{"player_id":"`+pid+`"}`)
 
 	if !betDL {
 		t.Error("Bet: engine context must carry a deadline")
@@ -401,7 +401,7 @@ func TestSessionHandler_MissingPlayerID(t *testing.T) {
 		return domain.Wallet{}, nil
 	}}
 	r := handlerRouter(eng)
-	w := doJSON(r, http.MethodGet, "/api/v1/session", "")
+	w := doJSON(r, http.MethodPost, "/api/v1/session", `{}`)
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status: got %d want 400", w.Code)
 	}
@@ -413,7 +413,7 @@ func TestSessionHandler_NotFound(t *testing.T) {
 		return domain.Wallet{}, errs.ErrPlayerNotFound
 	}}
 	r := handlerRouter(eng)
-	w := doJSON(r, http.MethodGet, "/api/v1/session?player_id="+uuid.NewString(), "")
+	w := doJSON(r, http.MethodPost, "/api/v1/session", `{"player_id":"`+uuid.NewString()+`"}`)
 	if w.Code != http.StatusNotFound {
 		t.Errorf("status: got %d want 404", w.Code)
 	}

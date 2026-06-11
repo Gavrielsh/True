@@ -89,7 +89,10 @@ func NewRouter(cfg Config) *gin.Engine {
 		v1.POST("/bet", handlers.Bet)
 		v1.POST("/win", handlers.Win)
 		v1.POST("/rollback", handlers.Rollback)
-		v1.GET("/session", handlers.Session)
+		// POST (not GET): the player_id must live in the HMAC-signed body —
+		// an empty-body GET signature is the constant HMAC(secret, "") and
+		// authenticates nothing. See Handlers.Session.
+		v1.POST("/session", handlers.Session)
 
 		// Real-money wrapper endpoints share the same HMAC + replay stack.
 		if cfg.Casino != nil {

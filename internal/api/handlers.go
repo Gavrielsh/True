@@ -223,9 +223,22 @@ func (h *Handlers) Rollback(c *gin.Context) {
 	c.JSON(http.StatusOK, successResponse{Code: errors.CodeOK, Result: result})
 }
 
-// Session handles GET /api/v1/session?player_id=<uuid>.
+// Session handles POST /api/v1/session — a non-locking balance snapshot.
+//
+// POST with a body (not GET with a query) is a SECURITY requirement, not a
+// style choice: the HMAC middleware signs only the raw request body, so a GET
+// variant's valid signature would be the constant HMAC(secret, "") — bound to
+// neither the player_id, the timestamp, nor the nonce. One captured signature
+// would then mint unlimited balance reads for arbitrary players. With the id
+// in the body, every request is individually authenticated.
 func (h *Handlers) Session(c *gin.Context) {
-	playerID, ok := parsePlayerID(c, c.Query("player_id"))
+	var dto sessionRequestDTO
+	if err := c.ShouldBindJSON(&dto); err != nil {
+		respondErrorCode(c, http.StatusBadRequest, errors.CodeInvalidAmount, "invalid request body")
+		return
+	}
+
+	playerID, ok := parsePlayerID(c, dto.PlayerID)
 	if !ok {
 		return
 	}
