@@ -57,7 +57,7 @@ func Init(ctx context.Context, serviceName string) (shutdown func(), err error) 
 	}
 
 	res, err := resource.Merge(resource.Default(), resource.NewWithAttributes(
-		semconv.SchemaURL,
+		"",
 		semconv.ServiceName(serviceName),
 	))
 	if err != nil {
