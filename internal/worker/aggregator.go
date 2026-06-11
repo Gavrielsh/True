@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // DB is the minimal pgxpool surface the aggregator needs: a single Begin so the
@@ -216,7 +217,9 @@ func (a *Aggregator) runOnce(ctx context.Context) (int64, error) {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var lastProcessed time.Time
+	// pgtype.Timestamptz is required: migration 000007 seeds the watermark at
+	// '-infinity', which pgx cannot scan into time.Time.
+	var lastProcessed pgtype.Timestamptz
 	if err := tx.QueryRow(ctx, sqlLockGGRState).Scan(&lastProcessed); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, fmt.Errorf("ggr_aggregator_state is empty; run migration 000007")

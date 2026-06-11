@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/pashagolub/pgxmock/v4"
 )
 
@@ -57,6 +58,29 @@ func TestRunOnce_HappyPath_UpsertsAndAdvances(t *testing.T) {
 	}
 	if n != 3 {
 		t.Errorf("rows upserted: got %d want 3", n)
+	}
+}
+
+func TestRunOnce_NegativeInfinityWatermark(t *testing.T) {
+	t.Parallel()
+	agg, mock := newAgg(t)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(rxLockState).
+		WillReturnRows(pgxmock.NewRows([]string{"last_processed_at"}).AddRow(pgtype.Timestamptz{
+			InfinityModifier: pgtype.NegativeInfinity,
+			Valid:            true,
+		}))
+	mock.ExpectExec(rxAggregate).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), "UTC").
+		WillReturnResult(pgxmock.NewResult("INSERT", 0))
+	mock.ExpectExec(rxAdvance).
+		WithArgs(pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectCommit()
+
+	if _, err := agg.runOnce(context.Background()); err != nil {
+		t.Fatalf("runOnce: %v", err)
 	}
 }
 
