@@ -2,7 +2,7 @@
 
 package main
 
-// Integration coverage for runMigrations against a real Postgres. The
+// Integration coverage for RunMigrations against a real Postgres. The
 // migration SQL uses plpgsql, ENUMs, and native partitioning, so it is NOT
 // portable to sqlite — run with:
 //
@@ -30,12 +30,12 @@ func TestRunMigrations_Integration(t *testing.T) {
 	logger := testLogger()
 
 	// Fresh apply: every embedded migration runs.
-	if err := runMigrations(ctx, logger, url); err != nil {
+	if err := RunMigrations(ctx, logger, url); err != nil {
 		t.Fatalf("first run: %v", err)
 	}
 
 	// Idempotent re-run: must take the ErrNoChange path and return nil.
-	if err := runMigrations(ctx, logger, url); err != nil {
+	if err := RunMigrations(ctx, logger, url); err != nil {
 		t.Fatalf("second run (expected no-change): %v", err)
 	}
 }

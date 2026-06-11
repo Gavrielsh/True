@@ -99,7 +99,7 @@ func TestCountVersionsBetween(t *testing.T) {
 // or a silent skip.
 func TestRunMigrations_BadURLFailsFast(t *testing.T) {
 	t.Parallel()
-	err := runMigrations(context.Background(), testLogger(), "bogus://nowhere")
+	err := RunMigrations(context.Background(), testLogger(), "bogus://nowhere")
 	if err == nil {
 		t.Fatal("expected error for unsupported database URL")
 	}

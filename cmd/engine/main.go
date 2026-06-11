@@ -75,7 +75,7 @@ func run() error {
 
 	// --- Schema migrations ----------------------------------------------------
 	// FAIL FAST: never serve traffic against a stale or dirty schema.
-	if err := runMigrations(bootCtx, logger, cfg.PostgresURL); err != nil {
+	if err := RunMigrations(bootCtx, logger, cfg.PostgresURL); err != nil {
 		return fmt.Errorf("migrations: %w", err)
 	}
 

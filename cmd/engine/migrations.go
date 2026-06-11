@@ -20,11 +20,11 @@ import (
 	truengine "github.com/Gavrielsh/True"
 )
 
-// runMigrations applies all pending embedded migrations against postgresURL.
+// RunMigrations applies all pending embedded migrations against postgresURL.
 // Returns nil when the schema is already current (logged at DEBUG) or after
 // applying the pending set (count logged at INFO). Any failure — including a
 // dirty version left by a crashed deploy — is returned for main to abort on.
-func runMigrations(ctx context.Context, logger *slog.Logger, postgresURL string) error {
+func RunMigrations(ctx context.Context, logger *slog.Logger, postgresURL string) error {
 	src, err := iofs.New(truengine.MigrationsFS, "migrations")
 	if err != nil {
 		return fmt.Errorf("open embedded migrations: %w", err)
