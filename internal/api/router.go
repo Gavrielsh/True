@@ -92,7 +92,12 @@ func NewRouter(cfg Config) *gin.Engine {
 	// Geo-fence runs AFTER HMAC + replay: only authenticated, non-replayed
 	// operator traffic reaches the jurisdiction check, so the fence can never
 	// be used as an unauthenticated region-probing oracle.
-	if cfg.GeoFence.Enabled() {
+	//
+	// Mounted whenever a fence is configured — including a DISABLED one, which
+	// short-circuits internally. Gating the mount on Enabled() would mean a
+	// misconfigured fence silently vanishes from the chain; letting the
+	// middleware decide keeps the fail-closed logic in one place.
+	if cfg.GeoFence != nil {
 		v1.Use(cfg.GeoFence.Middleware())
 	}
 	{

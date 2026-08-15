@@ -47,9 +47,33 @@ services:
       ADMIN_PORT: "9090"
       ADMIN_API_KEY: ${ADMIN_API_KEY:-dev-admin-key}
       RATE_LIMIT_RPS: "5000"
-      # Empty GEOIP_DB_PATH = geofence disabled (dev mode, WARN at boot).
+      # Absolute ceiling on a single THIRD-PARTY win credit. Required — the
+      # engine cannot re-derive an external provider's payout, so this is the
+      # backstop against a leaked webhook secret minting redeemable currency.
+      # First-party /spin rounds are bounded by the paytable instead.
+      MAX_PROVIDER_WIN: ${MAX_PROVIDER_WIN:-50000.0000}
+      # ── Jurisdiction enforcement ────────────────────────────────────────────
+      # FAIL CLOSED: any request whose region cannot be positively established
+      # is rejected with 403. Running without enforcement now requires the
+      # EXPLICIT opt-out below — an absent GEOIP_DB_PATH is a boot error, not a
+      # silent disable (which is how the blocklist previously looked
+      # configured while enforcing nothing).
+      #
+      # This dev stack ships with enforcement OFF because there is no GeoLite2
+      # file in the image. Mount one and drop GEOFENCE_MODE for a realistic run.
+      GEOFENCE_MODE: ${GEOFENCE_MODE:-disabled}
       GEOIP_DB_PATH: ${GEOIP_DB_PATH:-}
-      BLOCKED_REGIONS: ${BLOCKED_REGIONS:-US-WA,US-UT,US-ID,US-MI,US-NV}
+      # Blocked US states. Empty falls back to the code default (WA, ID, TN, WY).
+      # Review with counsel before launch — this list is a default, not advice.
+      BLOCKED_REGIONS: ${BLOCKED_REGIONS:-}
+      # CIDRs whose X-Forwarded-For is honoured. EMPTY = the header is ignored
+      # and the socket peer is the client. Set this to your load balancer's
+      # range in any environment that fronts the engine with a proxy —
+      # otherwise real player IPs never reach the fence.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      # TRANSITIONAL: accept the pre-audit body-only HMAC signature. Leave
+      # false; replay protection is not in effect while it is true.
+      HMAC_ACCEPT_LEGACY_SIGNATURE: ${HMAC_ACCEPT_LEGACY_SIGNATURE:-false}
       OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
       LOG_LEVEL: ${LOG_LEVEL:-info}
     ports:

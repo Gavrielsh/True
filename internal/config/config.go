@@ -69,12 +69,24 @@ type Config struct {
 	// Defaults to FALSE (secure).
 	AcceptLegacySignature bool
 
-	// GeoIPDBPath locates the MaxMind GeoLite2 database. Empty disables
-	// geo-fencing (dev mode; logged as WARN at startup).
+	// GeoIPDBPath locates the MaxMind GeoLite2 database. REQUIRED unless
+	// GeofenceDisabled is set — an absent database no longer silently
+	// disables jurisdiction enforcement.
 	GeoIPDBPath string
 	// BlockedRegions are ISO-3166-2 codes (e.g. US-WA) rejected by the
-	// geo-fence. Parsed from comma-separated BLOCKED_REGIONS.
+	// geo-fence. Parsed from comma-separated BLOCKED_REGIONS. Empty falls
+	// back to api.DefaultBlockedRegions (WA, ID, TN, WY).
 	BlockedRegions []string
+	// GeofenceDisabled is the EXPLICIT dev-mode opt-out
+	// (GEOFENCE_MODE=disabled). It exists so that running without
+	// jurisdiction enforcement is a deliberate, greppable, loudly-logged
+	// choice rather than the accidental consequence of an unset path.
+	GeofenceDisabled bool
+	// TrustedProxies are CIDRs (or bare IPs) whose X-Forwarded-For header is
+	// honoured. EMPTY means the header is ignored entirely and the socket
+	// peer is treated as the client — the safe default. Without this,
+	// anyone could pick their own jurisdiction by setting the header.
+	TrustedProxies []string
 
 	// DB holds the HFT-ready pgxpool tuning (see DBConfig).
 	DB DBConfig
@@ -149,12 +161,24 @@ func Load() (Config, error) {
 		AcceptLegacySignature: strings.EqualFold(strings.TrimSpace(os.Getenv("HMAC_ACCEPT_LEGACY_SIGNATURE")), "true"),
 		GeoIPDBPath:           l.str("GEOIP_DB_PATH", ""),
 		BlockedRegions:        splitCSV(l.str("BLOCKED_REGIONS", "")),
+		GeofenceDisabled:      strings.EqualFold(strings.TrimSpace(os.Getenv("GEOFENCE_MODE")), "disabled"),
+		TrustedProxies:        splitCSV(l.str("TRUSTED_PROXIES", "")),
 		DB:                    l.dbConfig(),
 	}
 	rawSecrets := l.required("OPERATOR_SECRETS")
 
 	if l.err != nil {
 		return Config{}, l.err
+	}
+
+	// Jurisdiction enforcement is on unless explicitly switched off. A missing
+	// database must fail the boot, not silently admit every region — that
+	// combination is exactly how the blocklist ended up looking configured
+	// while enforcing nothing.
+	if !cfg.GeofenceDisabled && strings.TrimSpace(cfg.GeoIPDBPath) == "" {
+		return Config{}, errors.New(
+			"GEOIP_DB_PATH is required for jurisdiction enforcement " +
+				"(set GEOFENCE_MODE=disabled to run without it — dev only)")
 	}
 
 	secrets, err := parseOperatorSecrets(rawSecrets)

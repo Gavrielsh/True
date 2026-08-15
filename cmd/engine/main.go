@@ -118,11 +118,17 @@ func run() error {
 	// — there is deliberately no config knob for a weaker entropy source.
 	gameEng := repository.NewGame(pool, idem, nil, logger)
 
-	// Geo-fence: jurisdiction blocking for restricted US states. An empty
-	// GEOIP_DB_PATH disables it with a startup WARN (dev mode).
-	geoFence, err := api.NewGeoFence(cfg.GeoIPDBPath, cfg.BlockedRegions, logger)
-	if err != nil {
-		return fmt.Errorf("geofence: %w", err)
+	// Geo-fence: jurisdiction blocking for restricted US states. FAIL CLOSED —
+	// any request whose region cannot be positively established is rejected.
+	// Running without it requires the explicit GEOFENCE_MODE=disabled opt-out.
+	var geoFence *api.GeoFence
+	if cfg.GeofenceDisabled {
+		geoFence = api.NewDisabledGeoFence(logger)
+	} else {
+		geoFence, err = api.NewGeoFence(cfg.GeoIPDBPath, cfg.BlockedRegions, cfg.TrustedProxies, logger)
+		if err != nil {
+			return fmt.Errorf("geofence: %w", err)
+		}
 	}
 	defer func() {
 		if cerr := geoFence.Close(); cerr != nil {
