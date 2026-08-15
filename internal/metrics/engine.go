@@ -21,6 +21,9 @@ const (
 	OpBet      = "bet"
 	OpWin      = "win"
 	OpRollback = "rollback"
+	// OpSpin is the server-authoritative game round: bet + win settled in a
+	// single transaction under one wallet lock.
+	OpSpin = "spin"
 )
 
 var (
@@ -32,6 +35,45 @@ var (
 	GhostSpinsRecovered = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "engine_ghost_spins_recovered_total",
 		Help: "Total ledger 23505 conflicts successfully replayed via Ghost-Spin recovery.",
+	})
+
+	// SpinsSettled counts completed server-authoritative rounds by game and
+	// line result. Both labels are bounded (registered game ids; the three
+	// LineResult values), so the cardinality stays fixed.
+	//
+	// OPERATIONAL USE: the ratio of line results is the live check that the
+	// RNG is behaving. If THREE_OF_A_KIND drifts from its theoretical rate,
+	// either the entropy source or the paytable has been tampered with.
+	SpinsSettled = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "engine_spins_settled_total",
+		Help: "Server-authoritative spins settled, by game id and line result.",
+	}, []string{"game_id", "line"})
+
+	// SpinWagerTotal and SpinPayoutTotal track realised turnover and payout
+	// per game, in whole currency units. Their ratio is the REALISED RTP,
+	// which alerting compares against the paytable's declared figure — the
+	// operational counterpart to the compile-time RTP assertion in
+	// internal/game.
+	SpinWagerTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "engine_spin_wager_total",
+		Help: "Total amount wagered on server-authoritative spins, by game id and currency family.",
+	}, []string{"game_id", "family"})
+
+	SpinPayoutTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "engine_spin_payout_total",
+		Help: "Total amount paid out on server-authoritative spins, by game id and currency family.",
+	}, []string{"game_id", "family"})
+
+	// WinCeilingRejections counts third-party WIN credits refused for
+	// exceeding the operator's configured ceiling.
+	//
+	// ANY increment is a page-the-humans event: a legitimate provider does
+	// not pay above its own declared max win, so a rejection means either a
+	// provider defect or a compromised webhook secret being used to mint
+	// redeemable currency.
+	WinCeilingRejections = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "engine_win_ceiling_rejections_total",
+		Help: "Third-party WIN credits rejected for exceeding the configured absolute ceiling.",
 	})
 
 	// GeoBlockedRequests counts requests rejected by the jurisdiction fence,

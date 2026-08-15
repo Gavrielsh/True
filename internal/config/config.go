@@ -48,6 +48,16 @@ type Config struct {
 	// RateLimitRPS caps each operator's requests/second (sliding window).
 	RateLimitRPS int
 
+	// MaxProviderWin is the absolute ceiling on a single WIN credit accepted
+	// from a third-party aggregator, as a decimal string ("50000.0000").
+	//
+	// REQUIRED — Load() refuses to boot without it. /win cannot re-derive an
+	// external provider's payout the way /spin does, so this ceiling is the
+	// only thing standing between a leaked webhook secret and unlimited
+	// redeemable currency. Defaulting it would make the protection silently
+	// optional, which is exactly how the original vulnerability shipped.
+	MaxProviderWin string
+
 	// GeoIPDBPath locates the MaxMind GeoLite2 database. Empty disables
 	// geo-fencing (dev mode; logged as WARN at startup).
 	GeoIPDBPath string
@@ -123,6 +133,7 @@ func Load() (Config, error) {
 		AdminPort:         l.str("ADMIN_PORT", "9090"),
 		AdminAPIKey:       os.Getenv("ADMIN_API_KEY"),
 		RateLimitRPS:      l.intEnv([]string{"RATE_LIMIT_RPS"}, 5000, false),
+		MaxProviderWin:    l.required("MAX_PROVIDER_WIN"),
 		GeoIPDBPath:       l.str("GEOIP_DB_PATH", ""),
 		BlockedRegions:    splitCSV(l.str("BLOCKED_REGIONS", "")),
 		DB:                l.dbConfig(),

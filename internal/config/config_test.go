@@ -78,6 +78,7 @@ func setRequiredEnv(t *testing.T) {
 	t.Setenv("POSTGRES_URL", "postgres://u:p@localhost:5432/db")
 	t.Setenv("REDIS_URL", "redis://localhost:6379/0")
 	t.Setenv("OPERATOR_SECRETS", `{"OP1":"secret"}`)
+	t.Setenv("MAX_PROVIDER_WIN", "50000.0000")
 }
 
 func TestLoad_Defaults(t *testing.T) {
@@ -195,7 +196,7 @@ func TestLoad_MinConnsZeroAllowed(t *testing.T) {
 }
 
 func TestLoad_MissingRequired(t *testing.T) {
-	cases := []string{"POSTGRES_URL", "REDIS_URL", "OPERATOR_SECRETS"}
+	cases := []string{"POSTGRES_URL", "REDIS_URL", "OPERATOR_SECRETS", "MAX_PROVIDER_WIN"}
 	for _, missing := range cases {
 		t.Run("missing_"+missing, func(t *testing.T) {
 			setRequiredEnv(t)

@@ -25,6 +25,7 @@ import (
 	"github.com/Gavrielsh/True/internal/api"
 	"github.com/Gavrielsh/True/internal/cache"
 	"github.com/Gavrielsh/True/internal/config"
+	"github.com/Gavrielsh/True/internal/domain"
 	"github.com/Gavrielsh/True/internal/repository"
 	"github.com/Gavrielsh/True/internal/telemetry"
 	"github.com/Gavrielsh/True/internal/worker"
@@ -93,8 +94,22 @@ func run() error {
 
 	// --- Wiring -------------------------------------------------------------
 	idem := cache.NewRedis(rdb)
-	eng := repository.New(pool, idem, logger)
+	// Third-party win ceiling. Parsed here so a malformed value fails the
+	// boot rather than silently disabling the cap at request time.
+	maxWin, err := domain.MoneyFromString(cfg.MaxProviderWin)
+	if err != nil {
+		return fmt.Errorf("MAX_PROVIDER_WIN %q: %w", cfg.MaxProviderWin, err)
+	}
+	if !maxWin.IsPositive() {
+		return fmt.Errorf("MAX_PROVIDER_WIN must be > 0, got %s", maxWin)
+	}
+	logger.Info("third-party win ceiling active", slog.String("max_provider_win", maxWin.String()))
+
+	eng := repository.New(pool, idem, logger, repository.WithMaxWinAmount(maxWin))
 	casinoEng := repository.NewCasino(pool, idem, logger)
+	// Server-authoritative game engine. Passing a nil RNG selects crypto/rand
+	// — there is deliberately no config knob for a weaker entropy source.
+	gameEng := repository.NewGame(pool, idem, nil, logger)
 
 	// Geo-fence: jurisdiction blocking for restricted US states. An empty
 	// GEOIP_DB_PATH disables it with a startup WARN (dev mode).
@@ -113,6 +128,7 @@ func run() error {
 	router := api.NewRouter(api.Config{
 		Engine:      eng,
 		Casino:      casinoEng,
+		Game:        gameEng,
 		DB:          pool,
 		Redis:       rdb,
 		Secrets:     cfg.OperatorSecrets,

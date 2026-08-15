@@ -105,6 +105,18 @@ const (
 		  AND operator_transaction_id = $2
 	`
 
+	// Ghost-Spin recovery for a server-authoritative round. Returns the
+	// committed BET leg plus its request_metadata, which carries the ORIGINAL
+	// outcome (reels, line, multiplier). Recovering the outcome from the
+	// ledger — rather than trusting the retry's fresh draw — is what stops a
+	// player re-rolling a settled spin by replaying the request.
+	sqlSelectLedgerTxForGhost = `
+		SELECT id, player_id, request_metadata
+		FROM ledger_transactions
+		WHERE operator_code = $1
+		  AND operator_transaction_id = $2
+	`
+
 	// Rollback: read the original ledger_transactions header (immutable — the
 	// ledger is strictly append-only, so NO lock is taken here). Serialization
 	// of concurrent rollbacks is provided by the wallets FOR UPDATE lock taken

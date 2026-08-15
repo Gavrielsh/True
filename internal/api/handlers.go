@@ -34,7 +34,8 @@ const (
 // safe for concurrent use.
 type Handlers struct {
 	engine      repository.Engine
-	limiter     *RateLimiter // nil = player-scope rate limiting disabled
+	game        repository.GameEngine // nil = /spin not enabled
+	limiter     *RateLimiter          // nil = player-scope rate limiting disabled
 	txTimeout   time.Duration
 	readTimeout time.Duration
 }
@@ -45,6 +46,13 @@ func NewHandlers(engine repository.Engine) *Handlers {
 		txTimeout:   defaultTxTimeout,
 		readTimeout: defaultReadTimeout,
 	}
+}
+
+// WithGameEngine enables the server-authoritative /spin endpoint. Returns h
+// for chaining at wire-up time.
+func (h *Handlers) WithGameEngine(g repository.GameEngine) *Handlers {
+	h.game = g
+	return h
 }
 
 // WithRateLimiter enables the per-player sliding window inside each money
@@ -221,6 +229,67 @@ func (h *Handlers) Rollback(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, successResponse{Code: errors.CodeOK, Result: result})
+}
+
+// Spin handles POST /api/v1/spin — the server-authoritative game round.
+//
+// The caller sends a stake and a game id. The server draws the reels from
+// crypto/rand, evaluates the paytable, derives the win, and settles both the
+// debit and the credit in one transaction. No caller-supplied field reaches
+// the payout amount.
+func (h *Handlers) Spin(c *gin.Context) {
+	if h.game == nil {
+		respondErrorCode(c, http.StatusNotFound, errors.CodeUnsupportedGame, "game engine not enabled")
+		return
+	}
+
+	var dto spinRequestDTO
+	if err := c.ShouldBindJSON(&dto); err != nil {
+		respondErrorCode(c, http.StatusBadRequest, errors.CodeInvalidAmount, "invalid request body")
+		return
+	}
+
+	playerID, ok := parsePlayerID(c, dto.PlayerID)
+	if !ok {
+		return
+	}
+	family, ok := parseFamily(c, dto.Currency)
+	if !ok {
+		return
+	}
+	betAmount, ok := parseAmount(c, dto.BetAmount)
+	if !ok {
+		return
+	}
+
+	// Player-scope rate limit: body is parsed (player_id is signed/verified).
+	if playerLimited(c, h.limiter, "spin", playerID) {
+		return
+	}
+
+	operatorCode := OperatorCodeFromContext(c.Request.Context())
+	spanCtx, span := moneySpan(c, "http.spin", operatorCode, dto.OperatorTransactionID, playerID,
+		attribute.String("currency", family.String()),
+		attribute.String("game_id", dto.GameID))
+
+	ctx, cancel := context.WithTimeout(spanCtx, h.txTimeout)
+	defer cancel()
+	result, err := h.game.ProcessSpin(ctx, repository.SpinRequest{
+		OperatorCode:          operatorCode,
+		OperatorTransactionID: dto.OperatorTransactionID,
+		PlayerID:              playerID,
+		Family:                family,
+		BetAmount:             betAmount,
+		GameID:                dto.GameID,
+		RoundID:               dto.RoundID,
+		Metadata:              dto.Metadata,
+	})
+	telemetry.EndSpan(span, err)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, spinResponse{Code: errors.CodeOK, Result: result})
 }
 
 // Session handles POST /api/v1/session — a non-locking balance snapshot.

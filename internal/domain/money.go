@@ -15,12 +15,46 @@ import (
 	"fmt"
 
 	"github.com/shopspring/decimal"
+
+	errs "github.com/Gavrielsh/True/pkg/errors"
 )
 
 // MoneyScale is the fixed decimal precision used throughout the engine.
 // It matches the DB column type NUMERIC(18,4) exactly so that a Money
 // value can round-trip Postgres without truncation.
 const MoneyScale int32 = 4
+
+// MaxMoneyUnits is the largest whole-coin magnitude the ledger can store.
+// NUMERIC(18,4) holds 18 significant digits with 4 after the point, so the
+// integer part is bounded by 10^14.
+//
+// WHY THIS EXISTS: without it, an amount like "99999999999999999999" passes
+// every application check (it is positive and has no fractional digits) and
+// only fails at the UPDATE, as Postgres 22003 numeric_field_overflow — after
+// the transaction has taken the wallet's FOR UPDATE lock and held it across
+// several round-trips. That turns a malformed request into lock contention
+// and an opaque 500. Bounding the magnitude here rejects it at the edge with
+// a clean 400 instead.
+//
+// It is also load-bearing for the server-authoritative win cap: a payout is
+// bet × multiplier, so an unbounded stake is an unbounded win no matter how
+// tightly the paytable is capped.
+const MaxMoneyUnits = 100_000_000_000_000 // 10^14
+
+var maxMoneyDecimal = decimal.NewFromInt(MaxMoneyUnits)
+
+// CheckAmountBound rejects amounts the ledger column cannot represent.
+// Callers run this at request validation, before any lock is taken.
+//
+// Wraps ErrInvalidAmount so it maps to INVALID_AMOUNT / HTTP 400 through the
+// existing error-code table — an out-of-range amount is a malformed request,
+// not an internal fault.
+func CheckAmountBound(m Money) error {
+	if m.v.Abs().GreaterThanOrEqual(maxMoneyDecimal) {
+		return fmt.Errorf("%w: amount %s exceeds maximum %d", errs.ErrInvalidAmount, m.String(), MaxMoneyUnits)
+	}
+	return nil
+}
 
 // ErrMoneyScaleExceeded is returned when an input decimal carries more than
 // MoneyScale fractional digits. Silently truncating sub-cent fractions would
