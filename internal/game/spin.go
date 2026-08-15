@@ -22,10 +22,10 @@ const (
 // the ledger transaction's metadata so any historical spin can be replayed
 // against the paytable version that produced it and independently verified.
 type Outcome struct {
-	GameID          string          `json:"game_id"`
-	PaytableVersion string          `json:"paytable_version"`
-	Reels           []string        `json:"reels"`
-	Line            LineResult      `json:"line"`
+	GameID          string     `json:"game_id"`
+	PaytableVersion string     `json:"paytable_version"`
+	Reels           []string   `json:"reels"`
+	Line            LineResult `json:"line"`
 	// WinSymbol is the paying symbol, empty when Line is LineNone.
 	WinSymbol string `json:"win_symbol,omitempty"`
 	// Multiplier is the stake multiple this outcome pays (0 for a loss).

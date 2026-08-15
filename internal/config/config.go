@@ -58,6 +58,17 @@ type Config struct {
 	// optional, which is exactly how the original vulnerability shipped.
 	MaxProviderWin string
 
+	// AcceptLegacySignature also accepts the OLD body-only HMAC signature,
+	// in addition to the canonical timestamp.nonce.body form.
+	//
+	// TRANSITIONAL AND INSECURE — while enabled, replay protection is not in
+	// effect: an attacker with a captured body-only signature can still
+	// replay it with a fresh timestamp and nonce. It exists only so the
+	// engine and its integrators can be rolled out independently. Watch
+	// engine_legacy_signature_accepted_total fall to zero, then turn it off.
+	// Defaults to FALSE (secure).
+	AcceptLegacySignature bool
+
 	// GeoIPDBPath locates the MaxMind GeoLite2 database. Empty disables
 	// geo-fencing (dev mode; logged as WARN at startup).
 	GeoIPDBPath string
@@ -134,9 +145,11 @@ func Load() (Config, error) {
 		AdminAPIKey:       os.Getenv("ADMIN_API_KEY"),
 		RateLimitRPS:      l.intEnv([]string{"RATE_LIMIT_RPS"}, 5000, false),
 		MaxProviderWin:    l.required("MAX_PROVIDER_WIN"),
-		GeoIPDBPath:       l.str("GEOIP_DB_PATH", ""),
-		BlockedRegions:    splitCSV(l.str("BLOCKED_REGIONS", "")),
-		DB:                l.dbConfig(),
+		// Secure by default: only an explicit "true" opens the fallback.
+		AcceptLegacySignature: strings.EqualFold(strings.TrimSpace(os.Getenv("HMAC_ACCEPT_LEGACY_SIGNATURE")), "true"),
+		GeoIPDBPath:           l.str("GEOIP_DB_PATH", ""),
+		BlockedRegions:        splitCSV(l.str("BLOCKED_REGIONS", "")),
+		DB:                    l.dbConfig(),
 	}
 	rawSecrets := l.required("OPERATOR_SECRETS")
 

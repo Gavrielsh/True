@@ -116,6 +116,7 @@ func (h *Handlers) Bet(c *gin.Context) {
 		GameID:                dto.GameID,
 		RoundID:               dto.RoundID,
 		Metadata:              dto.Metadata,
+		BodyHash:              BodyHashFromContext(c.Request.Context()),
 	})
 	telemetry.EndSpan(span, err)
 	if err != nil {
@@ -178,6 +179,7 @@ func (h *Handlers) Win(c *gin.Context) {
 		RoundID:                dto.RoundID,
 		ReferenceTransactionID: reference,
 		Metadata:               dto.Metadata,
+		BodyHash:               BodyHashFromContext(c.Request.Context()),
 	})
 	telemetry.EndSpan(span, err)
 	if err != nil {
@@ -222,6 +224,7 @@ func (h *Handlers) Rollback(c *gin.Context) {
 		PlayerID:               playerID,
 		ReferenceTransactionID: reference,
 		Metadata:               dto.Metadata,
+		BodyHash:               BodyHashFromContext(c.Request.Context()),
 	})
 	telemetry.EndSpan(span, err)
 	if err != nil {
@@ -283,6 +286,7 @@ func (h *Handlers) Spin(c *gin.Context) {
 		GameID:                dto.GameID,
 		RoundID:               dto.RoundID,
 		Metadata:              dto.Metadata,
+		BodyHash:              BodyHashFromContext(c.Request.Context()),
 	})
 	telemetry.EndSpan(span, err)
 	if err != nil {

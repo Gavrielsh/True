@@ -135,8 +135,8 @@ func TestSpinMetadataCannotForgeOutcome(t *testing.T) {
 	}
 
 	var got struct {
-		Outcome game.Outcome    `json:"outcome"`
-		Session string          `json:"session"`
+		Outcome game.Outcome `json:"outcome"`
+		Session string       `json:"session"`
 	}
 	if err := json.Unmarshal(merged, &got); err != nil {
 		t.Fatalf("unmarshal merged: %v", err)

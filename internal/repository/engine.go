@@ -105,6 +105,29 @@ func idempotencyKey(operatorCode, opTxID string) string {
 	return operatorCode + ":" + opTxID
 }
 
+// requestFingerprint binds an idempotency key to WHO is transacting and to
+// WHAT they sent. Stored beside the cached payload; a retry whose fingerprint
+// differs is refused with ErrIdempotencyMismatch instead of being served the
+// original request's result.
+//
+// bodyHash is the hex SHA-256 of the verified raw body, supplied by the HMAC
+// middleware. When it is empty (internal callers, tests) the key is still
+// bound to the player, so the cross-player disclosure the audit found cannot
+// occur either way.
+func requestFingerprint(playerID uuid.UUID, bodyHash string) string {
+	return cache.Fingerprint(playerID.String(), bodyHash)
+}
+
+// mapIdempotencyErr converts the cache layer's mismatch sentinel into the
+// domain error that maps to HTTP 409.
+func mapIdempotencyErr(operatorCode string, err error) error {
+	if errors.Is(err, cache.ErrFingerprintMismatch) {
+		metrics.IdempotencyFingerprintMismatch.WithLabelValues(operatorCode).Inc()
+		return fmt.Errorf("%w", errs.ErrIdempotencyMismatch)
+	}
+	return fmt.Errorf("idempotency acquire: %w", err)
+}
+
 // ----------------------------------------------------------------------------
 // GetBalances — non-locking snapshot read.
 // ----------------------------------------------------------------------------
@@ -139,10 +162,13 @@ func (e *engine) ProcessBet(ctx context.Context, req BetRequest) (TxResult, erro
 	idemKey := idempotencyKey(req.OperatorCode, req.OperatorTransactionID)
 
 	// ---- Phase 1: Redis idempotency ----
-	status, payload, err := e.idem.Acquire(ctx, idemKey)
+	fp := requestFingerprint(req.PlayerID, req.BodyHash)
+
+	status, payload, err := e.idem.Acquire(ctx, idemKey, fp)
 	if err != nil {
 		// FAIL CLOSED — never proceed when the idempotency barrier is down.
-		return TxResult{}, fmt.Errorf("idempotency acquire: %w", err)
+		// A fingerprint mismatch is a CLIENT error (409), not a barrier fault.
+		return TxResult{}, mapIdempotencyErr(req.OperatorCode, err)
 	}
 	switch status {
 	case cache.StatusPending:
@@ -159,7 +185,7 @@ func (e *engine) ProcessBet(ctx context.Context, req BetRequest) (TxResult, erro
 	}
 
 	// ---- Phase 3: cache the response ----
-	e.cacheResultQuietly(ctx, idemKey, result)
+	e.cacheResultQuietly(ctx, idemKey, fp, result)
 	return result, nil
 }
 
@@ -225,7 +251,7 @@ func (e *engine) processBetTx(ctx context.Context, req BetRequest) (result TxRes
 			// Stale FOR UPDATE rows are released by the deferred Rollback.
 			// Then read the committed state to reconstruct the response.
 			_ = tx.Rollback(ctx)
-			return e.recoverGhostSpin(ctx, req.OperatorCode, req.OperatorTransactionID, req.PlayerID, "BET", req.Family, req.Amount)
+			return e.recoverGhostSpin(ctx, req.OperatorCode, req.OperatorTransactionID, req.PlayerID, "BET", req.Family, req.Amount, req.BodyHash)
 		}
 		return TxResult{}, fmt.Errorf("insert ledger tx: %w", err)
 	}
@@ -277,9 +303,11 @@ func (e *engine) ProcessWin(ctx context.Context, req WinRequest) (TxResult, erro
 	}
 	idemKey := idempotencyKey(req.OperatorCode, req.OperatorTransactionID)
 
-	status, payload, err := e.idem.Acquire(ctx, idemKey)
+	fp := requestFingerprint(req.PlayerID, req.BodyHash)
+
+	status, payload, err := e.idem.Acquire(ctx, idemKey, fp)
 	if err != nil {
-		return TxResult{}, fmt.Errorf("idempotency acquire: %w", err)
+		return TxResult{}, mapIdempotencyErr(req.OperatorCode, err)
 	}
 	switch status {
 	case cache.StatusPending:
@@ -294,7 +322,7 @@ func (e *engine) ProcessWin(ctx context.Context, req WinRequest) (TxResult, erro
 		return TxResult{}, err
 	}
 
-	e.cacheResultQuietly(ctx, idemKey, result)
+	e.cacheResultQuietly(ctx, idemKey, fp, result)
 	return result, nil
 }
 
@@ -343,7 +371,7 @@ func (e *engine) processWinTx(ctx context.Context, req WinRequest) (result TxRes
 	if err != nil {
 		if isUniqueViolation(err) {
 			_ = tx.Rollback(ctx)
-			return e.recoverGhostSpin(ctx, req.OperatorCode, req.OperatorTransactionID, req.PlayerID, "WIN", req.Family, req.Amount)
+			return e.recoverGhostSpin(ctx, req.OperatorCode, req.OperatorTransactionID, req.PlayerID, "WIN", req.Family, req.Amount, req.BodyHash)
 		}
 		return TxResult{}, fmt.Errorf("insert ledger tx: %w", err)
 	}
@@ -385,9 +413,11 @@ func (e *engine) ProcessRollback(ctx context.Context, req RollbackRequest) (TxRe
 	}
 	idemKey := idempotencyKey(req.OperatorCode, req.OperatorTransactionID)
 
-	status, payload, err := e.idem.Acquire(ctx, idemKey)
+	fp := requestFingerprint(req.PlayerID, req.BodyHash)
+
+	status, payload, err := e.idem.Acquire(ctx, idemKey, fp)
 	if err != nil {
-		return TxResult{}, fmt.Errorf("idempotency acquire: %w", err)
+		return TxResult{}, mapIdempotencyErr(req.OperatorCode, err)
 	}
 	switch status {
 	case cache.StatusPending:
@@ -402,7 +432,7 @@ func (e *engine) ProcessRollback(ctx context.Context, req RollbackRequest) (TxRe
 		return TxResult{}, err
 	}
 
-	e.cacheResultQuietly(ctx, idemKey, result)
+	e.cacheResultQuietly(ctx, idemKey, fp, result)
 	return result, nil
 }
 
@@ -521,7 +551,7 @@ func (e *engine) processRollbackTx(ctx context.Context, req RollbackRequest) (re
 		if isUniqueViolation(err) {
 			_ = tx.Rollback(ctx)
 			return e.recoverGhostSpin(ctx, req.OperatorCode, req.OperatorTransactionID,
-				req.PlayerID, "ROLLBACK", domain.FamilyUnknown, domain.ZeroMoney())
+				req.PlayerID, "ROLLBACK", domain.FamilyUnknown, domain.ZeroMoney(), req.BodyHash)
 		}
 		return TxResult{}, fmt.Errorf("insert rollback tx: %w", err)
 	}
@@ -615,6 +645,7 @@ func (e *engine) recoverGhostSpin(
 	txType string,
 	family domain.CurrencyFamily,
 	amount domain.Money,
+	bodyHash string,
 ) (TxResult, error) {
 	var (
 		ledgerTxID   uuid.UUID
@@ -665,7 +696,8 @@ func (e *engine) recoverGhostSpin(
 	}
 
 	// Best-effort cache write so the next retry hits the fast Cached path.
-	e.cacheResultQuietly(ctx, idempotencyKey(operatorCode, opTxID), result)
+	e.cacheResultQuietly(ctx, idempotencyKey(operatorCode, opTxID),
+		requestFingerprint(playerID, bodyHash), result)
 	metrics.GhostSpinsRecovered.Inc()
 	return result, nil
 }
@@ -889,7 +921,7 @@ func (e *engine) releaseQuietly(ctx context.Context, idemKey string) {
 
 // cacheResultQuietly tries to write the success payload. Failure here is the
 // "Ghost Spin" origin condition: a retry will catch 23505 and recover.
-func (e *engine) cacheResultQuietly(ctx context.Context, idemKey string, result TxResult) {
+func (e *engine) cacheResultQuietly(ctx context.Context, idemKey, fingerprint string, result TxResult) {
 	b, err := json.Marshal(result)
 	if err != nil {
 		// json.Marshal on our well-defined struct cannot fail unless one of
@@ -900,7 +932,7 @@ func (e *engine) cacheResultQuietly(ctx context.Context, idemKey string, result 
 		)
 		return
 	}
-	if err := e.idem.Store(ctx, idemKey, string(b)); err != nil {
+	if err := e.idem.Store(ctx, idemKey, fingerprint, string(b)); err != nil {
 		e.logger.WarnContext(ctx, "idempotency cache store",
 			slog.String("error", err.Error()),
 			slog.String("idempotency_key", idemKey),

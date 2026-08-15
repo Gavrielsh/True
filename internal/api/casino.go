@@ -134,6 +134,7 @@ func (h *CasinoHandlers) Purchase(c *gin.Context) {
 		GCAmount:              gcAmount,
 		SCPromoAmount:         scPromo,
 		Metadata:              dto.Metadata,
+		BodyHash:              BodyHashFromContext(c.Request.Context()),
 	})
 	telemetry.EndSpan(span, err)
 	if err != nil {
@@ -169,6 +170,7 @@ func (h *CasinoHandlers) Redeem(c *gin.Context) {
 		PlayerID:              playerID,
 		Amount:                amount,
 		Metadata:              dto.Metadata,
+		BodyHash:              BodyHashFromContext(c.Request.Context()),
 	})
 	telemetry.EndSpan(span, err)
 	if err != nil {

@@ -71,8 +71,8 @@ type spinRequestDTO struct {
 // so the client can animate the exact reels the server drew — presentation
 // only; the balances are already authoritative.
 type spinResponse struct {
-	Code   errors.Code            `json:"code"`
-	Result repository.SpinResult  `json:"result"`
+	Code   errors.Code           `json:"code"`
+	Result repository.SpinResult `json:"result"`
 }
 
 // sessionRequestDTO is the wire format consumed by POST /api/v1/session.

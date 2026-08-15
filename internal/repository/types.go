@@ -54,6 +54,10 @@ type BetRequest struct {
 	GameID                string                // optional ("" = NULL)
 	RoundID               string                // optional ("" = NULL)
 	Metadata              json.RawMessage       // <= 512 bytes (DB-enforced)
+	// BodyHash is the hex SHA-256 of the verified raw request body, set by
+	// the HTTP layer. Together with PlayerID it binds the idempotency key to
+	// this exact request — see cache.Fingerprint.
+	BodyHash string
 }
 
 // WinRequest carries the same shape as BetRequest. A win typically references
@@ -69,6 +73,8 @@ type WinRequest struct {
 	RoundID                string
 	ReferenceTransactionID uuid.UUID // uuid.Nil = NULL
 	Metadata               json.RawMessage
+	// BodyHash — see BetRequest.BodyHash.
+	BodyHash string
 }
 
 // RollbackRequest reverses a previously-committed BET. The operator supplies
@@ -85,6 +91,8 @@ type RollbackRequest struct {
 	PlayerID               uuid.UUID // for cross-check against the original
 	ReferenceTransactionID uuid.UUID // the BET ledger_transactions.id to reverse
 	Metadata               json.RawMessage
+	// BodyHash — see BetRequest.BodyHash.
+	BodyHash string
 }
 
 // ResultStatus discriminates the three terminal outcomes of a Process* call.

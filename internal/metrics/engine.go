@@ -76,6 +76,30 @@ var (
 		Help: "Third-party WIN credits rejected for exceeding the configured absolute ceiling.",
 	})
 
+	// LegacySignatureAccepted counts requests admitted via the TRANSITIONAL
+	// body-only signature fallback, by operator.
+	//
+	// OPERATIONAL USE: this is the migration burndown. While it is non-zero
+	// for an operator, that operator is still signing the old way and replay
+	// protection is not in effect for them. Drive it to zero, then disable
+	// HMAC_ACCEPT_LEGACY_SIGNATURE and redeploy.
+	LegacySignatureAccepted = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "engine_legacy_signature_accepted_total",
+		Help: "Requests accepted via the transitional body-only HMAC fallback, by operator.",
+	}, []string{"operator"})
+
+	// IdempotencyFingerprintMismatch counts idempotency keys presented with a
+	// DIFFERENT request than the one that created them.
+	//
+	// A healthy integration never trips this: a retry replays the identical
+	// body. A non-zero rate means an integrator is reusing keys across
+	// distinct transactions — or someone is probing for cached results
+	// belonging to another player.
+	IdempotencyFingerprintMismatch = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "engine_idempotency_fingerprint_mismatch_total",
+		Help: "Idempotency keys reused with a materially different request, by operator.",
+	}, []string{"operator"})
+
 	// GeoBlockedRequests counts requests rejected by the jurisdiction fence,
 	// per ISO-3166-2 region. Region codes come from the operator-configured
 	// blocklist — a small bounded set, safe as a label.

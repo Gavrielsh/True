@@ -56,7 +56,7 @@ func TestValidateRejectsMalformed(t *testing.T) {
 	}
 
 	tests := []struct {
-		name  string
+		name   string
 		mutate func(*Paytable)
 	}{
 		{"empty game id", func(p *Paytable) { p.GameID = "" }},
@@ -166,10 +166,10 @@ func TestEvaluateLineRules(t *testing.T) {
 	p := ClassicThreeReel
 
 	tests := []struct {
-		name       string
-		reels      []string
-		wantLine   LineResult
-		wantMult   string
+		name     string
+		reels    []string
+		wantLine LineResult
+		wantMult string
 	}{
 		{"three crowns", []string{"CROWN", "CROWN", "CROWN"}, LineThree, "400"},
 		{"three cherries", []string{"CHERRY", "CHERRY", "CHERRY"}, LineThree, "5"},

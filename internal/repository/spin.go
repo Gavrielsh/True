@@ -65,6 +65,8 @@ type SpinRequest struct {
 	GameID                string                // resolves the paytable; "" → default
 	RoundID               string
 	Metadata              json.RawMessage
+	// BodyHash — see BetRequest.BodyHash.
+	BodyHash string
 }
 
 func (r SpinRequest) validate() error {
@@ -155,9 +157,11 @@ func (g *gameEngine) ProcessSpin(ctx context.Context, req SpinRequest) (SpinResu
 	idemKey := idempotencyKey(req.OperatorCode, req.OperatorTransactionID)
 
 	// ---- Phase 1: Redis idempotency ----
-	status, payload, err := e.idem.Acquire(ctx, idemKey)
+	fp := requestFingerprint(req.PlayerID, req.BodyHash)
+
+	status, payload, err := e.idem.Acquire(ctx, idemKey, fp)
 	if err != nil {
-		return SpinResult{}, fmt.Errorf("idempotency acquire: %w", err)
+		return SpinResult{}, mapIdempotencyErr(req.OperatorCode, err)
 	}
 	switch status {
 	case cache.StatusPending:
@@ -194,7 +198,7 @@ func (g *gameEngine) ProcessSpin(ctx context.Context, req SpinRequest) (SpinResu
 	}
 
 	// ---- Phase 4: cache the response ----
-	e.cacheSpinQuietly(ctx, idemKey, result)
+	e.cacheSpinQuietly(ctx, idemKey, fp, result)
 	return result, nil
 }
 
@@ -402,7 +406,8 @@ func (g *gameEngine) recoverGhostSpinRound(ctx context.Context, req SpinRequest)
 		PostBalances:           balanceSummaryOf(current),
 		Status:                 StatusGhostRecovered,
 	}
-	e.cacheSpinQuietly(ctx, idempotencyKey(req.OperatorCode, req.OperatorTransactionID), result)
+	e.cacheSpinQuietly(ctx, idempotencyKey(req.OperatorCode, req.OperatorTransactionID),
+		requestFingerprint(req.PlayerID, req.BodyHash), result)
 	metrics.GhostSpinsRecovered.Inc()
 	return result, nil
 }
@@ -459,14 +464,14 @@ func decodeCachedSpin(payload string) (SpinResult, error) {
 	return out, nil
 }
 
-func (e *engine) cacheSpinQuietly(ctx context.Context, idemKey string, result SpinResult) {
+func (e *engine) cacheSpinQuietly(ctx context.Context, idemKey, fingerprint string, result SpinResult) {
 	b, err := json.Marshal(result)
 	if err != nil {
 		e.logger.ErrorContext(ctx, "spin idempotency payload marshal",
 			slog.String("error", err.Error()), slog.String("idempotency_key", idemKey))
 		return
 	}
-	if err := e.idem.Store(ctx, idemKey, string(b)); err != nil {
+	if err := e.idem.Store(ctx, idemKey, fingerprint, string(b)); err != nil {
 		e.logger.WarnContext(ctx, "spin idempotency cache store",
 			slog.String("error", err.Error()), slog.String("idempotency_key", idemKey))
 	}

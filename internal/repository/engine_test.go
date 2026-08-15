@@ -41,33 +41,43 @@ type fakeIdem struct {
 
 	stored   map[string]string // payloads passed to Store
 	released map[string]int    // call-count per key
+	// fingerprints records the fingerprint bound to each key, mirroring the
+	// real store's "<fingerprint>|<payload>" layout.
+	fingerprints map[string]string
 }
 
 func newFakeIdem() *fakeIdem {
 	return &fakeIdem{
-		state:    map[string]string{},
-		stored:   map[string]string{},
-		released: map[string]int{},
+		state:        map[string]string{},
+		stored:       map[string]string{},
+		released:     map[string]int{},
+		fingerprints: map[string]string{},
 	}
 }
 
-func (f *fakeIdem) Acquire(_ context.Context, key string) (cache.AcquireStatus, string, error) {
+func (f *fakeIdem) Acquire(_ context.Context, key, fingerprint string) (cache.AcquireStatus, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.acquireErr != nil {
 		return cache.StatusUnknown, "", f.acquireErr
 	}
 	if v, ok := f.state[key]; ok {
+		// Same binding check the Lua script performs: a key presented with a
+		// different request is refused, never served the original's payload.
+		if stored, seen := f.fingerprints[key]; seen && stored != fingerprint {
+			return cache.StatusUnknown, "", cache.ErrFingerprintMismatch
+		}
 		if v == cache.ProcessingMarker {
 			return cache.StatusPending, "", nil
 		}
 		return cache.StatusCached, v, nil
 	}
 	f.state[key] = cache.ProcessingMarker
+	f.fingerprints[key] = fingerprint
 	return cache.StatusAcquired, "", nil
 }
 
-func (f *fakeIdem) Store(_ context.Context, key, payload string) error {
+func (f *fakeIdem) Store(_ context.Context, key, fingerprint, payload string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.storeErr != nil {
@@ -78,6 +88,7 @@ func (f *fakeIdem) Store(_ context.Context, key, payload string) error {
 	}
 	f.state[key] = payload
 	f.stored[key] = payload
+	f.fingerprints[key] = fingerprint
 	return nil
 }
 
@@ -89,6 +100,7 @@ func (f *fakeIdem) Release(_ context.Context, key string) error {
 		return f.releaseErr
 	}
 	delete(f.state, key)
+	delete(f.fingerprints, key)
 	return nil
 }
 
