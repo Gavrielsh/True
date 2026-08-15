@@ -217,23 +217,36 @@ func (g *gameEngine) settleSpinTx(
 		attribute.String("paytable_version", paytable.Version))
 	defer func() { telemetry.EndSpan(span, err) }()
 
+	// ISOLATION: READ COMMITTED, unchanged from the original design and from
+	// ARCHITECTURE.md §4. It is the correct level here BECAUSE the wallet row is
+	// locked pessimistically: FOR UPDATE serializes every concurrent spin for
+	// this player onto one queue, so the read-modify-write cannot interleave.
+	//
+	// Phantom reads are not a risk in this flow — it touches exactly one wallet
+	// row, addressed by primary key, and never scans a range whose membership
+	// could change. Raising to SERIALIZABLE would add 40001 serialization
+	// failures under precisely the workload this engine is built for (a single
+	// player firing rapid spins at the same row), turning a clean lock queue
+	// into a retry storm. That is the outcome ARCHITECTURE.md §3 explicitly
+	// warns against.
 	tx, err := e.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return SpinResult{}, fmt.Errorf("begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// 1. Lock the wallet for the duration of the transaction.
-	wallet, err := selectWalletForUpdate(ctx, tx, req.PlayerID)
+	// ── Round-trip 1: acquire the lock and read the compliance status ────────
+	wallet, status, err := lockWalletAndStatus(ctx, tx, req.PlayerID)
 	if err != nil {
 		return SpinResult{}, err
 	}
-	// 1b. KYC/compliance guard, serialized behind the lock above.
-	if err := requirePlayerActive(ctx, tx, req.PlayerID); err != nil {
-		return SpinResult{}, err
+	if status != "ACTIVE" {
+		return SpinResult{}, fmt.Errorf("%w: player status is %s", errs.ErrPlayerNotActive, status)
 	}
 
-	// 2. Debit leg — pure domain math, no I/O.
+	// ── Pure domain math — UNCHANGED, still the only place money is computed ──
+	// No I/O between these calls; the allocators run in microseconds on values
+	// already in hand.
 	alloc, err := wallet.AllocateBet(req.Family, req.BetAmount)
 	if err != nil {
 		return SpinResult{}, err
@@ -243,10 +256,9 @@ func (g *gameEngine) settleSpinTx(
 		return SpinResult{}, err
 	}
 
-	// 3. Credit leg, applied on top of the post-bet wallet so the stake is
-	//    already deducted when the win lands. This matters when a player
-	//    stakes their entire balance and wins: the intermediate state must be
-	//    the real post-debit position, not the pre-bet one.
+	// The credit applies on top of the post-bet wallet so the stake is already
+	// deducted when the win lands — this matters when a player stakes their
+	// whole balance and wins.
 	post := postBet
 	var winAlloc domain.WinAllocation
 	hasWin := winAmount.IsPositive()
@@ -258,74 +270,40 @@ func (g *gameEngine) settleSpinTx(
 		post = postBet.ApplyWin(winAlloc)
 	}
 
-	// 4. ONE UPDATE for the net position of both legs.
-	if err := updateWalletBalances(ctx, tx, req.PlayerID, post); err != nil {
-		return SpinResult{}, err
-	}
-
-	// 5. BET ledger transaction. The outcome is recorded in its metadata so
-	//    any historical round can be re-verified against the exact paytable
-	//    version that produced it.
 	betMeta, err := spinMetadata(req.Metadata, outcome)
 	if err != nil {
 		return SpinResult{}, err
 	}
-	betLedgerID, err := insertLedgerTx(ctx, tx, ledgerTxParams{
-		OperatorCode:          req.OperatorCode,
-		OperatorTransactionID: req.OperatorTransactionID + betLegSuffix,
-		PlayerID:              req.PlayerID,
-		Type:                  "BET",
-		GameID:                paytable.GameID,
-		RoundID:               req.RoundID,
-		Reference:             uuid.Nil,
-		Metadata:              betMeta,
+
+	// ── Round-trip 2: the entire write side in ONE statement ─────────────────
+	// Wallet update + 2 ledger headers + 2 dedup anchors + every entry line.
+	// The values below are the domain's output, passed through verbatim.
+	betLedgerID, winLedgerID, err := settleSpinStatement(ctx, tx, settleSpinParams{
+		Post:         post,
+		PlayerID:     req.PlayerID,
+		OperatorCode: req.OperatorCode,
+		BetOpTxID:    req.OperatorTransactionID + betLegSuffix,
+		WinOpTxID:    req.OperatorTransactionID + winLegSuffix,
+		GameID:       paytable.GameID,
+		RoundID:      req.RoundID,
+		Metadata:     betMeta,
+		HasWin:       hasWin,
+		Entries:      buildSpinEntries(req.PlayerID, alloc, postBet, winAlloc, post, hasWin),
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
+			// A duplicate operator transaction. The whole statement — wallet
+			// update included — rolled back atomically, so recovery replays the
+			// committed original rather than re-deducting.
 			_ = tx.Rollback(ctx)
 			return g.recoverGhostSpinRound(ctx, req)
 		}
-		return SpinResult{}, fmt.Errorf("insert bet tx: %w", err)
+		return SpinResult{}, fmt.Errorf("settle spin: %w", err)
 	}
 	span.SetAttributes(attribute.String("bet_ledger_transaction_id", betLedgerID.String()))
 
-	for _, dbt := range alloc.Debits {
-		balanceAfter := postBet.BalanceFor(dbt.Currency)
-		if err := insertPlayerWalletEntry(ctx, tx, betLedgerID, req.PlayerID, dbt.Currency, "DEBIT", dbt.Amount, balanceAfter); err != nil {
-			return SpinResult{}, err
-		}
-		if err := insertHouseEntry(ctx, tx, betLedgerID, "HOUSE_BET_POOL", dbt.Currency, "CREDIT", dbt.Amount); err != nil {
-			return SpinResult{}, err
-		}
-	}
-
-	// 6. WIN ledger transaction, referencing the bet leg.
 	var winLedgerIDPtr *uuid.UUID
 	if hasWin {
-		winLedgerID, err := insertLedgerTx(ctx, tx, ledgerTxParams{
-			OperatorCode:          req.OperatorCode,
-			OperatorTransactionID: req.OperatorTransactionID + winLegSuffix,
-			PlayerID:              req.PlayerID,
-			Type:                  "WIN",
-			GameID:                paytable.GameID,
-			RoundID:               req.RoundID,
-			Reference:             betLedgerID,
-			Metadata:              betMeta,
-		})
-		if err != nil {
-			if isUniqueViolation(err) {
-				_ = tx.Rollback(ctx)
-				return g.recoverGhostSpinRound(ctx, req)
-			}
-			return SpinResult{}, fmt.Errorf("insert win tx: %w", err)
-		}
-		balanceAfter := post.BalanceFor(winAlloc.Credit.Currency)
-		if err := insertPlayerWalletEntry(ctx, tx, winLedgerID, req.PlayerID, winAlloc.Credit.Currency, "CREDIT", winAlloc.Credit.Amount, balanceAfter); err != nil {
-			return SpinResult{}, err
-		}
-		if err := insertHouseEntry(ctx, tx, winLedgerID, "HOUSE_WIN_POOL", winAlloc.Credit.Currency, "DEBIT", winAlloc.Credit.Amount); err != nil {
-			return SpinResult{}, err
-		}
 		winLedgerIDPtr = &winLedgerID
 	}
 
