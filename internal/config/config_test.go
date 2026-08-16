@@ -78,6 +78,11 @@ func setRequiredEnv(t *testing.T) {
 	t.Setenv("POSTGRES_URL", "postgres://u:p@localhost:5432/db")
 	t.Setenv("REDIS_URL", "redis://localhost:6379/0")
 	t.Setenv("OPERATOR_SECRETS", `{"OP1":"secret"}`)
+	t.Setenv("MAX_PROVIDER_WIN", "50000.0000")
+	// Jurisdiction enforcement is now on by default, so a config fixture must
+	// either supply a GeoIP database path or take the explicit opt-out. The
+	// tests here exercise config parsing, not geo behaviour, so they opt out.
+	t.Setenv("GEOFENCE_MODE", "disabled")
 }
 
 func TestLoad_Defaults(t *testing.T) {
@@ -195,7 +200,7 @@ func TestLoad_MinConnsZeroAllowed(t *testing.T) {
 }
 
 func TestLoad_MissingRequired(t *testing.T) {
-	cases := []string{"POSTGRES_URL", "REDIS_URL", "OPERATOR_SECRETS"}
+	cases := []string{"POSTGRES_URL", "REDIS_URL", "OPERATOR_SECRETS", "MAX_PROVIDER_WIN"}
 	for _, missing := range cases {
 		t.Run("missing_"+missing, func(t *testing.T) {
 			setRequiredEnv(t)
@@ -271,5 +276,102 @@ func TestConfig_LogValueHidesSecrets(t *testing.T) {
 	// It should still expose the safe operator count.
 	if !strings.Contains(rendered, "operator_count") {
 		t.Errorf("LogValue missing operator_count: %s", rendered)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Jurisdiction enforcement must be on by default (audit fix)
+// ----------------------------------------------------------------------------
+
+// The previous behaviour — an unset GEOIP_DB_PATH silently disabling the
+// fence — is exactly how the blocklist ended up looking configured while
+// enforcing nothing. Booting without a database now requires an explicit,
+// greppable opt-out.
+func TestLoad_GeofenceRequiresDBUnlessExplicitlyDisabled(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("GEOFENCE_MODE", "") // clear the fixture's opt-out
+	t.Setenv("GEOIP_DB_PATH", "")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("an unset GEOIP_DB_PATH must fail the boot, not silently disable enforcement")
+	}
+}
+
+func TestLoad_GeofenceDisabledOptOut(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("GEOFENCE_MODE", "disabled")
+	t.Setenv("GEOIP_DB_PATH", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("explicit opt-out should boot: %v", err)
+	}
+	if !cfg.GeofenceDisabled {
+		t.Error("GeofenceDisabled should be true")
+	}
+}
+
+func TestLoad_GeofenceEnabledWithDBPath(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("GEOFENCE_MODE", "")
+	t.Setenv("GEOIP_DB_PATH", "/opt/geoip/GeoLite2-City.mmdb")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("a configured db path should boot: %v", err)
+	}
+	if cfg.GeofenceDisabled {
+		t.Error("GeofenceDisabled should be false when a db path is set")
+	}
+	if cfg.GeoIPDBPath != "/opt/geoip/GeoLite2-City.mmdb" {
+		t.Errorf("GeoIPDBPath: got %q", cfg.GeoIPDBPath)
+	}
+}
+
+// Anything other than the exact opt-out keeps enforcement ON — a typo must not
+// silently disable a compliance control.
+func TestLoad_GeofenceModeTypoDoesNotDisable(t *testing.T) {
+	for _, mode := range []string{"disable", "off", "false", "no"} {
+		t.Run(mode, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("GEOFENCE_MODE", mode)
+			t.Setenv("GEOIP_DB_PATH", "")
+
+			if _, err := Load(); err == nil {
+				t.Fatalf("GEOFENCE_MODE=%q must NOT disable enforcement", mode)
+			}
+		})
+	}
+}
+
+func TestLoad_TrustedProxiesParsed(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("TRUSTED_PROXIES", "10.0.0.0/8, 172.16.0.0/12 ,192.168.1.1")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.1.1"}
+	if len(cfg.TrustedProxies) != len(want) {
+		t.Fatalf("TrustedProxies: got %v want %v", cfg.TrustedProxies, want)
+	}
+	for i := range want {
+		if cfg.TrustedProxies[i] != want[i] {
+			t.Errorf("TrustedProxies[%d]: got %q want %q", i, cfg.TrustedProxies[i], want[i])
+		}
+	}
+}
+
+// The default is EMPTY — X-Forwarded-For is ignored unless a proxy is
+// explicitly trusted, so no deployment accidentally honours a spoofable header.
+func TestLoad_TrustedProxiesDefaultsEmpty(t *testing.T) {
+	setRequiredEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.TrustedProxies) != 0 {
+		t.Errorf("TrustedProxies must default to empty, got %v", cfg.TrustedProxies)
 	}
 }

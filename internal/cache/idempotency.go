@@ -19,6 +19,8 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -57,12 +59,53 @@ const (
 	defaultCacheTTL = 24 * time.Hour
 )
 
+// ErrFingerprintMismatch is returned by Acquire when the key already exists
+// but was created by a MATERIALLY DIFFERENT request.
+//
+// This is the audit's "idempotency replay is not bound to its request"
+// finding. Previously a cached result was returned verbatim on any retry
+// carrying the same key, without checking that the retry described the same
+// transaction. That allowed:
+//
+//	win(tx=X, player=A, amount=1.00)     → 200, credits 1.00 to A
+//	win(tx=X, player=B, amount=5000.00)  → 200, returns A's BALANCES under a
+//	                                       receipt claiming 5000.00
+//
+// No money moved on the second call, but it disclosed another player's
+// balances and emitted a success receipt that disagreed with the ledger — a
+// first-order integrity failure for a system whose product is the
+// authoritative record.
+var ErrFingerprintMismatch = errors.New("idempotency: key reused with a different request")
+
+// Fingerprint derives the binding token stored alongside an idempotency key.
+//
+// Callers pass the identity-and-content parts of the request — in practice
+// the player id and the SHA-256 of the verified raw body, so the key is bound
+// to BOTH who is transacting and exactly what they asked for.
+//
+// An EMPTY part is not treated as a wildcard: it is hashed like any other
+// value, so a caller that fails to supply a body hash gets a fingerprint that
+// only matches other requests which also supplied none. Absence never
+// silently matches presence.
+func Fingerprint(parts ...string) string {
+	h := sha256.New()
+	for _, p := range parts {
+		// Length-prefix each part so ("ab","c") and ("a","bc") differ.
+		_, _ = fmt.Fprintf(h, "%d:%s|", len(p), p)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // Store is the contract the repository depends on. Defined here so the
 // repository can be unit-tested with an in-memory fake while production
 // uses Redis.
+//
+// Acquire and Store both take the request fingerprint: Acquire compares it
+// against any stored value and refuses a mismatch; Store persists it beside
+// the payload so later retries can be compared too.
 type Store interface {
-	Acquire(ctx context.Context, opTxID string) (AcquireStatus, string, error)
-	Store(ctx context.Context, opTxID string, payload string) error
+	Acquire(ctx context.Context, opTxID, fingerprint string) (AcquireStatus, string, error)
+	Store(ctx context.Context, opTxID, fingerprint, payload string) error
 	Release(ctx context.Context, opTxID string) error
 }
 
@@ -96,7 +139,14 @@ const (
 	luaAcquired int64 = 1 // we set the PROCESSING marker
 	luaPending  int64 = 2 // marker already held by a concurrent request
 	luaCached   int64 = 3 // a JSON payload is already cached
+	luaMismatch int64 = 4 // key exists but belongs to a DIFFERENT request
 )
+
+// fingerprintSep separates the stored fingerprint from the payload in the
+// Redis value: "<fingerprint>|<payload>". The fingerprint is fixed-width hex
+// from SHA-256 and can never contain the separator, so the split is
+// unambiguous even when the payload itself contains '|'.
+const fingerprintSep = "|"
 
 // acquireScript performs the entire Acquire decision in ONE atomic, server-side
 // step (Redis executes a script with no interleaving). Logic:
@@ -107,16 +157,37 @@ const (
 //
 // PX (millisecond TTL) is used so sub-second lock windows (tests) are exact;
 // EX would truncate a 100ms TTL to 0 and error.
+// Stored value layout: "<fingerprint>|PROCESSING" while in flight, then
+// "<fingerprint>|<json payload>" once complete.
+//
+//	KEYS[1] = idempotency key
+//	ARGV[1] = fingerprint of THIS request
+//	ARGV[2] = lock TTL in ms
+//	ARGV[3] = the ProcessingMarker sentinel
 var acquireScript = redis.NewScript(`
 local existing = redis.call('GET', KEYS[1])
 if existing == false then
-	redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+	redis.call('SET', KEYS[1], ARGV[1] .. '|' .. ARGV[3], 'PX', ARGV[2])
 	return {1, ''}
 end
-if existing == ARGV[1] then
+
+local sep = string.find(existing, '|', 1, true)
+if sep == nil then
+	-- Value written by a pre-binding release. Treat as a mismatch rather
+	-- than guessing: refusing is safe, replaying an unverifiable payload is not.
+	return {4, ''}
+end
+
+local storedFp = string.sub(existing, 1, sep - 1)
+if storedFp ~= ARGV[1] then
+	return {4, ''}
+end
+
+local rest = string.sub(existing, sep + 1)
+if rest == ARGV[3] then
 	return {2, ''}
 end
-return {3, existing}
+return {3, rest}
 `)
 
 // Acquire atomically claims the idempotency key. See AcquireStatus for the
@@ -126,7 +197,7 @@ return {3, existing}
 // there is no SETNX-then-GET window for the TTL to expire through — the race
 // the previous implementation papered over with a "treat phantom miss as
 // Pending" branch simply cannot occur.
-func (r *Redis) Acquire(ctx context.Context, opTxID string) (status AcquireStatus, payload string, err error) {
+func (r *Redis) Acquire(ctx context.Context, opTxID, fingerprint string) (status AcquireStatus, payload string, err error) {
 	// The idempotency key is operator_code:operator_transaction_id — an
 	// identifier, not PII (§9), and the single most useful pivot when
 	// debugging a Ghost-Spin.
@@ -137,6 +208,11 @@ func (r *Redis) Acquire(ctx context.Context, opTxID string) (status AcquireStatu
 	if opTxID == "" {
 		return StatusUnknown, "", errors.New("idempotency: empty operator_transaction_id")
 	}
+	if fingerprint == "" {
+		// A blank fingerprint would bind the key to nothing, silently
+		// restoring the unbound behaviour this parameter exists to remove.
+		return StatusUnknown, "", errors.New("idempotency: empty request fingerprint")
+	}
 	k := keyFor(opTxID)
 
 	// PX demands an integer >= 1ms.
@@ -145,7 +221,7 @@ func (r *Redis) Acquire(ctx context.Context, opTxID string) (status AcquireStatu
 		ttlMillis = 1
 	}
 
-	res, err := acquireScript.Run(ctx, r.client, []string{k}, ProcessingMarker, ttlMillis).Result()
+	res, err := acquireScript.Run(ctx, r.client, []string{k}, fingerprint, ttlMillis, ProcessingMarker).Result()
 	if err != nil {
 		return StatusUnknown, "", fmt.Errorf("idempotency acquire script: %w", err)
 	}
@@ -161,6 +237,8 @@ func (r *Redis) Acquire(ctx context.Context, opTxID string) (status AcquireStatu
 		return StatusPending, "", nil
 	case luaCached:
 		return StatusCached, payload, nil
+	case luaMismatch:
+		return StatusUnknown, "", ErrFingerprintMismatch
 	default:
 		return StatusUnknown, "", fmt.Errorf("idempotency: unexpected acquire code %d", code)
 	}
@@ -195,16 +273,22 @@ func parseAcquireResult(res any) (int64, string, error) {
 // only overwrite our own PROCESSING marker — if the key expired and a fresh
 // PROCESSING from a retry has appeared, we leave it alone (the retry will
 // hit 23505 on the DB INSERT and recover via Ghost-Spin).
-func (r *Redis) Store(ctx context.Context, opTxID string, payload string) error {
+func (r *Redis) Store(ctx context.Context, opTxID, fingerprint, payload string) error {
 	if opTxID == "" {
 		return errors.New("idempotency: empty operator_transaction_id")
+	}
+	if fingerprint == "" {
+		return errors.New("idempotency: empty request fingerprint")
 	}
 	if payload == "" {
 		return errors.New("idempotency: empty payload")
 	}
+	// The fingerprint is re-written with the payload so a later retry is
+	// compared against the request that actually produced this result.
+	value := fingerprint + fingerprintSep + payload
 	// SetXX returns BoolCmd: true = overwrote, false = key didn't exist.
 	// Both are acceptable here (the second case means our PROCESSING expired).
-	if err := r.client.SetXX(ctx, keyFor(opTxID), payload, r.cacheTTL).Err(); err != nil {
+	if err := r.client.SetXX(ctx, keyFor(opTxID), value, r.cacheTTL).Err(); err != nil {
 		return fmt.Errorf("idempotency SET XX: %w", err)
 	}
 	return nil

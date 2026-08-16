@@ -23,6 +23,21 @@ var (
 	ErrRollbackNotFound    = stderrors.New("rollback target not found")
 	ErrRollbackAlready     = stderrors.New("transaction already rolled back")
 	ErrRollbackUnsupported = stderrors.New("rollback not supported for this transaction type")
+
+	// ErrUnsupportedGame: the requested game_id has no registered paytable.
+	// Rejected outright rather than falling back to a default, so a caller
+	// cannot shop for a better-paying table with a bogus id.
+	ErrUnsupportedGame = stderrors.New("unsupported game")
+	// ErrRNGUnavailable: the entropy source failed. A spin that cannot be
+	// drawn securely is not drawn at all — never degrade to a weaker source.
+	ErrRNGUnavailable = stderrors.New("random number generator unavailable")
+	// ErrIdempotencyMismatch: the idempotency key was reused with a
+	// materially different request (different player, amount, or currency).
+	ErrIdempotencyMismatch = stderrors.New("idempotency key reused with a different request")
+	// ErrWinExceedsCeiling: a third-party WIN credit exceeded the operator's
+	// configured absolute ceiling. Signals a provider bug or a compromised
+	// webhook secret — always alert, never auto-raise the ceiling.
+	ErrWinExceedsCeiling = stderrors.New("win exceeds configured ceiling")
 )
 
 // Code is the stable identifier surfaced to operators (e.g. in webhook
@@ -42,6 +57,10 @@ const (
 	CodeRollbackNotFound    Code = "ROLLBACK_NOT_FOUND"
 	CodeRollbackAlready     Code = "ROLLBACK_ALREADY"
 	CodeRollbackUnsupported Code = "ROLLBACK_UNSUPPORTED"
+	CodeUnsupportedGame     Code = "UNSUPPORTED_GAME"
+	CodeRNGUnavailable      Code = "RNG_UNAVAILABLE"
+	CodeIdempotencyMismatch Code = "IDEMPOTENCY_KEY_REUSED"
+	CodeWinExceedsCeiling   Code = "WIN_EXCEEDS_CEILING"
 	// CodeGeoBlocked is returned by the jurisdiction fence (no sentinel error:
 	// the middleware rejects before any domain call).
 	CodeGeoBlocked Code = "GEO_BLOCKED"
@@ -74,6 +93,14 @@ func CodeFor(err error) Code {
 		return CodeRollbackAlready
 	case stderrors.Is(err, ErrRollbackUnsupported):
 		return CodeRollbackUnsupported
+	case stderrors.Is(err, ErrUnsupportedGame):
+		return CodeUnsupportedGame
+	case stderrors.Is(err, ErrRNGUnavailable):
+		return CodeRNGUnavailable
+	case stderrors.Is(err, ErrIdempotencyMismatch):
+		return CodeIdempotencyMismatch
+	case stderrors.Is(err, ErrWinExceedsCeiling):
+		return CodeWinExceedsCeiling
 	default:
 		return CodeInternal
 	}

@@ -25,6 +25,7 @@ import (
 	"github.com/Gavrielsh/True/internal/api"
 	"github.com/Gavrielsh/True/internal/cache"
 	"github.com/Gavrielsh/True/internal/config"
+	"github.com/Gavrielsh/True/internal/domain"
 	"github.com/Gavrielsh/True/internal/repository"
 	"github.com/Gavrielsh/True/internal/telemetry"
 	"github.com/Gavrielsh/True/internal/worker"
@@ -93,14 +94,41 @@ func run() error {
 
 	// --- Wiring -------------------------------------------------------------
 	idem := cache.NewRedis(rdb)
-	eng := repository.New(pool, idem, logger)
-	casinoEng := repository.NewCasino(pool, idem, logger)
-
-	// Geo-fence: jurisdiction blocking for restricted US states. An empty
-	// GEOIP_DB_PATH disables it with a startup WARN (dev mode).
-	geoFence, err := api.NewGeoFence(cfg.GeoIPDBPath, cfg.BlockedRegions, logger)
+	// Third-party win ceiling. Parsed here so a malformed value fails the
+	// boot rather than silently disabling the cap at request time.
+	maxWin, err := domain.MoneyFromString(cfg.MaxProviderWin)
 	if err != nil {
-		return fmt.Errorf("geofence: %w", err)
+		return fmt.Errorf("MAX_PROVIDER_WIN %q: %w", cfg.MaxProviderWin, err)
+	}
+	if !maxWin.IsPositive() {
+		return fmt.Errorf("MAX_PROVIDER_WIN must be > 0, got %s", maxWin)
+	}
+	logger.Info("third-party win ceiling active", slog.String("max_provider_win", maxWin.String()))
+
+	if cfg.AcceptLegacySignature {
+		logger.Warn("INSECURE: HMAC_ACCEPT_LEGACY_SIGNATURE is enabled — " +
+			"body-only signatures are accepted, so replay protection is NOT in effect. " +
+			"Migrate every integrator to the canonical timestamp.nonce.body signature, " +
+			"watch engine_legacy_signature_accepted_total reach zero, then disable this.")
+	}
+
+	eng := repository.New(pool, idem, logger, repository.WithMaxWinAmount(maxWin))
+	casinoEng := repository.NewCasino(pool, idem, logger)
+	// Server-authoritative game engine. Passing a nil RNG selects crypto/rand
+	// — there is deliberately no config knob for a weaker entropy source.
+	gameEng := repository.NewGame(pool, idem, nil, logger)
+
+	// Geo-fence: jurisdiction blocking for restricted US states. FAIL CLOSED —
+	// any request whose region cannot be positively established is rejected.
+	// Running without it requires the explicit GEOFENCE_MODE=disabled opt-out.
+	var geoFence *api.GeoFence
+	if cfg.GeofenceDisabled {
+		geoFence = api.NewDisabledGeoFence(logger)
+	} else {
+		geoFence, err = api.NewGeoFence(cfg.GeoIPDBPath, cfg.BlockedRegions, cfg.TrustedProxies, logger)
+		if err != nil {
+			return fmt.Errorf("geofence: %w", err)
+		}
 	}
 	defer func() {
 		if cerr := geoFence.Close(); cerr != nil {
@@ -111,14 +139,16 @@ func run() error {
 	limiter := api.NewRateLimiter(rdb, logger, api.WithOperatorRPS(cfg.RateLimitRPS))
 
 	router := api.NewRouter(api.Config{
-		Engine:      eng,
-		Casino:      casinoEng,
-		DB:          pool,
-		Redis:       rdb,
-		Secrets:     cfg.OperatorSecrets,
-		GeoFence:    geoFence,
-		RateLimiter: limiter,
-		Logger:      logger,
+		Engine:                eng,
+		Casino:                casinoEng,
+		Game:                  gameEng,
+		DB:                    pool,
+		Redis:                 rdb,
+		Secrets:               cfg.OperatorSecrets,
+		AcceptLegacySignature: cfg.AcceptLegacySignature,
+		GeoFence:              geoFence,
+		RateLimiter:           limiter,
+		Logger:                logger,
 	})
 
 	srv := &http.Server{

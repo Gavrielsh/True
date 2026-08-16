@@ -42,6 +42,21 @@ func httpStatusFor(code errors.Code) int {
 		return http.StatusConflict
 	case errors.CodeRollbackUnsupported:
 		return http.StatusUnprocessableEntity
+	case errors.CodeUnsupportedGame:
+		return http.StatusBadRequest
+	case errors.CodeWinExceedsCeiling:
+		// 422, not 400: the request is well-formed but refused by policy.
+		// Terminal — an operator retry will not help, a human must look.
+		return http.StatusUnprocessableEntity
+	case errors.CodeIdempotencyMismatch:
+		// 409 per the audit's requirement: the key is in use by a DIFFERENT
+		// request. Distinct from CodeTransactionPending, which means the SAME
+		// request is still in flight.
+		return http.StatusConflict
+	case errors.CodeRNGUnavailable:
+		// 503 — transient infrastructure failure; the spin was NOT settled
+		// and the same key is safe to retry.
+		return http.StatusServiceUnavailable
 	default:
 		return http.StatusInternalServerError
 	}
@@ -103,6 +118,14 @@ func publicMessageFor(code errors.Code) string {
 		return "transaction already rolled back"
 	case errors.CodeRollbackUnsupported:
 		return "rollback not supported for this transaction type"
+	case errors.CodeUnsupportedGame:
+		return "unknown game"
+	case errors.CodeWinExceedsCeiling:
+		return "win exceeds permitted ceiling"
+	case errors.CodeIdempotencyMismatch:
+		return "idempotency key already used for a different request"
+	case errors.CodeRNGUnavailable:
+		return "game temporarily unavailable"
 	default:
 		return "internal error"
 	}

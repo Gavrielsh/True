@@ -45,13 +45,23 @@ func fullStack(t *testing.T, eng repository.Engine, secret string) *http.ServeMu
 	return mux
 }
 
-// signedRequest builds a fully-authenticated request: HMAC over the raw body
-// plus a fresh timestamp and nonce.
+// signedRequest builds a fully-authenticated request: HMAC over the CANONICAL
+// STRING (timestamp.nonce.body), plus the matching timestamp and nonce headers.
+//
+// The timestamp is captured ONCE and used for both the signature and the
+// header. Computing it twice would let the two land on either side of a second
+// boundary, producing a signature over a timestamp the request never carried —
+// an intermittent 401 that looks like a security bug but is a test bug.
+//
+// ReplayGuard IS mounted in this router (unlike hmacRouter), so the timestamp
+// must be genuinely fresh rather than the fixed constant used in the
+// HMAC-only tests.
 func signedRequest(method, path, body, secret, nonce string) *http.Request {
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	req.Header.Set(HeaderOperatorCode, "OP1")
-	req.Header.Set(HeaderSignature, sign(secret, body))
-	req.Header.Set(HeaderTimestamp, strconv.FormatInt(time.Now().Unix(), 10))
+	req.Header.Set(HeaderSignature, signAt(secret, timestamp, nonce, body))
+	req.Header.Set(HeaderTimestamp, timestamp)
 	req.Header.Set(HeaderNonce, nonce)
 	return req
 }

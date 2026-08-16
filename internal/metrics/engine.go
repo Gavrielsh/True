@@ -21,6 +21,9 @@ const (
 	OpBet      = "bet"
 	OpWin      = "win"
 	OpRollback = "rollback"
+	// OpSpin is the server-authoritative game round: bet + win settled in a
+	// single transaction under one wallet lock.
+	OpSpin = "spin"
 )
 
 var (
@@ -33,6 +36,69 @@ var (
 		Name: "engine_ghost_spins_recovered_total",
 		Help: "Total ledger 23505 conflicts successfully replayed via Ghost-Spin recovery.",
 	})
+
+	// SpinsSettled counts completed server-authoritative rounds by game and
+	// line result. Both labels are bounded (registered game ids; the three
+	// LineResult values), so the cardinality stays fixed.
+	//
+	// OPERATIONAL USE: the ratio of line results is the live check that the
+	// RNG is behaving. If THREE_OF_A_KIND drifts from its theoretical rate,
+	// either the entropy source or the paytable has been tampered with.
+	SpinsSettled = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "engine_spins_settled_total",
+		Help: "Server-authoritative spins settled, by game id and line result.",
+	}, []string{"game_id", "line"})
+
+	// SpinWagerTotal and SpinPayoutTotal track realised turnover and payout
+	// per game, in whole currency units. Their ratio is the REALISED RTP,
+	// which alerting compares against the paytable's declared figure — the
+	// operational counterpart to the compile-time RTP assertion in
+	// internal/game.
+	SpinWagerTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "engine_spin_wager_total",
+		Help: "Total amount wagered on server-authoritative spins, by game id and currency family.",
+	}, []string{"game_id", "family"})
+
+	SpinPayoutTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "engine_spin_payout_total",
+		Help: "Total amount paid out on server-authoritative spins, by game id and currency family.",
+	}, []string{"game_id", "family"})
+
+	// WinCeilingRejections counts third-party WIN credits refused for
+	// exceeding the operator's configured ceiling.
+	//
+	// ANY increment is a page-the-humans event: a legitimate provider does
+	// not pay above its own declared max win, so a rejection means either a
+	// provider defect or a compromised webhook secret being used to mint
+	// redeemable currency.
+	WinCeilingRejections = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "engine_win_ceiling_rejections_total",
+		Help: "Third-party WIN credits rejected for exceeding the configured absolute ceiling.",
+	})
+
+	// LegacySignatureAccepted counts requests admitted via the TRANSITIONAL
+	// body-only signature fallback, by operator.
+	//
+	// OPERATIONAL USE: this is the migration burndown. While it is non-zero
+	// for an operator, that operator is still signing the old way and replay
+	// protection is not in effect for them. Drive it to zero, then disable
+	// HMAC_ACCEPT_LEGACY_SIGNATURE and redeploy.
+	LegacySignatureAccepted = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "engine_legacy_signature_accepted_total",
+		Help: "Requests accepted via the transitional body-only HMAC fallback, by operator.",
+	}, []string{"operator"})
+
+	// IdempotencyFingerprintMismatch counts idempotency keys presented with a
+	// DIFFERENT request than the one that created them.
+	//
+	// A healthy integration never trips this: a retry replays the identical
+	// body. A non-zero rate means an integrator is reusing keys across
+	// distinct transactions — or someone is probing for cached results
+	// belonging to another player.
+	IdempotencyFingerprintMismatch = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "engine_idempotency_fingerprint_mismatch_total",
+		Help: "Idempotency keys reused with a materially different request, by operator.",
+	}, []string{"operator"})
 
 	// GeoBlockedRequests counts requests rejected by the jurisdiction fence,
 	// per ISO-3166-2 region. Region codes come from the operator-configured

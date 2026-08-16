@@ -48,6 +48,33 @@ type rollbackRequestDTO struct {
 	Metadata               json.RawMessage `json:"metadata,omitempty"`
 }
 
+// spinRequestDTO is the wire format consumed by POST /api/v1/spin — the
+// SERVER-AUTHORITATIVE game round.
+//
+// SECURITY: note the fields that are deliberately absent. There is no
+// `amount` for a win, no `multiplier`, no `outcome`, and no `reels`. The
+// caller supplies a stake and a game; the server draws the result from
+// crypto/rand and derives the payout from the paytable. Adding any
+// win-shaped field here would reintroduce the vulnerability this endpoint
+// exists to close — see internal/game and internal/repository/spin.go.
+type spinRequestDTO struct {
+	OperatorTransactionID string          `json:"operator_transaction_id" binding:"required"`
+	PlayerID              string          `json:"player_id"               binding:"required"`
+	Currency              string          `json:"currency"                binding:"required"`
+	BetAmount             string          `json:"bet_amount"              binding:"required"`
+	GameID                string          `json:"game_id,omitempty"`
+	RoundID               string          `json:"round_id,omitempty"`
+	Metadata              json.RawMessage `json:"metadata,omitempty"`
+}
+
+// spinResponse is the POST /api/v1/spin payload. It embeds the full outcome
+// so the client can animate the exact reels the server drew — presentation
+// only; the balances are already authoritative.
+type spinResponse struct {
+	Code   errors.Code           `json:"code"`
+	Result repository.SpinResult `json:"result"`
+}
+
 // sessionRequestDTO is the wire format consumed by POST /api/v1/session.
 // The player id travels in the BODY — not the query string — so it is covered
 // by the raw-body HMAC signature (a GET's empty body would MAC to the constant

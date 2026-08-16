@@ -19,10 +19,45 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// testTimestamp / testNonce are the replay headers every signed test request
+// carries. They are part of the SIGNED material now (see canonicalPayload), so
+// sign() and the request must agree on them EXACTLY.
+//
+// Both are FIXED constants, not derived from time.Now(): the HMAC middleware
+// checks only well-formedness, never freshness (that is ReplayGuard's job, and
+// it is not mounted in hmacRouter). Deriving the timestamp from the clock here
+// would let sign() and the request header land on either side of a second
+// boundary and fail intermittently — exactly the flake pattern already present
+// in TestReplay_TimestampWindow.
+const (
+	testTimestamp = "1700000000"
+	testNonce     = "test-nonce-0001"
+)
+
+// sign produces the canonical signature: HMAC(secret, timestamp.nonce.body).
 func sign(secret, body string) string {
+	return signAt(secret, testTimestamp, testNonce, body)
+}
+
+func signAt(secret, timestamp, nonce, body string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(timestamp + "." + nonce + "." + body))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// signLegacy produces the PRE-AUDIT body-only signature, used to prove it is
+// rejected by default and accepted only under the transitional fallback.
+func signLegacy(secret, body string) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(body))
 	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// withReplayHeaders stamps the timestamp/nonce that sign() assumed.
+func withReplayHeaders(req *http.Request) *http.Request {
+	req.Header.Set(HeaderTimestamp, testTimestamp)
+	req.Header.Set(HeaderNonce, testNonce)
+	return req
 }
 
 // ----------------------------------------------------------------------------
@@ -56,6 +91,8 @@ func TestHMAC_ValidSignature_PassesAndRestoresBody(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(body))
 	req.Header.Set(HeaderOperatorCode, "OP1")
 	req.Header.Set(HeaderSignature, sign("topsecret", body))
+	req.Header.Set(HeaderTimestamp, testTimestamp)
+	req.Header.Set(HeaderNonce, testNonce)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -98,6 +135,8 @@ func TestHMAC_Rejections(t *testing.T) {
 			}
 			if tc.sig != "" {
 				req.Header.Set(HeaderSignature, tc.sig)
+				req.Header.Set(HeaderTimestamp, testTimestamp)
+				req.Header.Set(HeaderNonce, testNonce)
 			}
 			w := httptest.NewRecorder()
 			r.ServeHTTP(w, req)
@@ -115,6 +154,8 @@ func TestHMAC_BodyTooLarge(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(huge))
 	req.Header.Set(HeaderOperatorCode, "OP1")
 	req.Header.Set(HeaderSignature, sign("s", huge))
+	req.Header.Set(HeaderTimestamp, testTimestamp)
+	req.Header.Set(HeaderNonce, testNonce)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusRequestEntityTooLarge {
@@ -154,6 +195,8 @@ func TestHMAC_CaseInsensitiveHexAccepted(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(body))
 			req.Header.Set(HeaderOperatorCode, "OP1")
 			req.Header.Set(HeaderSignature, tc.sig)
+			req.Header.Set(HeaderTimestamp, testTimestamp)
+			req.Header.Set(HeaderNonce, testNonce)
 			w := httptest.NewRecorder()
 			r.ServeHTTP(w, req)
 			if w.Code != http.StatusOK {
@@ -172,6 +215,8 @@ func TestHMAC_NonHexSignatureRejected(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(body))
 	req.Header.Set(HeaderOperatorCode, "OP1")
 	req.Header.Set(HeaderSignature, "nothexZZ"+sign(secret, body)) // invalid hex prefix
+	req.Header.Set(HeaderTimestamp, testTimestamp)
+	req.Header.Set(HeaderNonce, testNonce)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusUnauthorized {
@@ -198,6 +243,8 @@ func TestHMAC_PooledBufferConcurrencySafe(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(body))
 			req.Header.Set(HeaderOperatorCode, "OP1")
 			req.Header.Set(HeaderSignature, sign(secret, body))
+			req.Header.Set(HeaderTimestamp, testTimestamp)
+			req.Header.Set(HeaderNonce, testNonce)
 			w := httptest.NewRecorder()
 			r.ServeHTTP(w, req)
 			if w.Code != http.StatusOK {
@@ -227,6 +274,8 @@ func BenchmarkHMACMiddleware(b *testing.B) {
 		req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(body))
 		req.Header.Set(HeaderOperatorCode, "OP1")
 		req.Header.Set(HeaderSignature, sig)
+		req.Header.Set(HeaderTimestamp, testTimestamp)
+		req.Header.Set(HeaderNonce, testNonce)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		if w.Code != http.StatusOK {
@@ -241,11 +290,28 @@ func BenchmarkHMACMiddleware(b *testing.B) {
 
 func replayRouter(t *testing.T) (*gin.Engine, *miniredis.Miniredis) {
 	t.Helper()
+	return replayRouterAt(t, time.Time{})
+}
+
+// replayRouterAt builds the replay-guard router with an optional FIXED clock.
+//
+// Pass a non-zero `at` when the test asserts a window BOUNDARY. With the real
+// clock, a case built as "now - 299s" is only 299s old at construction time;
+// by the time a parallel subtest actually executes, real time has advanced and
+// the age can cross the 300s limit, flipping an expected 200 into a 401. That
+// was a genuine intermittent failure in TestReplay_TimestampWindow (~40% of
+// runs), not a bug in the guard itself. Freezing the guard's clock makes the
+// boundary exact.
+func replayRouterAt(t *testing.T, at time.Time) (*gin.Engine, *miniredis.Miniredis) {
+	t.Helper()
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 	r := gin.New()
 	guard := NewReplayGuard(client)
+	if !at.IsZero() {
+		guard.now = func() time.Time { return at }
+	}
 	r.POST("/t", guard.Middleware(), func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})
@@ -290,7 +356,12 @@ func TestReplay_NonceReuseRejected(t *testing.T) {
 
 func TestReplay_TimestampWindow(t *testing.T) {
 	t.Parallel()
-	now := time.Now().Unix()
+	// FROZEN reference instant. Every case is expressed relative to it and the
+	// guard is pinned to it, so boundary cases are exact regardless of how long
+	// a parallel subtest waits to run.
+	frozen := time.Unix(1_700_000_000, 0)
+	now := frozen.Unix()
+
 	cases := []struct {
 		name   string
 		ts     int64
@@ -298,6 +369,8 @@ func TestReplay_TimestampWindow(t *testing.T) {
 	}{
 		{"now", now, http.StatusOK},
 		{"5min_minus_1s_ok", now - 299, http.StatusOK},
+		{"exactly_5min_ok", now - 300, http.StatusOK},
+		{"5min_plus_1s_stale", now - 301, http.StatusUnauthorized},
 		{"6min_old_stale", now - 360, http.StatusUnauthorized},
 		{"within_skew_future", now + 10, http.StatusOK},
 		{"beyond_skew_future", now + 120, http.StatusUnauthorized},
@@ -305,7 +378,7 @@ func TestReplay_TimestampWindow(t *testing.T) {
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			r, _ := replayRouter(t)
+			r, _ := replayRouterAt(t, frozen)
 			w := httptest.NewRecorder()
 			// Unique nonce per case so only the timestamp is under test.
 			r.ServeHTTP(w, replayReq(tc.ts, "ts-nonce-"+strconv.Itoa(i)))
@@ -380,5 +453,172 @@ func TestRecovery_TurnsPanicInto500(t *testing.T) {
 	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/boom", nil))
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("status: got %d want 500", w.Code)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Canonical-signature binding (audit fix: replay protection was decorative)
+// ----------------------------------------------------------------------------
+
+// TestHMAC_LegacyBodyOnlySignatureRejected is the core regression guard.
+//
+// Before the fix the signature covered ONLY the body, so an attacker who
+// captured one valid request could replay it forever: reuse the body and its
+// signature, attach a fresh timestamp and a brand-new nonce, and every check
+// passed — the nonce could not help because the ATTACKER chose it.
+//
+// A body-only signature must now be rejected by default.
+func TestHMAC_LegacyBodyOnlySignatureRejected(t *testing.T) {
+	t.Parallel()
+	const secret = "topsecret"
+	body := `{"x":1}`
+
+	r := hmacRouter(map[string]string{"OP1": secret})
+	req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(body))
+	req.Header.Set(HeaderOperatorCode, "OP1")
+	req.Header.Set(HeaderSignature, signLegacy(secret, body)) // pre-audit form
+	req.Header.Set(HeaderTimestamp, testTimestamp)
+	req.Header.Set(HeaderNonce, testNonce)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("body-only signature must be rejected: got %d, body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestHMAC_SignatureIsBoundToTimestampAndNonce proves the replay headers are
+// genuinely covered: a signature valid for one (timestamp, nonce) pair must not
+// validate when either is swapped — which is exactly the attacker's move.
+func TestHMAC_SignatureIsBoundToTimestampAndNonce(t *testing.T) {
+	t.Parallel()
+	const secret = "topsecret"
+	body := `{"x":1}`
+	captured := signAt(secret, testTimestamp, testNonce, body)
+
+	cases := []struct {
+		name      string
+		timestamp string
+		nonce     string
+	}{
+		{"fresh timestamp, same nonce", "1700009999", testNonce},
+		{"same timestamp, fresh nonce", testTimestamp, "attacker-nonce"},
+		{"both refreshed", "1700009999", "attacker-nonce"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := hmacRouter(map[string]string{"OP1": secret})
+			req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(body))
+			req.Header.Set(HeaderOperatorCode, "OP1")
+			req.Header.Set(HeaderSignature, captured) // replayed signature
+			req.Header.Set(HeaderTimestamp, tc.timestamp)
+			req.Header.Set(HeaderNonce, tc.nonce)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusUnauthorized {
+				t.Errorf("replayed signature with %s must be rejected: got %d", tc.name, w.Code)
+			}
+		})
+	}
+}
+
+// TestHMAC_LegacyFallbackAcceptsWhenEnabled documents the TRANSITIONAL escape
+// hatch used to roll the engine and its integrators independently.
+func TestHMAC_LegacyFallbackAcceptsWhenEnabled(t *testing.T) {
+	t.Parallel()
+	const secret = "topsecret"
+	body := `{"x":1}`
+
+	r := gin.New()
+	v := NewHMACVerifier(map[string]string{"OP1": secret}, WithLegacySignatureFallback(true))
+	r.POST("/t", v.Middleware(), func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true}) })
+
+	req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(body))
+	req.Header.Set(HeaderOperatorCode, "OP1")
+	req.Header.Set(HeaderSignature, signLegacy(secret, body))
+	req.Header.Set(HeaderTimestamp, testTimestamp)
+	req.Header.Set(HeaderNonce, testNonce)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("legacy fallback should accept the old signature: got %d, body=%s", w.Code, w.Body.String())
+	}
+	// The canonical form must STILL work while the fallback is open.
+	req2 := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(body))
+	req2.Header.Set(HeaderOperatorCode, "OP1")
+	req2.Header.Set(HeaderSignature, sign(secret, body))
+	req2.Header.Set(HeaderTimestamp, testTimestamp)
+	req2.Header.Set(HeaderNonce, testNonce)
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("canonical signature must still pass under the fallback: got %d", w2.Code)
+	}
+}
+
+// TestHMAC_MalformedReplayHeadersRejected covers the canonical-string
+// ambiguity guard: a nonce containing the '.' separator could otherwise let an
+// attacker shift bytes between fields while keeping the same digest.
+func TestHMAC_MalformedReplayHeadersRejected(t *testing.T) {
+	t.Parallel()
+	const secret = "topsecret"
+	body := `{"x":1}`
+
+	cases := []struct{ name, timestamp, nonce string }{
+		{"missing timestamp", "", testNonce},
+		{"missing nonce", testTimestamp, ""},
+		{"non-numeric timestamp", "not-a-number", testNonce},
+		{"nonce contains separator", testTimestamp, "aaa.bbb"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := hmacRouter(map[string]string{"OP1": secret})
+			req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(body))
+			req.Header.Set(HeaderOperatorCode, "OP1")
+			req.Header.Set(HeaderSignature, signAt(secret, tc.timestamp, tc.nonce, body))
+			if tc.timestamp != "" {
+				req.Header.Set(HeaderTimestamp, tc.timestamp)
+			}
+			if tc.nonce != "" {
+				req.Header.Set(HeaderNonce, tc.nonce)
+			}
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusUnauthorized {
+				t.Errorf("%s must be rejected: got %d", tc.name, w.Code)
+			}
+		})
+	}
+}
+
+// TestHMAC_BodyHashExposedToHandlers confirms the verified body hash reaches
+// the handler, which is what binds an idempotency key to its request.
+func TestHMAC_BodyHashExposedToHandlers(t *testing.T) {
+	t.Parallel()
+	const secret = "topsecret"
+	body := `{"x":1}`
+
+	var seen string
+	r := gin.New()
+	v := NewHMACVerifier(map[string]string{"OP1": secret})
+	r.POST("/t", v.Middleware(), func(c *gin.Context) {
+		seen = BodyHashFromContext(c.Request.Context())
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(body))
+	req.Header.Set(HeaderOperatorCode, "OP1")
+	req.Header.Set(HeaderSignature, sign(secret, body))
+	req.Header.Set(HeaderTimestamp, testTimestamp)
+	req.Header.Set(HeaderNonce, testNonce)
+	r.ServeHTTP(httptest.NewRecorder(), req)
+
+	want := sha256.Sum256([]byte(body))
+	if seen != hex.EncodeToString(want[:]) {
+		t.Fatalf("body hash: got %q want %q", seen, hex.EncodeToString(want[:]))
 	}
 }

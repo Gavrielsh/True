@@ -25,7 +25,7 @@ func TestAcquire_EmitsSpan(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 
 	r := NewRedis(client)
-	status, _, err := r.Acquire(context.Background(), "PRAGMATIC:span-tx-1")
+	status, _, err := r.Acquire(context.Background(), "PRAGMATIC:span-tx-1", testFP)
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}

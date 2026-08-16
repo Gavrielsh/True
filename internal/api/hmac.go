@@ -8,12 +8,21 @@ import (
 	"encoding/hex"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/Gavrielsh/True/internal/metrics"
 	"github.com/Gavrielsh/True/pkg/errors"
 )
+
+// signHMAC computes HMAC-SHA256(secret, payload).
+func signHMAC(secret, payload []byte) []byte {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(payload)
+	return mac.Sum(nil)
+}
 
 // Headers consumed by the HMAC middleware. Names are case-insensitive at
 // the HTTP layer but we use the canonical capitalisation in tests.
@@ -48,9 +57,10 @@ var hmacBodyPool = sync.Pool{
 // X-Signature header of inbound webhooks.
 //
 // SECURITY contract (architecture §5):
-//  1. The signature MUST be computed over the RAW request body bytes,
-//     BEFORE any unmarshal. Unmarshalling and re-marshalling alters JSON
-//     whitespace and breaks the signature.
+//  1. The signature is computed over a CANONICAL STRING that binds the raw
+//     body to the replay headers — see canonicalPayload. The body portion is
+//     the RAW bytes, hashed BEFORE any unmarshal: unmarshalling and
+//     re-marshalling alters JSON whitespace and breaks the signature.
 //  2. The client X-Signature is hex-DECODED to raw bytes and compared to the
 //     computed HMAC-SHA256 with subtle.ConstantTimeCompare. Comparing decoded
 //     bytes (not hex strings) is both case-insensitive — "AB" and "ab" are the
@@ -58,18 +68,102 @@ var hmacBodyPool = sync.Pool{
 //  3. On verification failure the response is HTTP 401 with code
 //     "AUTHENTICATION_FAILED" — no further detail is leaked (don't
 //     tell an attacker which check failed).
+//
+// WHY THE CANONICAL STRING CHANGED (audit finding):
+//
+//	The signature previously covered ONLY the body. X-Timestamp and X-Nonce
+//	were then validated by ReplayGuard as unauthenticated headers — which
+//	meant they protected nothing. An attacker who captured one valid request
+//	could replay it forever: reuse the body and its still-valid signature,
+//	attach a fresh timestamp and a brand-new random nonce, and every check
+//	passed. The nonce could not detect the replay because the ATTACKER chose
+//	the nonce.
+//
+//	Binding all three into the signed material makes the freshness window and
+//	the single-use nonce real: an attacker cannot re-sign a new timestamp or
+//	nonce without the operator secret, and the captured pair is bound to the
+//	instant it was issued.
 type HMACVerifier struct {
 	secrets map[string][]byte
+	// acceptLegacy accepts a body-only signature IN ADDITION to the canonical
+	// one. Transitional only — see WithLegacySignatureFallback.
+	acceptLegacy bool
 }
 
 // NewHMACVerifier builds a verifier from a map of operator code to shared
 // secret. The secret strings are copied to []byte once and never logged.
-func NewHMACVerifier(secrets map[string]string) *HMACVerifier {
+func NewHMACVerifier(secrets map[string]string, opts ...HMACOption) *HMACVerifier {
 	out := make(map[string][]byte, len(secrets))
 	for k, v := range secrets {
 		out[k] = []byte(v)
 	}
-	return &HMACVerifier{secrets: out}
+	v := &HMACVerifier{secrets: out}
+	for _, o := range opts {
+		o(v)
+	}
+	return v
+}
+
+// HMACOption configures the verifier.
+type HMACOption func(*HMACVerifier)
+
+// WithLegacySignatureFallback also accepts the OLD body-only signature.
+//
+// TRANSITIONAL AND INSECURE. It exists solely so the engine and its
+// integrators can be rolled out independently without a flag-day outage:
+// enable it, deploy the engine, migrate every caller to the canonical
+// signature, then disable it and redeploy.
+//
+// While enabled the replay protection this fix restores is NOT in effect —
+// an attacker can still present a captured body-only signature with a fresh
+// timestamp and nonce. cmd/engine logs a WARN on every boot with it on.
+// Never leave it enabled in production.
+func WithLegacySignatureFallback(enabled bool) HMACOption {
+	return func(v *HMACVerifier) { v.acceptLegacy = enabled }
+}
+
+// canonicalPayload builds the exact byte string that is signed:
+//
+//	<X-Timestamp> "." <X-Nonce> "." <raw body>
+//
+// The two dot separators are unambiguous because neither a unix-seconds
+// timestamp nor a nonce may contain a dot — ReplayGuard enforces the
+// timestamp shape, and nonceIsWellFormed enforces the nonce's. Without that
+// guarantee the concatenation would be ambiguous and an attacker could shift
+// bytes between fields while keeping the same digest.
+func canonicalPayload(timestamp, nonce string, body []byte) []byte {
+	out := make([]byte, 0, len(timestamp)+len(nonce)+len(body)+2)
+	out = append(out, timestamp...)
+	out = append(out, '.')
+	out = append(out, nonce...)
+	out = append(out, '.')
+	out = append(out, body...)
+	return out
+}
+
+// nonceIsWellFormed keeps the canonical string unambiguous: the nonce must be
+// non-empty and free of the '.' separator. Rejecting here (rather than in
+// ReplayGuard) means a malformed nonce can never produce a signature that
+// validates against a DIFFERENT field split.
+func nonceIsWellFormed(nonce string) bool {
+	if nonce == "" || len(nonce) > 128 {
+		return false
+	}
+	return !strings.Contains(nonce, ".")
+}
+
+// timestampIsWellFormed mirrors nonceIsWellFormed for the timestamp field:
+// unix seconds, digits only. Freshness is still ReplayGuard's job.
+func timestampIsWellFormed(ts string) bool {
+	if ts == "" || len(ts) > 20 {
+		return false
+	}
+	for _, r := range ts {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // Middleware returns the gin.HandlerFunc enforcing the HMAC contract above.
@@ -94,6 +188,17 @@ func (v *HMACVerifier) Middleware() gin.HandlerFunc {
 
 		clientSig := c.GetHeader(HeaderSignature)
 		if clientSig == "" {
+			respondErrorCode(c, http.StatusUnauthorized, errors.Code("AUTHENTICATION_FAILED"), authFailMsg)
+			return
+		}
+
+		// The replay headers are part of the SIGNED material now, so they must
+		// be present and well-formed BEFORE the MAC is computed. ReplayGuard
+		// still owns freshness and single-use; this is purely about making the
+		// canonical string unambiguous.
+		timestamp := c.GetHeader(HeaderTimestamp)
+		nonce := c.GetHeader(HeaderNonce)
+		if !timestampIsWellFormed(timestamp) || !nonceIsWellFormed(nonce) {
 			respondErrorCode(c, http.StatusUnauthorized, errors.Code("AUTHENTICATION_FAILED"), authFailMsg)
 			return
 		}
@@ -123,10 +228,9 @@ func (v *HMACVerifier) Middleware() gin.HandlerFunc {
 		//    recycled until this request's chain completes (see pool docs).
 		c.Request.Body = io.NopCloser(bytes.NewReader(body))
 
-		// 3. Compute HMAC over the raw bytes. NEVER unmarshal-then-rehash.
-		mac := hmac.New(sha256.New, secret)
-		mac.Write(body)
-		expectedMAC := mac.Sum(nil)
+		// 3. Compute HMAC over the CANONICAL STRING (timestamp.nonce.body).
+		//    The body portion is the raw bytes — NEVER unmarshal-then-rehash.
+		expectedMAC := signHMAC(secret, canonicalPayload(timestamp, nonce, body))
 
 		// 4. Decode the client signature from hex to RAW BYTES, then compare
 		//    with subtle.ConstantTimeCompare. Decoding (rather than comparing
@@ -138,14 +242,35 @@ func (v *HMACVerifier) Middleware() gin.HandlerFunc {
 			respondErrorCode(c, http.StatusUnauthorized, errors.Code("AUTHENTICATION_FAILED"), authFailMsg)
 			return
 		}
-		if subtle.ConstantTimeCompare(clientMAC, expectedMAC) != 1 {
+
+		ok := subtle.ConstantTimeCompare(clientMAC, expectedMAC) == 1
+		if !ok && v.acceptLegacy {
+			// TRANSITIONAL: accept the old body-only signature. Both branches
+			// run a constant-time compare, so the fallback adds no timing
+			// oracle distinguishing "legacy accepted" from "rejected".
+			legacyMAC := signHMAC(secret, body)
+			if subtle.ConstantTimeCompare(clientMAC, legacyMAC) == 1 {
+				metrics.LegacySignatureAccepted.WithLabelValues(operator).Inc()
+				ok = true
+			}
+		}
+		if !ok {
 			respondErrorCode(c, http.StatusUnauthorized, errors.Code("AUTHENTICATION_FAILED"), authFailMsg)
 			return
 		}
 
-		// Trusted: stash the operator code for the handler.
+		// Trusted. Stash the operator code and the body hash — the latter binds
+		// the idempotency key to this exact request (see cache.Fingerprint), so
+		// a key replayed with a different body is refused instead of returning
+		// the first request's cached result.
+		bodyHash := sha256.Sum256(body)
+		bodyHashHex := hex.EncodeToString(bodyHash[:])
+
 		c.Set(ginKeyOperator, operator)
-		c.Request = c.Request.WithContext(withOperator(c.Request.Context(), operator))
+		c.Set(ginKeyBodyHash, bodyHashHex)
+		ctx := withOperator(c.Request.Context(), operator)
+		ctx = withBodyHash(ctx, bodyHashHex)
+		c.Request = c.Request.WithContext(ctx)
 		c.Next()
 	}
 }

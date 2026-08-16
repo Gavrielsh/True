@@ -101,6 +101,8 @@ type PurchaseRequest struct {
 	GCAmount              domain.Money    // > 0 (the purchased package)
 	SCPromoAmount         domain.Money    // >= 0 (promotional SC_UNPLAYED)
 	Metadata              json.RawMessage // <= 512 bytes (DB-enforced)
+	// BodyHash — see BetRequest.BodyHash.
+	BodyHash string
 }
 
 // RedeemRequest is a validated fiat redemption. Amount is drawn EXCLUSIVELY
@@ -111,6 +113,8 @@ type RedeemRequest struct {
 	PlayerID              uuid.UUID
 	Amount                domain.Money // > 0, SC_REDEEMABLE only
 	Metadata              json.RawMessage
+	// BodyHash — see BetRequest.BodyHash.
+	BodyHash string
 }
 
 // ----------------------------------------------------------------------------
@@ -223,9 +227,11 @@ func (e *engine) ProcessPurchase(ctx context.Context, req PurchaseRequest) (TxRe
 	}
 	idemKey := idempotencyKey(req.OperatorCode, req.OperatorTransactionID)
 
-	status, payload, err := e.idem.Acquire(ctx, idemKey)
+	fp := requestFingerprint(req.PlayerID, req.BodyHash)
+
+	status, payload, err := e.idem.Acquire(ctx, idemKey, fp)
 	if err != nil {
-		return TxResult{}, fmt.Errorf("idempotency acquire: %w", err)
+		return TxResult{}, mapIdempotencyErr(req.OperatorCode, err)
 	}
 	switch status {
 	case cache.StatusPending:
@@ -239,7 +245,7 @@ func (e *engine) ProcessPurchase(ctx context.Context, req PurchaseRequest) (TxRe
 		e.releaseQuietly(ctx, idemKey)
 		return TxResult{}, err
 	}
-	e.cacheResultQuietly(ctx, idemKey, result)
+	e.cacheResultQuietly(ctx, idemKey, fp, result)
 	return result, nil
 }
 
@@ -286,7 +292,7 @@ func (e *engine) processPurchaseTx(ctx context.Context, req PurchaseRequest) (re
 		if isUniqueViolation(err) {
 			_ = tx.Rollback(ctx)
 			return e.recoverGhostSpin(ctx, req.OperatorCode, req.OperatorTransactionID,
-				req.PlayerID, "DEPOSIT", domain.FamilyUnknown, req.GCAmount)
+				req.PlayerID, "DEPOSIT", domain.FamilyUnknown, req.GCAmount, req.BodyHash)
 		}
 		return TxResult{}, fmt.Errorf("insert ledger tx: %w", err)
 	}
@@ -331,9 +337,11 @@ func (e *engine) ProcessRedeem(ctx context.Context, req RedeemRequest) (TxResult
 	}
 	idemKey := idempotencyKey(req.OperatorCode, req.OperatorTransactionID)
 
-	status, payload, err := e.idem.Acquire(ctx, idemKey)
+	fp := requestFingerprint(req.PlayerID, req.BodyHash)
+
+	status, payload, err := e.idem.Acquire(ctx, idemKey, fp)
 	if err != nil {
-		return TxResult{}, fmt.Errorf("idempotency acquire: %w", err)
+		return TxResult{}, mapIdempotencyErr(req.OperatorCode, err)
 	}
 	switch status {
 	case cache.StatusPending:
@@ -347,7 +355,7 @@ func (e *engine) ProcessRedeem(ctx context.Context, req RedeemRequest) (TxResult
 		e.releaseQuietly(ctx, idemKey)
 		return TxResult{}, err
 	}
-	e.cacheResultQuietly(ctx, idemKey, result)
+	e.cacheResultQuietly(ctx, idemKey, fp, result)
 	return result, nil
 }
 
@@ -395,7 +403,7 @@ func (e *engine) processRedeemTx(ctx context.Context, req RedeemRequest) (result
 		if isUniqueViolation(err) {
 			_ = tx.Rollback(ctx)
 			return e.recoverGhostSpin(ctx, req.OperatorCode, req.OperatorTransactionID,
-				req.PlayerID, "WITHDRAWAL", domain.FamilySC, req.Amount)
+				req.PlayerID, "WITHDRAWAL", domain.FamilySC, req.Amount, req.BodyHash)
 		}
 		return TxResult{}, fmt.Errorf("insert ledger tx: %w", err)
 	}
