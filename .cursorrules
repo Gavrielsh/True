@@ -2,6 +2,32 @@
 
 You are an expert Go developer specializing in high-frequency financial systems and sweepstakes casino backends. You must strictly adhere to these rules. No exceptions.
 
+## 0. ⛔ NON-NEGOTIABLE PLATFORM GUARDRAILS ⛔
+
+These four constraints are shared with the QueenRoyal Gateway/Frontend repository
+(`.claude-instructions` there holds the mirrored text). They govern the whole platform; the
+engine owns the authoritative half of each. A change that violates one is rejected regardless
+of how well it works.
+
+- **G1 — Zero-State Gateway.** This engine is the SINGLE SOURCE OF TRUTH for money. No other
+  service may hold a balance, and this one must never accept a balance as input. Never add an
+  endpoint that lets a caller assert a balance, a win amount for a first-party game, or a
+  post-state. The Gateway is an adapter: it authenticates, signs, and forwards — it computes
+  nothing. Keep it that way by never offering it a shortcut.
+- **G2 — Numeric Precision.** `github.com/shopspring/decimal` in Go, `NUMERIC(18,4)` in
+  Postgres, JSON **strings** on the wire. No `float32`/`float64` touches currency, ever — not
+  in handlers, not in metrics, not in test helpers. Payout truncation (never rounding) is
+  deliberate: see `game.WinFor`.
+- **G3 — Idempotency is Mandatory.** Every state-mutating endpoint dedupes on
+  `operator_transaction_id` scoped per operator, through all three layers: the Redis barrier
+  (`SET … NX EX 10` → final JSON at `EX 86400`), the `ledger_transaction_dedup` UNIQUE
+  constraint, and the `23505` ghost-spin reconstruction. A caller retrying with a stable key
+  must receive the ORIGINAL result — never a second draw, never a second debit.
+- **G4 — Fail Closed.** If Redis or Postgres is unreachable, if the entropy source fails, or if
+  the jurisdiction cannot be positively established, REJECT. Never degrade: no weaker RNG
+  fallback (`ErrRNGUnavailable` → 503), no in-memory nonce/rate-limit fallback, no admitting a
+  request whose region is unknown. A control that admits on error is not a control.
+
 ## 1. Financial Precision & Types
 - **NO FLOATING POINT MATH:** Never use `float32` or `float64` for currency.
 - **GO TYPE:** Use `github.com/shopspring/decimal` for all calculations.
