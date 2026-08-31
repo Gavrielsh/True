@@ -13,7 +13,13 @@ As an AI assisting in writing code for this project, you must strictly adhere to
 ---
 
 ## 1. System Overview & Scale
-This system is a high-frequency, Zero-Trust transaction engine designed for a Social Sweepstakes Casino. It must handle **10,000 to 50,000 Transactions Per Second (TPS)** horizontally, with individual players generating up to 50 TPS during rapid slot spins. 
+This system is a high-frequency, Zero-Trust transaction engine designed for a Social Sweepstakes Casino. It must scale **horizontally**, and a single player can issue rapid consecutive spins, so the design assumes heavy concurrent write pressure on one wallet row.
+
+> **No throughput figure is published here.** This document previously claimed a specific
+> transactions-per-second range. Nothing in this repository measured it, so the number stated
+> a capability the system had never been shown to have. A concrete target belongs here only
+> once a reproducible benchmark harness produces it — see `loadtest/` for the k6 baseline this
+> would build on.
 
 ### Sweepstakes Core Logic
 To comply with strict US sweepstakes legal frameworks, tokens must be segregated natively at the database level:
@@ -39,7 +45,7 @@ To comply with strict US sweepstakes legal frameworks, tokens must be segregated
 The `wallets` table acts as a materialized view (cache) for read operations. The actual single source of truth is the `ledger_entries` table. The sum of all historical credits minus debits must always perfectly match the wallet balance.
 
 ### Schema Constraints & Partitioning
-At 10k+ TPS, the `ledger_entries` table will generate hundreds of millions of rows. **You MUST implement PostgreSQL Table Partitioning by date.**
+At sustained production write volume the `ledger_entries` table will reach hundreds of millions of rows. **You MUST implement PostgreSQL Table Partitioning by date.**
 
 **Required PostgreSQL Typings & Constraints:**
 * Types: `currency_type` ('GC', 'SC_UNPLAYED', 'SC_REDEEMABLE'), `transaction_type` ('BET', 'WIN', 'ROLLBACK'), `entry_direction` ('DEBIT', 'CREDIT').
