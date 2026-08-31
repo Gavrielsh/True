@@ -2,3 +2,18 @@
 .env
 .env.local
 node_modules/
+
+# ─── Compiled build artifacts — never commit build output ───
+# A 51 MB engine.exe was committed here once and had to be purged from git
+# history in a coordinated rewrite (Milestone 0.2). Build output belongs in
+# CI artifacts or a container registry, never in git.
+# Enforced structurally by .github/workflows/file-size-guard.yml.
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+
+# `go build ./cmd/engine` drops the binary at the repo root. Anchored with a
+# leading slash so it CANNOT match the cmd/engine/ SOURCE directory.
+/engine

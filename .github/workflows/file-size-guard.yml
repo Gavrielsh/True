@@ -1,0 +1,77 @@
+# Structural guard against the defect remediated in Milestone 0.2: a 51 MB
+# engine.exe committed to the repository, which had to be purged from history
+# in a coordinated force-push.
+#
+# .gitignore alone does not make that unrepeatable — it is advisory, it can be
+# bypassed with `git add -f`, and a contributor may carry their own ignore
+# rules. This workflow is the enforcement: the tree is scanned on every push
+# and pull request, so an oversized file or a compiled binary cannot reach the
+# default branch even if it slips past a developer's local configuration.
+#
+# The scan covers the WHOLE tracked tree rather than just the diff. Checking
+# the diff would let a file enter through a branch cut, a merge, or any path
+# that does not present as an addition; checking the tree means the invariant
+# either holds for the whole repository or the build is red.
+name: File Size Guard
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Block oversized files and compiled binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Only the tree is inspected, never history, so a shallow checkout
+          # is sufficient — and keeps the job fast.
+          fetch-depth: 1
+
+      - name: Scan tracked files
+        env:
+          # 5 MiB. Comfortably above any legitimate source file, GeoIP
+          # fixture, or test corpus in this repository, and far below the
+          # scale at which a binary starts inflating every clone.
+          MAX_BYTES: 5242880
+        run: |
+          set -euo pipefail
+
+          fail=0
+
+          # -z and read -d '' so paths containing spaces or newlines are
+          # handled exactly, rather than word-split into false negatives.
+          while IFS= read -r -d '' f; do
+            # Skip anything unreadable or already removed in this tree.
+            [ -f "$f" ] || continue
+
+            size=$(stat -c%s "$f")
+            if [ "$size" -gt "$MAX_BYTES" ]; then
+              printf '::error file=%s::%s is %s bytes, over the %s-byte limit. Build output and large assets do not belong in git — publish them as CI artifacts or to a registry.\n' \
+                "$f" "$f" "$size" "$MAX_BYTES"
+              fail=1
+            fi
+
+            case "${f,,}" in
+              *.exe|*.dll|*.so|*.dylib|*.test)
+                printf '::error file=%s::%s is a compiled binary. The engine is built from source by the Dockerfile; committed binaries are unreviewable, unauditable, and bloat every clone forever.\n' \
+                  "$f" "$f"
+                fail=1
+                ;;
+            esac
+          done < <(git ls-files -z)
+
+          if [ "$fail" -ne 0 ]; then
+            echo ""
+            echo "File size guard FAILED. See the annotated files above."
+            echo "If a large file is genuinely required, it needs an explicit"
+            echo "decision — raise it in review rather than forcing it through."
+            exit 1
+          fi
+
+          echo "File size guard passed: no tracked file exceeds ${MAX_BYTES} bytes or is a compiled binary."
