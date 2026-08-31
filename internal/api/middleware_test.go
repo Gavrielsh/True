@@ -45,8 +45,8 @@ func signAt(secret, timestamp, nonce, body string) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-// signLegacy produces the PRE-AUDIT body-only signature, used to prove it is
-// rejected by default and accepted only under the transitional fallback.
+// signLegacy produces the PRE-AUDIT body-only signature. It exists only so the
+// tests can prove that form is rejected — there is no code path that accepts it.
 func signLegacy(secret, body string) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(body))
@@ -467,23 +467,62 @@ func TestRecovery_TurnsPanicInto500(t *testing.T) {
 // signature, attach a fresh timestamp and a brand-new nonce, and every check
 // passed — the nonce could not help because the ATTACKER chose it.
 //
-// A body-only signature must now be rejected by default.
+// The body-only form is now rejected unconditionally. There is no verifier
+// option, router config field, or environment variable that admits it — the
+// fallback was deleted, not merely defaulted off.
 func TestHMAC_LegacyBodyOnlySignatureRejected(t *testing.T) {
 	t.Parallel()
 	const secret = "topsecret"
-	body := `{"x":1}`
+	const body = `{"x":1}`
 
-	r := hmacRouter(map[string]string{"OP1": secret})
-	req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(body))
-	req.Header.Set(HeaderOperatorCode, "OP1")
-	req.Header.Set(HeaderSignature, signLegacy(secret, body)) // pre-audit form
-	req.Header.Set(HeaderTimestamp, testTimestamp)
-	req.Header.Set(HeaderNonce, testNonce)
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
+	cases := []struct {
+		name      string
+		signature string
+		timestamp string
+		nonce     string
+	}{
+		{
+			// The captured request replayed verbatim.
+			name:      "body-only signature",
+			signature: signLegacy(secret, body),
+			timestamp: testTimestamp,
+			nonce:     testNonce,
+		},
+		{
+			// The signature is hex-DECODED before comparison, so casing must
+			// not become a laundering route around the rejection.
+			name:      "body-only signature in uppercase hex",
+			signature: strings.ToUpper(signLegacy(secret, body)),
+			timestamp: testTimestamp,
+			nonce:     testNonce,
+		},
+		{
+			// The actual attack: a captured body-only signature re-presented
+			// with attacker-chosen freshness headers.
+			name:      "body-only signature with attacker-chosen timestamp and nonce",
+			signature: signLegacy(secret, body),
+			timestamp: "1700009999",
+			nonce:     "attacker-nonce",
+		},
+	}
 
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("body-only signature must be rejected: got %d, body=%s", w.Code, w.Body.String())
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := hmacRouter(map[string]string{"OP1": secret})
+			req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(body))
+			req.Header.Set(HeaderOperatorCode, "OP1")
+			req.Header.Set(HeaderSignature, tc.signature)
+			req.Header.Set(HeaderTimestamp, tc.timestamp)
+			req.Header.Set(HeaderNonce, tc.nonce)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("body-only signature must be rejected: got %d, body=%s",
+					w.Code, w.Body.String())
+			}
+		})
 	}
 }
 
@@ -521,41 +560,6 @@ func TestHMAC_SignatureIsBoundToTimestampAndNonce(t *testing.T) {
 				t.Errorf("replayed signature with %s must be rejected: got %d", tc.name, w.Code)
 			}
 		})
-	}
-}
-
-// TestHMAC_LegacyFallbackAcceptsWhenEnabled documents the TRANSITIONAL escape
-// hatch used to roll the engine and its integrators independently.
-func TestHMAC_LegacyFallbackAcceptsWhenEnabled(t *testing.T) {
-	t.Parallel()
-	const secret = "topsecret"
-	body := `{"x":1}`
-
-	r := gin.New()
-	v := NewHMACVerifier(map[string]string{"OP1": secret}, WithLegacySignatureFallback(true))
-	r.POST("/t", v.Middleware(), func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true}) })
-
-	req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(body))
-	req.Header.Set(HeaderOperatorCode, "OP1")
-	req.Header.Set(HeaderSignature, signLegacy(secret, body))
-	req.Header.Set(HeaderTimestamp, testTimestamp)
-	req.Header.Set(HeaderNonce, testNonce)
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("legacy fallback should accept the old signature: got %d, body=%s", w.Code, w.Body.String())
-	}
-	// The canonical form must STILL work while the fallback is open.
-	req2 := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(body))
-	req2.Header.Set(HeaderOperatorCode, "OP1")
-	req2.Header.Set(HeaderSignature, sign(secret, body))
-	req2.Header.Set(HeaderTimestamp, testTimestamp)
-	req2.Header.Set(HeaderNonce, testNonce)
-	w2 := httptest.NewRecorder()
-	r.ServeHTTP(w2, req2)
-	if w2.Code != http.StatusOK {
-		t.Fatalf("canonical signature must still pass under the fallback: got %d", w2.Code)
 	}
 }
 

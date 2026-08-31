@@ -13,7 +13,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/Gavrielsh/True/internal/metrics"
 	"github.com/Gavrielsh/True/pkg/errors"
 )
 
@@ -69,57 +68,37 @@ var hmacBodyPool = sync.Pool{
 //     "AUTHENTICATION_FAILED" — no further detail is leaked (don't
 //     tell an attacker which check failed).
 //
-// WHY THE CANONICAL STRING CHANGED (audit finding):
+// WHY THE CANONICAL STRING IS THE ONLY ACCEPTED FORM (audit finding):
 //
-//	The signature previously covered ONLY the body. X-Timestamp and X-Nonce
-//	were then validated by ReplayGuard as unauthenticated headers — which
-//	meant they protected nothing. An attacker who captured one valid request
-//	could replay it forever: reuse the body and its still-valid signature,
-//	attach a fresh timestamp and a brand-new random nonce, and every check
-//	passed. The nonce could not detect the replay because the ATTACKER chose
-//	the nonce.
+//	The signature once covered ONLY the body. X-Timestamp and X-Nonce were
+//	then validated by ReplayGuard as unauthenticated headers — which meant
+//	they protected nothing. An attacker who captured one valid request could
+//	replay it forever: reuse the body and its still-valid signature, attach a
+//	fresh timestamp and a brand-new random nonce, and every check passed. The
+//	nonce could not detect the replay because the ATTACKER chose the nonce.
 //
 //	Binding all three into the signed material makes the freshness window and
 //	the single-use nonce real: an attacker cannot re-sign a new timestamp or
 //	nonce without the operator secret, and the captured pair is bound to the
 //	instant it was issued.
+//
+//	The body-only form is NOT accepted, and there is deliberately no option,
+//	flag, or environment variable to re-admit it. config.Load refuses to boot
+//	if the retired HMAC_ACCEPT_LEGACY_SIGNATURE switch is still set to a
+//	truthy value, so a stale manifest fails loudly at deploy time instead of
+//	quietly running without replay protection.
 type HMACVerifier struct {
 	secrets map[string][]byte
-	// acceptLegacy accepts a body-only signature IN ADDITION to the canonical
-	// one. Transitional only — see WithLegacySignatureFallback.
-	acceptLegacy bool
 }
 
 // NewHMACVerifier builds a verifier from a map of operator code to shared
 // secret. The secret strings are copied to []byte once and never logged.
-func NewHMACVerifier(secrets map[string]string, opts ...HMACOption) *HMACVerifier {
+func NewHMACVerifier(secrets map[string]string) *HMACVerifier {
 	out := make(map[string][]byte, len(secrets))
 	for k, v := range secrets {
 		out[k] = []byte(v)
 	}
-	v := &HMACVerifier{secrets: out}
-	for _, o := range opts {
-		o(v)
-	}
-	return v
-}
-
-// HMACOption configures the verifier.
-type HMACOption func(*HMACVerifier)
-
-// WithLegacySignatureFallback also accepts the OLD body-only signature.
-//
-// TRANSITIONAL AND INSECURE. It exists solely so the engine and its
-// integrators can be rolled out independently without a flag-day outage:
-// enable it, deploy the engine, migrate every caller to the canonical
-// signature, then disable it and redeploy.
-//
-// While enabled the replay protection this fix restores is NOT in effect —
-// an attacker can still present a captured body-only signature with a fresh
-// timestamp and nonce. cmd/engine logs a WARN on every boot with it on.
-// Never leave it enabled in production.
-func WithLegacySignatureFallback(enabled bool) HMACOption {
-	return func(v *HMACVerifier) { v.acceptLegacy = enabled }
+	return &HMACVerifier{secrets: out}
 }
 
 // canonicalPayload builds the exact byte string that is signed:
@@ -243,18 +222,7 @@ func (v *HMACVerifier) Middleware() gin.HandlerFunc {
 			return
 		}
 
-		ok := subtle.ConstantTimeCompare(clientMAC, expectedMAC) == 1
-		if !ok && v.acceptLegacy {
-			// TRANSITIONAL: accept the old body-only signature. Both branches
-			// run a constant-time compare, so the fallback adds no timing
-			// oracle distinguishing "legacy accepted" from "rejected".
-			legacyMAC := signHMAC(secret, body)
-			if subtle.ConstantTimeCompare(clientMAC, legacyMAC) == 1 {
-				metrics.LegacySignatureAccepted.WithLabelValues(operator).Inc()
-				ok = true
-			}
-		}
-		if !ok {
+		if subtle.ConstantTimeCompare(clientMAC, expectedMAC) != 1 {
 			respondErrorCode(c, http.StatusUnauthorized, errors.Code("AUTHENTICATION_FAILED"), authFailMsg)
 			return
 		}

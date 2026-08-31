@@ -71,9 +71,6 @@ services:
       # range in any environment that fronts the engine with a proxy —
       # otherwise real player IPs never reach the fence.
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
-      # TRANSITIONAL: accept the pre-audit body-only HMAC signature. Leave
-      # false; replay protection is not in effect while it is true.
-      HMAC_ACCEPT_LEGACY_SIGNATURE: ${HMAC_ACCEPT_LEGACY_SIGNATURE:-false}
       OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
       LOG_LEVEL: ${LOG_LEVEL:-info}
     ports:

@@ -105,13 +105,6 @@ func run() error {
 	}
 	logger.Info("third-party win ceiling active", slog.String("max_provider_win", maxWin.String()))
 
-	if cfg.AcceptLegacySignature {
-		logger.Warn("INSECURE: HMAC_ACCEPT_LEGACY_SIGNATURE is enabled — " +
-			"body-only signatures are accepted, so replay protection is NOT in effect. " +
-			"Migrate every integrator to the canonical timestamp.nonce.body signature, " +
-			"watch engine_legacy_signature_accepted_total reach zero, then disable this.")
-	}
-
 	eng := repository.New(pool, idem, logger, repository.WithMaxWinAmount(maxWin))
 	casinoEng := repository.NewCasino(pool, idem, logger)
 	// Server-authoritative game engine. Passing a nil RNG selects crypto/rand
@@ -139,16 +132,15 @@ func run() error {
 	limiter := api.NewRateLimiter(rdb, logger, api.WithOperatorRPS(cfg.RateLimitRPS))
 
 	router := api.NewRouter(api.Config{
-		Engine:                eng,
-		Casino:                casinoEng,
-		Game:                  gameEng,
-		DB:                    pool,
-		Redis:                 rdb,
-		Secrets:               cfg.OperatorSecrets,
-		AcceptLegacySignature: cfg.AcceptLegacySignature,
-		GeoFence:              geoFence,
-		RateLimiter:           limiter,
-		Logger:                logger,
+		Engine:      eng,
+		Casino:      casinoEng,
+		Game:        gameEng,
+		DB:          pool,
+		Redis:       rdb,
+		Secrets:     cfg.OperatorSecrets,
+		GeoFence:    geoFence,
+		RateLimiter: limiter,
+		Logger:      logger,
 	})
 
 	srv := &http.Server{

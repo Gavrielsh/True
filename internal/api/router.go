@@ -23,9 +23,6 @@ type Config struct {
 	DB      Pinger
 	Redis   redis.UniversalClient
 	Secrets map[string]string // operator_code → HMAC-SHA256 shared secret
-	// AcceptLegacySignature also accepts the pre-audit body-only signature.
-	// TRANSITIONAL — see WithLegacySignatureFallback.
-	AcceptLegacySignature bool
 	// GeoFence rejects blocked jurisdictions on /api/v1. Optional: nil (or a
 	// disabled fence) skips geo-checking entirely (dev mode).
 	GeoFence *GeoFence
@@ -76,8 +73,7 @@ func NewRouter(cfg Config) *gin.Engine {
 	handlers := NewHandlers(cfg.Engine).
 		WithRateLimiter(cfg.RateLimiter).
 		WithGameEngine(cfg.Game)
-	hmacMW := NewHMACVerifier(cfg.Secrets,
-		WithLegacySignatureFallback(cfg.AcceptLegacySignature)).Middleware()
+	hmacMW := NewHMACVerifier(cfg.Secrets).Middleware()
 	replayMW := NewReplayGuard(cfg.Redis).Middleware()
 
 	v1 := r.Group("/api/v1")

@@ -375,3 +375,65 @@ func TestLoad_TrustedProxiesDefaultsEmpty(t *testing.T) {
 		t.Errorf("TrustedProxies must default to empty, got %v", cfg.TrustedProxies)
 	}
 }
+
+// ----------------------------------------------------------------------------
+// Retired legacy-HMAC kill switch
+// ----------------------------------------------------------------------------
+
+// TestLoad_RetiredLegacyHMACSwitchIsFatal proves the boot fails when a
+// deployment still asks for the removed body-only signature path.
+//
+// Silently ignoring the variable would leave a gap between what the manifest
+// says and what the engine does: the operator believes legacy signatures are
+// accepted, their integrators keep signing the old way, and the only symptom
+// is a flood of 401s in production with no obvious cause. Failing here moves
+// that discovery to deploy time.
+//
+// Note the absence of a Config field to assert against — the flag was deleted
+// from the struct, so "the legacy path cannot be re-enabled" is enforced by
+// the compiler. This test covers the remaining runtime surface: the variable
+// itself.
+func TestLoad_RetiredLegacyHMACSwitchIsFatal(t *testing.T) {
+	// Values that read as a request to turn the legacy path ON. "1" and "yes"
+	// are included deliberately: the old parser treated them as false, so a
+	// deployment using them was ALREADY not getting the behaviour it asked
+	// for. That silent mismatch is exactly what must now fail loudly.
+	fatal := []string{"true", "TRUE", "True", " true ", "1", "yes", "on"}
+	for _, v := range fatal {
+		t.Run("fatal_"+v, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv(legacyHMACEnvVar, v)
+
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("%s=%q must fail the boot", legacyHMACEnvVar, v)
+			}
+			if !strings.Contains(err.Error(), legacyHMACEnvVar) {
+				t.Errorf("error must name the offending variable, got: %v", err)
+			}
+		})
+	}
+
+	// An explicitly falsy leftover expects the secure behaviour and gets it,
+	// so upgrading must not take that deployment down over a dead config line.
+	inert := []string{"", "false", "FALSE", "0", "no", "off", "  false  "}
+	for _, v := range inert {
+		t.Run("inert_"+v, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv(legacyHMACEnvVar, v)
+
+			if _, err := Load(); err != nil {
+				t.Fatalf("%s=%q expects the secure path and must boot: %v",
+					legacyHMACEnvVar, v, err)
+			}
+		})
+	}
+
+	// Unset is the steady state once the variable has been cleaned up.
+	t.Run("unset", func(t *testing.T) {
+		setRequiredEnv(t)
+		if _, err := Load(); err != nil {
+			t.Fatalf("unset %s must boot: %v", legacyHMACEnvVar, err)
+		}
+	})
+}

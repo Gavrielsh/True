@@ -58,17 +58,6 @@ type Config struct {
 	// optional, which is exactly how the original vulnerability shipped.
 	MaxProviderWin string
 
-	// AcceptLegacySignature also accepts the OLD body-only HMAC signature,
-	// in addition to the canonical timestamp.nonce.body form.
-	//
-	// TRANSITIONAL AND INSECURE — while enabled, replay protection is not in
-	// effect: an attacker with a captured body-only signature can still
-	// replay it with a fresh timestamp and nonce. It exists only so the
-	// engine and its integrators can be rolled out independently. Watch
-	// engine_legacy_signature_accepted_total fall to zero, then turn it off.
-	// Defaults to FALSE (secure).
-	AcceptLegacySignature bool
-
 	// GeoIPDBPath locates the MaxMind GeoLite2 database. REQUIRED unless
 	// GeofenceDisabled is set — an absent database no longer silently
 	// disables jurisdiction enforcement.
@@ -157,13 +146,11 @@ func Load() (Config, error) {
 		AdminAPIKey:       os.Getenv("ADMIN_API_KEY"),
 		RateLimitRPS:      l.intEnv([]string{"RATE_LIMIT_RPS"}, 5000, false),
 		MaxProviderWin:    l.required("MAX_PROVIDER_WIN"),
-		// Secure by default: only an explicit "true" opens the fallback.
-		AcceptLegacySignature: strings.EqualFold(strings.TrimSpace(os.Getenv("HMAC_ACCEPT_LEGACY_SIGNATURE")), "true"),
-		GeoIPDBPath:           l.str("GEOIP_DB_PATH", ""),
-		BlockedRegions:        splitCSV(l.str("BLOCKED_REGIONS", "")),
-		GeofenceDisabled:      strings.EqualFold(strings.TrimSpace(os.Getenv("GEOFENCE_MODE")), "disabled"),
-		TrustedProxies:        splitCSV(l.str("TRUSTED_PROXIES", "")),
-		DB:                    l.dbConfig(),
+		GeoIPDBPath:       l.str("GEOIP_DB_PATH", ""),
+		BlockedRegions:    splitCSV(l.str("BLOCKED_REGIONS", "")),
+		GeofenceDisabled:  strings.EqualFold(strings.TrimSpace(os.Getenv("GEOFENCE_MODE")), "disabled"),
+		TrustedProxies:    splitCSV(l.str("TRUSTED_PROXIES", "")),
+		DB:                l.dbConfig(),
 	}
 	rawSecrets := l.required("OPERATOR_SECRETS")
 
@@ -179,6 +166,15 @@ func Load() (Config, error) {
 		return Config{}, errors.New(
 			"GEOIP_DB_PATH is required for jurisdiction enforcement " +
 				"(set GEOFENCE_MODE=disabled to run without it — dev only)")
+	}
+
+	// The body-only HMAC fallback was removed outright. Refuse to boot if a
+	// deployment still asks for it, rather than starting secure-but-silent:
+	// an operator whose manifest says the legacy path is on, and whose
+	// integrators still sign the old way, must find out here — not from a
+	// production flood of 401s with no obvious cause.
+	if err := checkRetiredLegacyHMACSwitch(); err != nil {
+		return Config{}, err
 	}
 
 	secrets, err := parseOperatorSecrets(rawSecrets)
@@ -207,6 +203,37 @@ func (c Config) LogValue() slog.Value {
 		slog.Duration("read_timeout", c.ReadTimeout),
 		slog.Duration("write_timeout", c.WriteTimeout),
 	)
+}
+
+// legacyHMACEnvVar is the RETIRED kill switch that once admitted a
+// replayable body-only HMAC signature. The code path it guarded is gone.
+const legacyHMACEnvVar = "HMAC_ACCEPT_LEGACY_SIGNATURE"
+
+// checkRetiredLegacyHMACSwitch fails the boot when the retired switch is set
+// to anything that reads as a request to ENABLE the legacy path.
+//
+// An explicitly falsy value (or an unset variable) is accepted: that
+// deployment expects the secure behaviour and gets exactly it, so upgrading
+// must not take it down over a harmless leftover line. Anything else — a
+// "true", but equally a "1" or "yes" that the old parser silently treated as
+// false — means the manifest is asking for a path that no longer exists, and
+// that gap between expectation and reality is precisely what must not survive
+// a deploy.
+func checkRetiredLegacyHMACSwitch() error {
+	raw, ok := os.LookupEnv(legacyHMACEnvVar)
+	if !ok {
+		return nil
+	}
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "false", "0", "no", "off":
+		return nil
+	}
+	return fmt.Errorf(
+		"%s is set to %q, but the legacy body-only HMAC signature path has been "+
+			"removed: only the canonical timestamp.nonce.body signature is accepted. "+
+			"Migrate every integrator to the canonical signature, then delete this "+
+			"variable from your deployment configuration",
+		legacyHMACEnvVar, raw)
 }
 
 // parseOperatorSecrets accepts two formats:

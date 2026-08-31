@@ -76,18 +76,6 @@ var (
 		Help: "Third-party WIN credits rejected for exceeding the configured absolute ceiling.",
 	})
 
-	// LegacySignatureAccepted counts requests admitted via the TRANSITIONAL
-	// body-only signature fallback, by operator.
-	//
-	// OPERATIONAL USE: this is the migration burndown. While it is non-zero
-	// for an operator, that operator is still signing the old way and replay
-	// protection is not in effect for them. Drive it to zero, then disable
-	// HMAC_ACCEPT_LEGACY_SIGNATURE and redeploy.
-	LegacySignatureAccepted = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "engine_legacy_signature_accepted_total",
-		Help: "Requests accepted via the transitional body-only HMAC fallback, by operator.",
-	}, []string{"operator"})
-
 	// IdempotencyFingerprintMismatch counts idempotency keys presented with a
 	// DIFFERENT request than the one that created them.
 	//
