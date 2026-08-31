@@ -1,0 +1,73 @@
+# Zone 1 (True Engine) continuous integration — M1.1-T1 SKELETON.
+#
+# Scope is deliberately narrow: compile, vet, and run the unit tests, on a pinned toolchain.
+# This is the floor every later gate builds on, and it must be RELIABLY GREEN — a pipeline
+# that is red for reasons unrelated to the change under review teaches people to ignore it,
+# which is worse than having no pipeline.
+#
+# Arriving in later, separately-reviewed tasks:
+#   T2  staticcheck + golangci-lint      T5  govulncheck
+#   T3  -race test run                   T6  integration job (Postgres service container)
+#   T4  coverage floors                  T7  reconcile with the file-size guard
+#
+# Redis is deliberately NOT provisioned: every test uses miniredis in-process, so a Redis
+# service container would be unused infrastructure standing in for a guarantee nothing checks.
+name: Engine CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+# Least privilege: this workflow only ever reads the tree.
+permissions:
+  contents: read
+
+# A newer push to the same ref makes the older run irrelevant. Cancelling it frees runners
+# and stops a stale red/green result from landing after a newer one.
+concurrency:
+  group: engine-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build, vet, and unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Read the version from go.mod rather than repeating it here. A hardcoded version
+          # silently drifts from the module's own requirement, and then CI is validating a
+          # toolchain nobody actually builds with.
+          go-version-file: go.mod
+          # Cache the module and build caches, keyed on go.sum.
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Verify module checksums
+        # Confirms the downloaded dependencies match go.sum — a cheap integrity check that
+        # catches a tampered or corrupted module cache before anything is compiled.
+        run: go mod verify
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests
+        # -count=1 disables test-result caching. setup-go restores Go's build cache between
+        # runs, and that cache can hold PASSING TEST RESULTS: without this flag a run can
+        # report green from a previous commit's cached results rather than actually executing
+        # the tests. For a money engine, a falsely-green CI run is the worst possible outcome.
+        #
+        # The integration-tagged tests are excluded here by default (they carry
+        # `//go:build integration` and need a real Postgres); they get their own job in T6.
+        run: go test -count=1 ./...
