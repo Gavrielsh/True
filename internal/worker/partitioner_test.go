@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -82,32 +83,36 @@ func (f *fakePartitionDB) counts() (queries, execs int) {
 	return f.queryCalls, f.execCalls
 }
 
-// The generated DDL must follow migration 000005's naming (<parent>_YYYYMMDD)
-// and standard Postgres range syntax with a strictly exclusive upper bound.
-func TestPartitionDDL_NameAndBounds(t *testing.T) {
+// Partition naming must follow migration 000005's <parent>_YYYYMMDD convention:
+// the worker and the SQL function must agree, or Postgres would reject a
+// differently-named partition covering an already-covered range as overlapping
+// rather than skipping it.
+func TestPartitionName_Convention(t *testing.T) {
 	t.Parallel()
-	day := time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)
-
-	if got, want := partitionName("ledger_entries", day), "ledger_entries_20260115"; got != want {
+	if got, want := partitionName("ledger_entries", time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)),
+		"ledger_entries_20260115"; got != want {
 		t.Errorf("name: got %q want %q", got, want)
 	}
-	got := partitionDDL("ledger_entries", day)
-	want := `CREATE TABLE IF NOT EXISTS "ledger_entries_20260115" PARTITION OF "ledger_entries" ` +
-		`FOR VALUES FROM ('2026-01-15') TO ('2026-01-16')`
-	if got != want {
-		t.Errorf("ddl:\n got %q\nwant %q", got, want)
+	// Month/year rollover.
+	if got, want := partitionName("ledger_transactions", time.Date(2026, 12, 31, 0, 0, 0, 0, time.UTC)),
+		"ledger_transactions_20261231"; got != want {
+		t.Errorf("name: got %q want %q", got, want)
 	}
 }
 
-// Month/year boundaries: the exclusive upper bound must roll over correctly.
-func TestPartitionDDL_MonthAndYearRollover(t *testing.T) {
+// The worker must NEVER issue raw CREATE TABLE (Milestone 0.3). Raw DDL needs
+// CREATE on the schema, and a role that creates a partition owns it — owners
+// hold implicit UPDATE/DELETE on their own tables, which would reopen mutation
+// of ledger rows through any partition the application created. Creation must
+// therefore go through migration 000005's SECURITY DEFINER function, which
+// leaves every partition owned by the schema owner.
+func TestPartitioner_UsesDefinerFunctionNotRawDDL(t *testing.T) {
 	t.Parallel()
-	day := time.Date(2026, 12, 31, 0, 0, 0, 0, time.UTC)
-	got := partitionDDL("ledger_transactions", day)
-	want := `CREATE TABLE IF NOT EXISTS "ledger_transactions_20261231" PARTITION OF "ledger_transactions" ` +
-		`FOR VALUES FROM ('2026-12-31') TO ('2027-01-01')`
-	if got != want {
-		t.Errorf("ddl:\n got %q\nwant %q", got, want)
+	if strings.Contains(sqlCreateDailyPartition, "CREATE TABLE") {
+		t.Errorf("partition creation must not issue raw DDL, got: %s", sqlCreateDailyPartition)
+	}
+	if !strings.Contains(sqlCreateDailyPartition, "create_daily_partition") {
+		t.Errorf("expected a call to create_daily_partition, got: %s", sqlCreateDailyPartition)
 	}
 }
 
@@ -128,23 +133,24 @@ func TestEnsureFrom_CreatesMissingAndSkipsExisting(t *testing.T) {
 
 	base := time.Date(2026, 6, 10, 13, 45, 0, 0, time.UTC) // mid-day: must truncate to midnight
 	existsRe := `SELECT to_regclass\(\$1\) IS NOT NULL`
+	createRe := `SELECT create_daily_partition\(\$1, \$2::date\)`
 
 	// Day 0: ledger_entries already exists (skipped), ledger_transactions created.
 	mock.ExpectQuery(existsRe).WithArgs("ledger_entries_20260610").
 		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
 	mock.ExpectQuery(existsRe).WithArgs("ledger_transactions_20260610").
 		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(false))
-	mock.ExpectExec(`CREATE TABLE IF NOT EXISTS "ledger_transactions_20260610" PARTITION OF "ledger_transactions" FOR VALUES FROM \('2026-06-10'\) TO \('2026-06-11'\)`).
-		WillReturnResult(pgxmock.NewResult("CREATE TABLE", 0))
+	mock.ExpectExec(createRe).WithArgs("ledger_transactions", "2026-06-10").
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	// Day 1 (lookahead): both created.
 	mock.ExpectQuery(existsRe).WithArgs("ledger_entries_20260611").
 		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(false))
-	mock.ExpectExec(`CREATE TABLE IF NOT EXISTS "ledger_entries_20260611" PARTITION OF "ledger_entries" FOR VALUES FROM \('2026-06-11'\) TO \('2026-06-12'\)`).
-		WillReturnResult(pgxmock.NewResult("CREATE TABLE", 0))
+	mock.ExpectExec(createRe).WithArgs("ledger_entries", "2026-06-11").
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectQuery(existsRe).WithArgs("ledger_transactions_20260611").
 		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(false))
-	mock.ExpectExec(`CREATE TABLE IF NOT EXISTS "ledger_transactions_20260611" PARTITION OF "ledger_transactions" FOR VALUES FROM \('2026-06-11'\) TO \('2026-06-12'\)`).
-		WillReturnResult(pgxmock.NewResult("CREATE TABLE", 0))
+	mock.ExpectExec(createRe).WithArgs("ledger_transactions", "2026-06-11").
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 
 	p := NewPartitioner(mock, discardLogger(), WithLookaheadDays(1))
 	created, skipped, err := p.ensureFrom(context.Background(), base)

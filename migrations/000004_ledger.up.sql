@@ -95,25 +95,35 @@ CREATE TABLE ledger_entries (
 ) PARTITION BY RANGE (created_at);
 
 -- =============================================================================
--- Append-only enforcement is delegated to ROLE PERMISSIONS, NOT triggers.
+-- Append-only enforcement: SEE 000005 AND 000008, NOT THIS MIGRATION.
 -- =============================================================================
--- Firing a PL/pgSQL BEFORE UPDATE/DELETE trigger on every ledger insert path
--- would cost CPU we cannot spare at 10k+ TPS. The contract is instead enforced
--- by what the application role is *granted*:
+-- This migration once carried the grant set as a COMMENT and deferred it to
+-- "operational" provisioning, on the grounds that the role name was
+-- environment-specific. That provisioning never happened, and the table comment
+-- below asserted a control that did not exist: ledger_entries accepted UPDATE,
+-- DELETE and TRUNCATE from the application role, so a settled money line could
+-- be silently rewritten. 000008 then compounded it by citing this migration's
+-- non-existent grants as the reason it only needed to protect
+-- ledger_transactions.
 --
---   GRANT INSERT, SELECT ON ledger_entries TO engine_writer;
---   REVOKE UPDATE, DELETE, TRUNCATE ON ledger_entries FROM engine_writer;
---   GRANT INSERT, SELECT ON ALL TABLES IN SCHEMA public TO engine_writer;
---   -- (and a separate engine_admin role for partition maintenance / DDL)
+-- Nothing is granted HERE, and that is deliberate rather than deferred: 000005
+-- DROPs both ledger tables CASCADE and recreates them, which would discard any
+-- privilege granted at this point. The enforcement now lives where it survives:
 --
--- These statements are operational (run when provisioning the DB user), not
--- part of this migration, because the role name is environment-specific.
--- The application connects exclusively as `engine_writer`; any attempted
--- UPDATE/DELETE returns SQLSTATE 42501 (insufficient_privilege) at zero
--- per-row overhead. See README §"DB Roles" (TODO ops doc).
+--   * 000005 — the engine_writer role and the authoritative grant set
+--              (INSERT + SELECT only on both ledger tables; no UPDATE, no
+--              DELETE, no TRUNCATE anywhere).
+--   * 000008 — BEFORE UPDATE OR DELETE triggers on both ledger tables, which
+--              hold even against a connection that is the table owner (where
+--              grants are inert).
+--
+-- The earlier claim that a trigger was too expensive was mistaken: a
+-- BEFORE UPDATE OR DELETE trigger never fires on INSERT, so the write path
+-- pays nothing for it.
 COMMENT ON TABLE ledger_entries IS
-    'Append-only double-entry ledger. UPDATE/DELETE blocked at the role-grant '
-    'layer (engine_writer holds INSERT+SELECT only). Corrections are posted as '
+    'Append-only double-entry ledger. UPDATE/DELETE/TRUNCATE are blocked by BOTH '
+    'the engine_writer grant set (000005: INSERT+SELECT only) and a '
+    'BEFORE UPDATE OR DELETE trigger (000008). Corrections are posted as '
     'offsetting ROLLBACK entries, never as in-place mutations.';
 
 -- Indexes are declared on the partitioned root; Postgres propagates them to

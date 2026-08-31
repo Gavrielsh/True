@@ -6,19 +6,41 @@
 -- them.
 --
 -- ─────────────────────────────────────────────────────────────────────────────
--- 1. STRICT APPEND-ONLY ledger_transactions.
+-- 1. STRICT APPEND-ONLY on BOTH ledger tables.
 -- ─────────────────────────────────────────────────────────────────────────────
 -- The engine no longer mutates ledger_transactions: the old rollback path did
 -- `UPDATE ledger_transactions SET status = 'ROLLED_BACK'`, which rewrote
 -- financial history. A reversal is now posted as a NEW ROLLBACK row that
 -- references the original (strict double-entry audit trail; see
--- internal/repository processRollbackTx). ledger_entries is already append-only
--- via role grants (000004); this extends the same guarantee to
--- ledger_transactions with a lightweight trigger.
+-- internal/repository processRollbackTx).
 --
--- The trigger fires ONLY on UPDATE/DELETE — never on INSERT — so the 50k-TPS
--- write path pays nothing. On a partitioned table (PG 15) a row-level trigger
+-- CORRECTION (Milestone 0.3). This section previously protected only
+-- ledger_transactions, on the stated grounds that "ledger_entries is already
+-- append-only via role grants (000004)". That was false: 000004 carried those
+-- grants only in a comment and explicitly deferred them, so nothing was ever
+-- granted. The effect was the exact inverse of the documented design — the
+-- transaction HEADER was protected while the money LINES accepted UPDATE,
+-- DELETE and TRUNCATE. A settled ledger_entries row could be silently rewritten.
+-- The trigger is therefore applied to BOTH tables here, and the real grant set
+-- now lives in 000005.
+--
+-- Triggers and grants are complementary, not redundant:
+--   * GRANTS (000005) stop the application role, but are INERT against a
+--     connection that owns the tables — an owner holds implicit full rights.
+--   * TRIGGERS (here) fire regardless of role, including for the owner and for
+--     a superuser, so a misconfigured POSTGRES_URL cannot silently reopen the
+--     hole. cmd/engine additionally refuses to boot as an owner/superuser.
+--
+-- Cost is nil on the write path: the row trigger fires ONLY on UPDATE/DELETE,
+-- never on INSERT. (000004's original claim that a trigger was too expensive at
+-- 10k+ TPS was simply mistaken.) On a partitioned table a row-level trigger
 -- cascades to every existing and future partition automatically.
+--
+-- A statement-level BEFORE TRUNCATE trigger is added alongside, because row
+-- triggers do not see TRUNCATE. Verified behaviour: it blocks TRUNCATE of the
+-- PARENT even for the owner. It does NOT block a TRUNCATE aimed directly at an
+-- individual partition — that case is covered by the grant set, since
+-- engine_writer holds no privilege at all on any partition.
 --
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 2. BATCHED dedup pruning PROCEDURE (pg_cron alternative to the Go worker).
@@ -34,28 +56,55 @@ BEGIN;
 
 -- 1. Append-only guard --------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION ledger_transactions_block_mutation()
+-- One guard for both tables. TG_TABLE_NAME names the offending table in the
+-- error, so a single function serves every ledger relation without duplicating
+-- the logic per table.
+CREATE OR REPLACE FUNCTION ledger_block_mutation()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
     RAISE EXCEPTION
-        'ledger_transactions is append-only: % is not permitted '
-        '(post a compensating ROLLBACK transaction instead)', TG_OP
+        '% is append-only: % is not permitted '
+        '(post a compensating ROLLBACK transaction instead)', TG_TABLE_NAME, TG_OP
         USING ERRCODE = '0A000';  -- feature_not_supported
 END;
 $$;
 
+COMMENT ON FUNCTION ledger_block_mutation() IS
+    'Enforces the append-only invariant on the ledger tables: any UPDATE, DELETE '
+    'or TRUNCATE raises SQLSTATE 0A000, for EVERY role including the table owner '
+    'and superusers. Reversals are posted as new ROLLBACK rows referencing the '
+    'original (internal/repository processRollbackTx). Never fires on INSERT.';
+
+-- Retire the ledger_transactions-only guard this migration used to install.
 DROP TRIGGER IF EXISTS trg_ledger_transactions_append_only ON ledger_transactions;
+DROP FUNCTION IF EXISTS ledger_transactions_block_mutation();
+
+-- ledger_transactions (the header)
 CREATE TRIGGER trg_ledger_transactions_append_only
     BEFORE UPDATE OR DELETE ON ledger_transactions
     FOR EACH ROW
-    EXECUTE FUNCTION ledger_transactions_block_mutation();
+    EXECUTE FUNCTION ledger_block_mutation();
 
-COMMENT ON FUNCTION ledger_transactions_block_mutation() IS
-    'Enforces the append-only invariant on ledger_transactions: any UPDATE/DELETE '
-    'raises SQLSTATE 0A000. Reversals are posted as new ROLLBACK rows referencing '
-    'the original (internal/repository processRollbackTx). Never fires on INSERT.';
+DROP TRIGGER IF EXISTS trg_ledger_transactions_no_truncate ON ledger_transactions;
+CREATE TRIGGER trg_ledger_transactions_no_truncate
+    BEFORE TRUNCATE ON ledger_transactions
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION ledger_block_mutation();
+
+-- ledger_entries (the money lines) — the gap this migration previously left open.
+DROP TRIGGER IF EXISTS trg_ledger_entries_append_only ON ledger_entries;
+CREATE TRIGGER trg_ledger_entries_append_only
+    BEFORE UPDATE OR DELETE ON ledger_entries
+    FOR EACH ROW
+    EXECUTE FUNCTION ledger_block_mutation();
+
+DROP TRIGGER IF EXISTS trg_ledger_entries_no_truncate ON ledger_entries;
+CREATE TRIGGER trg_ledger_entries_no_truncate
+    BEFORE TRUNCATE ON ledger_entries
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION ledger_block_mutation();
 
 -- 2. Batched, low-lock dedup pruning -----------------------------------------
 

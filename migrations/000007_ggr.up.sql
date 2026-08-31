@@ -58,4 +58,22 @@ INSERT INTO ggr_aggregator_state (id, last_processed_at)
 VALUES (TRUE, '-infinity')
 ON CONFLICT (id) DO NOTHING;
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Grants for the GGR tables (Milestone 0.3).
+-- ─────────────────────────────────────────────────────────────────────────────
+-- The engine_writer role and the ledger grant set are defined in 000005; these
+-- two tables are created here, after that migration runs, so their grants must
+-- be issued here. Both privileges are load-bearing:
+--
+--   * daily_ggr is written by an UPSERT (ON CONFLICT DO UPDATE) in
+--     internal/worker/aggregator.go, so UPDATE is required alongside INSERT.
+--   * ggr_aggregator_state holds a single watermark row advanced after every
+--     aggregation cycle.
+--
+-- These are DERIVED reporting tables, not financial history: the ledger remains
+-- the sole source of truth, and daily_ggr can be rebuilt from it. They are
+-- therefore not append-only. TRUNCATE is still granted on neither.
+GRANT SELECT, INSERT, UPDATE ON daily_ggr            TO engine_writer;
+GRANT SELECT, UPDATE         ON ggr_aggregator_state TO engine_writer;
+
 COMMIT;

@@ -76,8 +76,26 @@ func run() error {
 
 	// --- Schema migrations ----------------------------------------------------
 	// FAIL FAST: never serve traffic against a stale or dirty schema.
-	if err := RunMigrations(bootCtx, logger, cfg.PostgresURL); err != nil {
+	//
+	// Migrations run on the PRIVILEGED URL, not the runtime pool: applying them
+	// needs CREATE ROLE / GRANT / CREATE TABLE, which the runtime role must not
+	// hold (see assertLedgerAppendOnly below). MigrationPostgresURL falls back
+	// to PostgresURL, so a single-role dev database is unaffected.
+	if err := RunMigrations(bootCtx, logger, cfg.MigrationPostgresURL); err != nil {
 		return fmt.Errorf("migrations: %w", err)
+	}
+
+	// --- Ledger append-only invariant ----------------------------------------
+	// Verify what the RUNTIME connection can actually do, after the migrations
+	// that establish the grants have run. Fails the boot if this connection can
+	// rewrite or erase settled money lines.
+	if cfg.LedgerRoleCheckDisabled {
+		logger.Warn("INSECURE: LEDGER_ROLE_CHECK=disabled — the engine is not " +
+			"verifying that its database role is unable to mutate the ledger. " +
+			"The privilege half of the append-only guarantee is NOT in force; only " +
+			"the 000008 triggers remain. Never set this outside local development.")
+	} else if err := assertLedgerAppendOnly(bootCtx, pool, logger); err != nil {
+		return err
 	}
 
 	// --- Redis --------------------------------------------------------------

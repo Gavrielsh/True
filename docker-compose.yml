@@ -41,6 +41,17 @@ services:
     environment:
       PORT: "8080"
       POSTGRES_URL: postgres://${POSTGRES_USER:-casino}:${POSTGRES_PASSWORD:-casino-dev-password}@postgres:5432/${POSTGRES_DB:-true_engine}?sslmode=disable
+      # DEV ONLY. The dev stack connects as the database OWNER, for which the
+      # engine_writer grants are inert (an owner holds implicit full rights), so
+      # the boot check in cmd/engine would refuse to start. The append-only
+      # invariant is still enforced here by the 000008 triggers, which fire for
+      # every role including the owner.
+      #
+      # PRODUCTION MUST NOT SET THIS. Instead provision a login user that is a
+      # member of engine_writer and point POSTGRES_URL at it, keeping the
+      # privileged credential in MIGRATION_POSTGRES_URL for schema changes only:
+      #   MIGRATION_POSTGRES_URL: postgres://<owner>:<secret>@postgres:5432/<db>
+      LEDGER_ROLE_CHECK: ${LEDGER_ROLE_CHECK:-disabled}
       REDIS_URL: redis://redis:6379/0
       # operator_code:hmac_secret pairs — dev values only.
       OPERATOR_SECRETS: ${OPERATOR_SECRETS:-PRAGMATIC:dev-secret-pragmatic,HACKSAW:dev-secret-hacksaw}

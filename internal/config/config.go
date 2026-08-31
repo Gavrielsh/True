@@ -58,6 +58,26 @@ type Config struct {
 	// optional, which is exactly how the original vulnerability shipped.
 	MaxProviderWin string
 
+	// MigrationPostgresURL is the PRIVILEGED connection used ONLY to apply
+	// schema migrations at boot. Schema changes need rights the runtime role
+	// deliberately lacks (CREATE ROLE, GRANT, CREATE TABLE), while the runtime
+	// connection must hold INSERT+SELECT only on the ledger so the append-only
+	// invariant is real (migration 000005). One credential cannot satisfy both.
+	//
+	// Defaults to PostgresURL when unset, which keeps a single-role dev or CI
+	// database working unchanged. In production the two MUST differ, and the
+	// boot check in assertLedgerAppendOnly enforces the runtime half.
+	MigrationPostgresURL string
+
+	// LedgerRoleCheckDisabled skips the boot assertion that the runtime
+	// connection cannot mutate the ledger.
+	//
+	// FOR LOCAL DEVELOPMENT ONLY, where the engine typically connects as the
+	// database owner. Enabling it means the privilege half of the append-only
+	// guarantee is not in force; only the 000008 triggers remain. cmd/engine
+	// logs a WARN on every boot with it set.
+	LedgerRoleCheckDisabled bool
+
 	// GeoIPDBPath locates the MaxMind GeoLite2 database. REQUIRED unless
 	// GeofenceDisabled is set — an absent database no longer silently
 	// disables jurisdiction enforcement.
@@ -146,11 +166,15 @@ func Load() (Config, error) {
 		AdminAPIKey:       os.Getenv("ADMIN_API_KEY"),
 		RateLimitRPS:      l.intEnv([]string{"RATE_LIMIT_RPS"}, 5000, false),
 		MaxProviderWin:    l.required("MAX_PROVIDER_WIN"),
-		GeoIPDBPath:       l.str("GEOIP_DB_PATH", ""),
-		BlockedRegions:    splitCSV(l.str("BLOCKED_REGIONS", "")),
-		GeofenceDisabled:  strings.EqualFold(strings.TrimSpace(os.Getenv("GEOFENCE_MODE")), "disabled"),
-		TrustedProxies:    splitCSV(l.str("TRUSTED_PROXIES", "")),
-		DB:                l.dbConfig(),
+		// Falls back to the runtime URL so a single-role dev/CI database still
+		// migrates; production supplies a privileged credential here.
+		MigrationPostgresURL:    l.str("MIGRATION_POSTGRES_URL", ""),
+		LedgerRoleCheckDisabled: strings.EqualFold(strings.TrimSpace(os.Getenv("LEDGER_ROLE_CHECK")), "disabled"),
+		GeoIPDBPath:             l.str("GEOIP_DB_PATH", ""),
+		BlockedRegions:          splitCSV(l.str("BLOCKED_REGIONS", "")),
+		GeofenceDisabled:        strings.EqualFold(strings.TrimSpace(os.Getenv("GEOFENCE_MODE")), "disabled"),
+		TrustedProxies:          splitCSV(l.str("TRUSTED_PROXIES", "")),
+		DB:                      l.dbConfig(),
 	}
 	rawSecrets := l.required("OPERATOR_SECRETS")
 
@@ -175,6 +199,10 @@ func Load() (Config, error) {
 	// production flood of 401s with no obvious cause.
 	if err := checkRetiredLegacyHMACSwitch(); err != nil {
 		return Config{}, err
+	}
+
+	if strings.TrimSpace(cfg.MigrationPostgresURL) == "" {
+		cfg.MigrationPostgresURL = cfg.PostgresURL
 	}
 
 	secrets, err := parseOperatorSecrets(rawSecrets)

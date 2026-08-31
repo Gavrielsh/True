@@ -180,7 +180,7 @@ func (p *Partitioner) ensureFrom(ctx context.Context, base time.Time) (created, 
 				continue
 			}
 
-			if _, err := p.db.Exec(ctx, partitionDDL(parent, day)); err != nil {
+			if _, err := p.db.Exec(ctx, sqlCreateDailyPartition, parent, day.Format(dateLayout)); err != nil {
 				p.logger.ErrorContext(ctx, "partition creation failed",
 					slog.String("partition", name),
 					slog.String("error", err.Error()),
@@ -206,20 +206,22 @@ func partitionName(parent string, day time.Time) string {
 	return parent + "_" + day.Format("20060102")
 }
 
-// partitionDDL renders the idempotent one-day partition DDL. The upper bound is
-// the next day, strictly exclusive per Postgres range-partition semantics.
-// Identifiers are quoted via pgx.Identifier (DDL cannot take bind parameters);
-// both name parts and the date literals come from compile-time constants and
-// time formatting, never from external input.
-func partitionDDL(parent string, day time.Time) string {
-	return fmt.Sprintf(
-		"CREATE TABLE IF NOT EXISTS %s PARTITION OF %s FOR VALUES FROM ('%s') TO ('%s')",
-		pgx.Identifier{partitionName(parent, day)}.Sanitize(),
-		pgx.Identifier{parent}.Sanitize(),
-		day.Format(dateLayout),
-		day.AddDate(0, 0, 1).Format(dateLayout),
-	)
-}
+// sqlCreateDailyPartition delegates partition creation to migration 000005's
+// SECURITY DEFINER function instead of issuing CREATE TABLE directly.
+//
+// WHY NOT RAW DDL (Milestone 0.3): the ledger is append-only, enforced by
+// granting engine_writer INSERT+SELECT and nothing else. Raw DDL here would
+// require CREATE on the schema, and that grant is self-defeating — a role that
+// creates a partition OWNS it, and an owner holds implicit UPDATE/DELETE on its
+// own tables. The application could then mutate ledger rows through any
+// partition it had created, silently reopening the hole the grants close.
+//
+// Running through the definer function keeps every partition owned by the schema
+// owner, so the append-only invariant holds even for partitions the application
+// itself caused to exist. The function is idempotent (CREATE TABLE IF NOT
+// EXISTS), uses the same <parent>_YYYYMMDD naming, and refuses any parent
+// outside the ledger allowlist.
+const sqlCreateDailyPartition = `SELECT create_daily_partition($1, $2::date)`
 
 // midnightUTC truncates t to the start of its UTC calendar day.
 func midnightUTC(t time.Time) time.Time {

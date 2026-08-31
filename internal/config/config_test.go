@@ -437,3 +437,91 @@ func TestLoad_RetiredLegacyHMACSwitchIsFatal(t *testing.T) {
 		}
 	})
 }
+
+// ----------------------------------------------------------------------------
+// Ledger role separation (Milestone 0.3)
+// ----------------------------------------------------------------------------
+
+// The migration credential defaults to the runtime one so a single-role dev or
+// CI database keeps working, and is used verbatim when supplied. Applying the
+// schema needs CREATE ROLE / GRANT rights that the runtime role deliberately
+// lacks, so production must be able to separate the two.
+func TestLoad_MigrationPostgresURL(t *testing.T) {
+	t.Run("defaults_to_runtime_url", func(t *testing.T) {
+		setRequiredEnv(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.MigrationPostgresURL != cfg.PostgresURL {
+			t.Errorf("unset MIGRATION_POSTGRES_URL must fall back to POSTGRES_URL: got %q want %q",
+				cfg.MigrationPostgresURL, cfg.PostgresURL)
+		}
+	})
+
+	t.Run("separate_credential_is_honoured", func(t *testing.T) {
+		setRequiredEnv(t)
+		const admin = "postgres://owner:s3cret@localhost:5432/db"
+		t.Setenv("MIGRATION_POSTGRES_URL", admin)
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.MigrationPostgresURL != admin {
+			t.Errorf("MigrationPostgresURL: got %q want %q", cfg.MigrationPostgresURL, admin)
+		}
+		if cfg.PostgresURL == admin {
+			t.Error("the runtime URL must stay distinct from the migration URL")
+		}
+	})
+}
+
+// The ledger role check is ON unless explicitly switched off, mirroring the
+// GEOFENCE_MODE opt-out. A typo must not silently disable a money invariant.
+func TestLoad_LedgerRoleCheckOptOut(t *testing.T) {
+	t.Run("on_by_default", func(t *testing.T) {
+		setRequiredEnv(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.LedgerRoleCheckDisabled {
+			t.Error("the ledger role check must be enabled unless explicitly disabled")
+		}
+	})
+
+	t.Run("explicit_opt_out", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("LEDGER_ROLE_CHECK", "disabled")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.LedgerRoleCheckDisabled {
+			t.Error("LEDGER_ROLE_CHECK=disabled must switch the check off")
+		}
+	})
+
+	// Anything that is not the exact opt-out leaves enforcement ON.
+	for _, v := range []string{"", "off", "false", "no", "disable", "DISABLED "} {
+		t.Run("still_enforced_"+v, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("LEDGER_ROLE_CHECK", v)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if v == "DISABLED " {
+				// Trimmed and case-folded: this IS the opt-out.
+				if !cfg.LedgerRoleCheckDisabled {
+					t.Error("whitespace/case variants of \"disabled\" must opt out")
+				}
+				return
+			}
+			if cfg.LedgerRoleCheckDisabled {
+				t.Errorf("LEDGER_ROLE_CHECK=%q must NOT disable the check", v)
+			}
+		})
+	}
+}

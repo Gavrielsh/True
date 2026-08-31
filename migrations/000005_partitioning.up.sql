@@ -225,10 +225,34 @@ $$;
 CREATE OR REPLACE FUNCTION create_daily_partition(p_parent text, p_day date)
 RETURNS void
 LANGUAGE plpgsql
+-- SECURITY DEFINER so the application role can pre-create partitions WITHOUT
+-- holding CREATE on the schema. Granting it CREATE would be self-defeating: the
+-- role would then OWN every partition it creates, and an owner has full rights
+-- on its own tables — which would hand back the UPDATE/DELETE on ledger rows
+-- that the grants below exist to remove. Running as the definer keeps every
+-- partition owned by the schema owner, so the append-only invariant holds on
+-- partitions the application itself caused to exist.
+--
+-- search_path is pinned: a SECURITY DEFINER function without a fixed
+-- search_path can be hijacked by a caller-controlled schema shadowing the
+-- objects it references.
+SECURITY DEFINER
+SET search_path = public, pg_temp
 AS $$
 DECLARE
     v_child text := format('%s_%s', p_parent, to_char(p_day, 'YYYYMMDD'));
 BEGIN
+    -- A SECURITY DEFINER function runs with the definer's rights, so it must
+    -- validate its own inputs rather than trusting the caller. Without this an
+    -- engine_writer could create a partition of ANY partitioned relation in the
+    -- schema. The allowlist pins it to the two ledger parents the worker
+    -- legitimately maintains. (%I quoting already prevents SQL injection; this
+    -- is about limiting the definer's authority, not string safety.)
+    IF p_parent NOT IN ('ledger_entries', 'ledger_transactions') THEN
+        RAISE EXCEPTION 'create_daily_partition: % is not a managed ledger parent', p_parent
+            USING ERRCODE = '42501';  -- insufficient_privilege
+    END IF;
+
     EXECUTE format(
         'CREATE TABLE IF NOT EXISTS %I PARTITION OF %I FOR VALUES FROM (%L) TO (%L)',
         v_child, p_parent, p_day::timestamptz, (p_day + 1)::timestamptz
@@ -243,6 +267,10 @@ $$;
 CREATE OR REPLACE FUNCTION ensure_ledger_partitions(p_days_ahead int DEFAULT 7)
 RETURNS void
 LANGUAGE plpgsql
+-- SECURITY DEFINER for the same reason as create_daily_partition above; this is
+-- the entry point internal/worker/partitioner.go calls on its daily cycle.
+SECURITY DEFINER
+SET search_path = public, pg_temp
 AS $$
 DECLARE
     d int;
@@ -270,5 +298,92 @@ CREATE TABLE ledger_entries_default       PARTITION OF ledger_entries       DEFA
 
 -- Bootstrap: today + the next 7 days of daily partitions for both tables.
 SELECT ensure_ledger_partitions(7);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 6. THE DOUBLE-ENTRY INVARIANT, ENFORCED BY PRIVILEGE (Milestone 0.3)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 000004 documented this grant set in a COMMENT and deferred it to "operational"
+-- provisioning that was never carried out. The result was that ledger_entries
+-- accepted UPDATE, DELETE and TRUNCATE from the application role: a settled
+-- money line could be silently rewritten. The grants are therefore declared HERE,
+-- in versioned migration SQL, where they are applied and auditable.
+--
+-- They live in 000005 rather than 000004 for a concrete reason: section 1 above
+-- DROPs both ledger tables CASCADE and recreates them, which discards every
+-- privilege granted on the old objects. A grant written into 000004 would be
+-- silently destroyed by this migration.
+--
+-- engine_writer is a NOLOGIN GROUP role. The privilege SET is fixed and
+-- versioned here; only the LOGIN user is environment-specific, and ops attaches
+-- it with:
+--
+--     CREATE ROLE <env_login_user> LOGIN PASSWORD '<secret>';
+--     GRANT engine_writer TO <env_login_user>;
+--
+-- The engine MUST connect as such a member and MUST NOT connect as the schema
+-- owner or a superuser: owners hold implicit full rights on their own tables, so
+-- the grants below would be inert. cmd/engine asserts this at boot and refuses
+-- to start otherwise.
+
+DO $role$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'engine_writer') THEN
+        CREATE ROLE engine_writer NOLOGIN;
+    END IF;
+END
+$role$;
+
+GRANT USAGE ON SCHEMA public TO engine_writer;
+
+-- ── Financial ledger: APPEND-ONLY. INSERT + SELECT, nothing else, ever. ──────
+-- No UPDATE: a settled entry is never rewritten. No DELETE: history is never
+-- erased. No TRUNCATE: the table is never emptied. Corrections are posted as
+-- offsetting ROLLBACK entries.
+--
+-- Grants are deliberately NOT issued on the individual partitions. PostgreSQL
+-- checks privileges on the PARENT for DML routed through it, so INSERT and
+-- SELECT work unchanged, while a direct UPDATE against a partition by name is
+-- refused for want of any privilege on that partition. Both halves are asserted
+-- by TestLedgerGrants_* in cmd/engine.
+GRANT INSERT, SELECT ON ledger_transactions TO engine_writer;
+GRANT INSERT, SELECT ON ledger_entries      TO engine_writer;
+
+-- ── Operational tables: the privileges the code actually exercises. ──────────
+-- Each line below is justified by a call site. 000004's documented alternative
+-- (GRANT INSERT, SELECT ON ALL TABLES IN SCHEMA public) would have broken every
+-- one of them: wallet balances, GGR aggregation, and dedup pruning all require
+-- privileges beyond INSERT+SELECT.
+
+-- ledger_transaction_dedup is the global idempotency anchor, NOT financial
+-- history. It is retention-pruned, so DELETE is required
+-- (internal/worker/dedup_prune.go).
+GRANT SELECT, INSERT, DELETE ON ledger_transaction_dedup TO engine_writer;
+
+-- wallets: balances mutate in place under SELECT ... FOR UPDATE
+-- (internal/repository engine.go, queries.go).
+GRANT SELECT, INSERT, UPDATE ON wallets TO engine_writer;
+
+-- users: created by the casino wrapper; never updated by the engine.
+GRANT SELECT, INSERT ON users TO engine_writer;
+
+-- NOTE: daily_ggr and ggr_aggregator_state are created later, by 000007, so
+-- their grants cannot be issued here — they are declared at the end of that
+-- migration instead. The complete, final grant set across all migrations is
+-- asserted as an exact match by TestLedgerGrants_ExactPrivilegeSet.
+
+-- ── Functions ────────────────────────────────────────────────────────────────
+-- Partition pre-creation is reachable ONLY through the SECURITY DEFINER entry
+-- point. EXECUTE is revoked from PUBLIC first: functions are granted to PUBLIC
+-- by default, which would let any role invoke a definer-rights function.
+REVOKE EXECUTE ON FUNCTION create_daily_partition(text, date)  FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION ensure_ledger_partitions(int)       FROM PUBLIC;
+-- internal/worker/partitioner.go calls create_daily_partition per parent/day so
+-- it can log created-vs-skipped per partition; ensure_ledger_partitions is the
+-- pg_cron entry point. Both are safe to expose: the definer function refuses any
+-- parent outside the ledger allowlist above.
+GRANT  EXECUTE ON FUNCTION create_daily_partition(text, date)  TO engine_writer;
+GRANT  EXECUTE ON FUNCTION ensure_ledger_partitions(int)       TO engine_writer;
+
+-- TRUNCATE is granted on NOTHING, to any role, anywhere in this schema.
 
 COMMIT;
