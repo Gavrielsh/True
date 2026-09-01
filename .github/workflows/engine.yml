@@ -6,8 +6,8 @@
 # which is worse than having no pipeline.
 #
 # Arriving in later, separately-reviewed tasks:
-#   T4  coverage floors                  T6  integration job (Postgres service container)
 #   T5  govulncheck                      T7  reconcile with the file-size guard
+#   T6  integration job (Postgres service container)
 #
 # Redis is deliberately NOT provisioned: every test uses miniredis in-process, so a Redis
 # service container would be unused infrastructure standing in for a guarantee nothing checks.
@@ -139,3 +139,41 @@ jobs:
         # -count=1 for the same reason as the unit-test job: a cached PASS from an earlier
         # commit would make this gate report green without instrumenting anything.
         run: go test -race -count=1 ./...
+
+  coverage:
+    name: Coverage floors
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Tests with coverage
+        # Its own job rather than an extra step on "Build, vet, and unit tests", for the
+        # same reason the race detector is separate: a coverage shortfall and a failing
+        # assertion are different problems, and a shared job would report them as one red
+        # X where the first failure hides the second. The cost is one more run of a
+        # ~30-second suite.
+        run: go test -count=1 -coverprofile=coverage.out ./...
+
+      - name: Enforce coverage floors
+        # The script prints EVERY package with its percentage and names precisely which
+        # one tripped, so a failure is actionable from the check output alone without
+        # re-running anything locally.
+        run: ./scripts/check-coverage.sh coverage.out
+
+      - name: Upload coverage profile
+        # Kept even when the gate fails — that is exactly when someone wants to open the
+        # profile and see which lines are uncovered.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-profile
+          path: coverage.out
+          retention-days: 7
