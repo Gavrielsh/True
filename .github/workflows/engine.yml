@@ -6,9 +6,8 @@
 # which is worse than having no pipeline.
 #
 # Arriving in later, separately-reviewed tasks:
-#   T3  -race test run                   T6  integration job (Postgres service container)
-#   T4  coverage floors                  T7  reconcile with the file-size guard
-#   T5  govulncheck
+#   T4  coverage floors                  T6  integration job (Postgres service container)
+#   T5  govulncheck                      T7  reconcile with the file-size guard
 #
 # Redis is deliberately NOT provisioned: every test uses miniredis in-process, so a Redis
 # service container would be unused infrastructure standing in for a guarantee nothing checks.
@@ -108,3 +107,35 @@ jobs:
         run: |
           go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
           staticcheck ./...
+
+  race:
+    name: Race detector
+    runs-on: ubuntu-latest
+    # The race detector instruments every memory access, so the suite runs several times
+    # slower than the plain job above. Budgeted generously: a timeout kill reads as a red
+    # build indistinguishable from a real finding.
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Race-detector tests
+        # A SEPARATE JOB from "Build, vet, and unit tests" on purpose. Sharing one job would
+        # mean a data race and an ordinary assertion failure arrive as the same red X, and
+        # whichever fails first hides the other. Keeping them apart means the check name
+        # alone says which kind of defect was found — and a race, which is timing-dependent
+        # and may not reproduce, is never masked by a functional failure that will.
+        #
+        # This matters more here than in most services: the engine's whole concurrency story
+        # is pessimistic locking around wallet mutation, and a race in that path corrupts
+        # balances rather than crashing.
+        #
+        # -count=1 for the same reason as the unit-test job: a cached PASS from an earlier
+        # commit would make this gate report green without instrumenting anything.
+        run: go test -race -count=1 ./...
