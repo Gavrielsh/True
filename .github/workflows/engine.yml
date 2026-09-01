@@ -84,6 +84,20 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # `golangci-lint run` does NOT validate its own configuration: an unrecognised key
+      # is ignored in silence and the run still reports "0 issues". That is how a lint
+      # rule can appear to be enforced while doing nothing — the same class of defect
+      # Milestone 0 kept finding. `config verify` fails the build on an invalid file.
+      #
+      # This is not hypothetical: the build-tags setting below was first written under a
+      # `build:` key that does not exist. The linter accepted it, reported clean, and
+      # analysed none of the integration files.
+      - name: Verify the golangci-lint configuration is valid
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.5.0
+          args: config verify
+
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v8
         with:
@@ -103,9 +117,14 @@ jobs:
         # Go >= 1.26 and would make `go install` silently download a second toolchain on
         # every run — slower, and it would analyse the code under a Go version the project
         # does not build with. Bump this together with go.mod, not ahead of it.
+        #
+        # -tags integration matches the golangci-lint run.build-tags setting: the
+        # Postgres-backed tests open connections, create roles and assert privilege sets,
+        # so they are the last files that should go unanalysed.
         run: |
           go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
           staticcheck ./...
+          staticcheck -tags integration ./...
 
   race:
     name: Race detector
@@ -225,16 +244,29 @@ jobs:
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: true_test
+          POSTGRES_DB: engine_test
         ports:
           - 5432:5432
         # Without a health check the test step starts while Postgres is still initialising
         # and fails on connection refused — a red build that says nothing about the code.
         options: >-
-          --health-cmd "pg_isready -U postgres -d true_test"
+          --health-cmd "pg_isready -U postgres -d engine_test"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+
+    env:
+      # 127.0.0.1 rather than localhost: the service port is published on the runner's
+      # IPv4 loopback, and "localhost" can resolve to ::1 first and refuse the connection.
+      #
+      # These connections are deliberately the SUPERUSER. The grant tests need it: they
+      # create the engine_writer role, provision a throwaway login user, and assert what
+      # that restricted user cannot do. A least-privilege URL here would make the tests
+      # skip or error rather than prove anything.
+      #
+      # ONE DATABASE PER SUITE — see "Provision an isolated database per suite" below.
+      ENGINE_DB_URL: postgres://postgres:postgres@127.0.0.1:5432/engine_test?sslmode=disable
+      REPO_DB_URL: postgres://postgres:postgres@127.0.0.1:5432/repo_test?sslmode=disable
 
     steps:
       - uses: actions/checkout@v4
@@ -245,48 +277,101 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Integration tests
+      # ────────────────────────────────────────────────────────────────────────
+      # THE TWO SUITES MUST NOT SHARE A DATABASE.
+      #
+      # cmd/engine's grant tests deliberately insert a single UNBALANCED ledger row
+      # (an IT_OP DEBIT) to prove that UPDATE and DELETE are refused — and because the
+      # ledger is append-only by design, that row can never be removed again.
+      #
+      # internal/repository's assertDoubleEntryBalanced scans ledger_entries TABLE-WIDE.
+      # That is the strict form of the invariant and the one worth keeping, so the fix is
+      # to isolate the data rather than to narrow the assertion: sharing one database
+      # makes the probe row look like a real accounting breach and fails four settlement
+      # tests that are behaving correctly.
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Provision an isolated database per suite
         env:
-          # 127.0.0.1 rather than localhost: the service port is published on the runner's
-          # IPv4 loopback, and "localhost" can resolve to ::1 first and refuse the connection.
-          #
-          # This connection is deliberately the SUPERUSER. The grant tests need it: they
-          # create the engine_writer role, provision a throwaway login user, and assert what
-          # that restricted user cannot do. A least-privilege URL here would make the tests
-          # skip or error rather than prove anything.
-          TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/true_test?sslmode=disable
-        run: go test -count=1 -tags integration ./...
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+          PGPASSWORD: postgres
+        run: psql -v ON_ERROR_STOP=1 -d postgres -c 'CREATE DATABASE repo_test;'
 
-      - name: Assert the ledger invariants were actually exercised
+      # The settlement tests need the schema but do not build it themselves; the migrator
+      # is the only thing that may create it, so it runs against the repository database
+      # exactly as it does against the engine one.
+      - name: Apply migrations to the repository suite's database
         env:
-          TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/true_test?sslmode=disable
-        # THE POINT OF THIS STEP. Every integration test begins with
-        #   if url == "" { t.Skip("TEST_POSTGRES_URL not set") }
-        # so a mis-plumbed environment variable does not fail the job — it makes the tests
-        # vanish and the job report green while proving nothing. That is the precise shape
-        # of the defect Milestone 0 kept finding: a control that looks enforced and is not.
-        #
-        # So the skips are asserted away. If TEST_POSTGRES_URL ever stops reaching the
-        # tests, this fails loudly instead of passing silently.
+          TEST_POSTGRES_URL: ${{ env.REPO_DB_URL }}
+        run: go test -count=1 -tags integration ./cmd/engine/ -run TestRunMigrations_Integration
+
+      - name: Integration tests — cmd/engine (migrations, grants, append-only)
+        env:
+          TEST_POSTGRES_URL: ${{ env.ENGINE_DB_URL }}
         run: |
           set -o pipefail
-          go test -count=1 -tags integration -v ./cmd/engine/ \
-            -run 'TestLedgerGrants|TestAssertLedgerAppendOnly|TestRunMigrations_Integration' \
-            2>&1 | tee integration.log
+          go test -count=1 -tags integration -v ./cmd/engine/ 2>&1 | tee engine.log
 
-          skipped=$(grep -c '^--- SKIP' integration.log || true)
-          passed=$(grep -c '^--- PASS' integration.log || true)
+      - name: Integration tests — internal/repository (settlement, double-entry)
+        env:
+          TEST_POSTGRES_URL: ${{ env.REPO_DB_URL }}
+        run: |
+          set -o pipefail
+          go test -count=1 -tags integration -v ./internal/repository/ 2>&1 | tee repo.log
 
-          echo "integration results: ${passed} passed, ${skipped} skipped"
+      # ────────────────────────────────────────────────────────────────────────
+      # THE POINT OF THIS STEP. Every Postgres-backed test begins with
+      #   if url == "" { t.Skip("TEST_POSTGRES_URL not set") }
+      # so a mis-plumbed environment variable does not fail the job — it makes the tests
+      # vanish and the job report green while proving nothing. That is the precise shape
+      # of the defect Milestone 0 kept finding: a control that looks enforced and is not.
+      #
+      # internal/repository is the proof that this guard is not theoretical. Those five
+      # tests carried no build tag and no CI coverage, and skipped silently for their
+      # entire existence — nobody had ever seen them run.
+      #
+      # if: always() so the guard reports even when a suite fails; a skip must never be
+      # able to hide behind an unrelated red step.
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Assert the ledger invariants were actually exercised
+        if: always()
+        run: |
+          fail=0
 
-          if [ "$skipped" -ne 0 ]; then
-            echo "::error::${skipped} integration test(s) SKIPPED — TEST_POSTGRES_URL is not reaching them."
-            echo "The job would otherwise report green without verifying the append-only ledger."
-            grep '^--- SKIP' integration.log
-            exit 1
-          fi
+          check() {
+            local name="$1" log="$2" pattern="$3" want="$4"
 
-          if [ "$passed" -lt 1 ]; then
-            echo "::error::No integration tests ran at all. The -run filter or the build tag is wrong."
-            exit 1
-          fi
+            if [ ! -f "$log" ]; then
+              echo "::error::${name}: ${log} is missing — the suite never ran."
+              fail=1
+              return
+            fi
+
+            local skipped passed
+            skipped=$(grep -cE '^--- SKIP' "$log" || true)
+            passed=$(grep -cE "^--- PASS: (${pattern})" "$log" || true)
+
+            echo "${name}: ${passed} Postgres-backed test(s) passed, ${skipped} skipped"
+
+            if [ "$skipped" -ne 0 ]; then
+              echo "::error::${name}: ${skipped} test(s) SKIPPED — TEST_POSTGRES_URL is not reaching them."
+              grep -E '^--- SKIP' "$log"
+              fail=1
+            fi
+
+            if [ "$passed" -lt "$want" ]; then
+              echo "::error::${name}: only ${passed} of the expected ${want} Postgres-backed tests passed."
+              echo "Either the build tag, the -run filter, or the database wiring is wrong."
+              fail=1
+            fi
+          }
+
+          # cmd/engine: 5x TestLedgerGrants_*, the boot guard, and the migration runner.
+          check "cmd/engine" engine.log \
+            'TestLedgerGrants|TestAssertLedgerAppendOnly|TestRunMigrations_Integration' 7
+
+          # internal/repository: the 5 settlement tests, including both concurrency proofs.
+          check "internal/repository" repo.log 'TestIntegration_' 5
+
+          exit "$fail"

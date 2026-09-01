@@ -23,5 +23,7 @@ node_modules/
 coverage.out
 *.coverprofile
 
-# Integration test log captured by the CI skip-guard.
-integration.log
+# Integration test logs captured by the CI skip-guard — one per suite, since
+# cmd/engine and internal/repository run against separate databases.
+engine.log
+repo.log

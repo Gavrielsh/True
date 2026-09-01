@@ -9,6 +9,14 @@
 # production code. The additions below are chosen for a money engine rather than for style.
 version: "2"
 
+# BUILD TAGS. The Postgres-backed tests live behind `//go:build integration`, so without
+# this they would compile only in CI and be linted NOWHERE — the exact files that open
+# database connections, create roles and assert privilege sets would be the least
+# scrutinised code in the repository. Analysing the tagged build keeps them in scope.
+run:
+  build-tags:
+    - integration
+
 linters:
   # Keeps the defaults (errcheck, govet, ineffassign, staticcheck, unused) and adds:
   enable:
