@@ -250,7 +250,12 @@ jobs:
         image: postgres:15-alpine
         env:
           POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
+          # No password. The container is throwaway: it lives only for this job, listens
+          # only on the runner's loopback, and is destroyed with the job — so a password
+          # here protects nothing, while a credential-shaped literal in a tracked file
+          # trains the secret scanner to cry wolf. Trust auth removes the string entirely
+          # rather than suppressing the finding.
+          POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_DB: engine_test
         ports:
           - 5432:5432
@@ -272,8 +277,8 @@ jobs:
       # skip or error rather than prove anything.
       #
       # ONE DATABASE PER SUITE — see "Provision an isolated database per suite" below.
-      ENGINE_DB_URL: postgres://postgres:postgres@127.0.0.1:5432/engine_test?sslmode=disable
-      REPO_DB_URL: postgres://postgres:postgres@127.0.0.1:5432/repo_test?sslmode=disable
+      ENGINE_DB_URL: postgres://postgres@127.0.0.1:5432/engine_test?sslmode=disable
+      REPO_DB_URL: postgres://postgres@127.0.0.1:5432/repo_test?sslmode=disable
 
     steps:
       - uses: actions/checkout@v4
@@ -302,7 +307,6 @@ jobs:
           PGHOST: 127.0.0.1
           PGPORT: "5432"
           PGUSER: postgres
-          PGPASSWORD: postgres
         run: psql -v ON_ERROR_STOP=1 -d postgres -c 'CREATE DATABASE repo_test;'
 
       # The settlement tests need the schema but do not build it themselves; the migrator
