@@ -5,9 +5,8 @@
 # that is red for reasons unrelated to the change under review teaches people to ignore it,
 # which is worse than having no pipeline.
 #
-# Arriving in later, separately-reviewed tasks:
-#   T6  integration job (Postgres service container)
-#   T7  reconcile with the file-size guard
+# The file-size guard (M0-T2) stays in its own workflow: it scans the tracked tree on a
+# different trigger scope and has nothing to do with the Go toolchain.
 #
 # Redis is deliberately NOT provisioned: every test uses miniredis in-process, so a Redis
 # service container would be unused infrastructure standing in for a guarantee nothing checks.
@@ -210,3 +209,84 @@ jobs:
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
           govulncheck ./...
+
+  integration:
+    name: Integration tests (Postgres)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        # Pinned to the major version the engine targets (ARCHITECTURE.md: PostgreSQL v15+).
+        # Testing the ledger's privilege and trigger behaviour against a DIFFERENT major
+        # than production would prove the wrong thing: grants, partitioned-table triggers
+        # and SECURITY DEFINER semantics are exactly the areas where majors differ.
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: true_test
+        ports:
+          - 5432:5432
+        # Without a health check the test step starts while Postgres is still initialising
+        # and fails on connection refused — a red build that says nothing about the code.
+        options: >-
+          --health-cmd "pg_isready -U postgres -d true_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Integration tests
+        env:
+          # 127.0.0.1 rather than localhost: the service port is published on the runner's
+          # IPv4 loopback, and "localhost" can resolve to ::1 first and refuse the connection.
+          #
+          # This connection is deliberately the SUPERUSER. The grant tests need it: they
+          # create the engine_writer role, provision a throwaway login user, and assert what
+          # that restricted user cannot do. A least-privilege URL here would make the tests
+          # skip or error rather than prove anything.
+          TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/true_test?sslmode=disable
+        run: go test -count=1 -tags integration ./...
+
+      - name: Assert the ledger invariants were actually exercised
+        env:
+          TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/true_test?sslmode=disable
+        # THE POINT OF THIS STEP. Every integration test begins with
+        #   if url == "" { t.Skip("TEST_POSTGRES_URL not set") }
+        # so a mis-plumbed environment variable does not fail the job — it makes the tests
+        # vanish and the job report green while proving nothing. That is the precise shape
+        # of the defect Milestone 0 kept finding: a control that looks enforced and is not.
+        #
+        # So the skips are asserted away. If TEST_POSTGRES_URL ever stops reaching the
+        # tests, this fails loudly instead of passing silently.
+        run: |
+          set -o pipefail
+          go test -count=1 -tags integration -v ./cmd/engine/ \
+            -run 'TestLedgerGrants|TestAssertLedgerAppendOnly|TestRunMigrations_Integration' \
+            2>&1 | tee integration.log
+
+          skipped=$(grep -c '^--- SKIP' integration.log || true)
+          passed=$(grep -c '^--- PASS' integration.log || true)
+
+          echo "integration results: ${passed} passed, ${skipped} skipped"
+
+          if [ "$skipped" -ne 0 ]; then
+            echo "::error::${skipped} integration test(s) SKIPPED — TEST_POSTGRES_URL is not reaching them."
+            echo "The job would otherwise report green without verifying the append-only ledger."
+            grep '^--- SKIP' integration.log
+            exit 1
+          fi
+
+          if [ "$passed" -lt 1 ]; then
+            echo "::error::No integration tests ran at all. The -run filter or the build tag is wrong."
+            exit 1
+          fi

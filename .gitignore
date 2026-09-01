@@ -22,3 +22,6 @@ node_modules/
 # scripts/check-coverage.sh. Never committed.
 coverage.out
 *.coverprofile
+
+# Integration test log captured by the CI skip-guard.
+integration.log
