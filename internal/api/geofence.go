@@ -257,6 +257,10 @@ func (g *GeoFence) Middleware() gin.HandlerFunc {
 
 		region, err := g.resolver.Region(ip)
 		if err != nil {
+			//nolint:errorlint // The SENTINEL is wrapped with %w so errors.Is classifies this
+			// failure; the cause is rendered with %v deliberately, so a caller's errors.Is
+			// cannot match on the cause's identity. Promoting it to %w would widen error
+			// classification on a money path.
 			g.reject(c, "lookup_failed", fmt.Errorf("%w: %v", errResolverFailed, err))
 			return
 		}

@@ -1,0 +1,52 @@
+# Zone 1 static analysis (M1.1-T2).
+#
+# The engine's own rules come first: this configuration is tuned to the code that exists,
+# not the other way round. Where a linter's default disagrees with a deliberate design
+# decision, the decision wins and the exception is recorded AT THE SITE with a justified
+# //nolint, so a reader meets the reasoning where the code is — never silently in here.
+#
+# Baseline when this landed: 3 findings on the default linters, all in test files, zero in
+# production code. The additions below are chosen for a money engine rather than for style.
+version: "2"
+
+linters:
+  # Keeps the defaults (errcheck, govet, ineffassign, staticcheck, unused) and adds:
+  enable:
+    # Wrapped-error correctness: %w vs %v decides whether errors.Is can classify a failure.
+    - errorlint
+    # Switches over the currency, transaction and status enums. The single most valuable
+    # linter here: an unhandled enum case in a money switch drops value silently.
+    - exhaustive
+    # Security scanner (weak randomness, integer overflow, file permissions).
+    - gosec
+    # Leaked HTTP response bodies — connection exhaustion under sustained load.
+    - bodyclose
+    # HTTP requests issued without a context: unbounded, uncancellable calls.
+    - noctx
+    # Returning nil after a non-nil error check — a silent swallow.
+    - nilerr
+    # time.Duration multiplied by a Duration, which is almost never what was meant.
+    - durationcheck
+    # append to a slice made with a non-zero length — silently leaves zero values in front.
+    - makezero
+    # Every //nolint must name its linters AND carry an explanation, and must actually be
+    # suppressing something. This is what stops the suppressions above from rotting into
+    # unexamined noise.
+    - nolintlint
+
+  settings:
+    exhaustive:
+      # A switch with a default clause IS exhaustive. Without this the linter reports every
+      # defensive default in the codebase, which trains people to ignore it — and it is the
+      # switches with NO default that actually drop values.
+      default-signifies-exhaustive: true
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
+
+  exclusions:
+    # golangci-lint ships presets that hide common findings (notably errcheck on Close and
+    # unhandled writes). Nothing is excluded by default here: this repository handles money,
+    # and an unchecked error is exactly the class of defect worth seeing.
+    presets: []

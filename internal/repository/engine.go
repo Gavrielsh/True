@@ -170,6 +170,10 @@ func (e *engine) ProcessBet(ctx context.Context, req BetRequest) (TxResult, erro
 		// A fingerprint mismatch is a CLIENT error (409), not a barrier fault.
 		return TxResult{}, mapIdempotencyErr(req.OperatorCode, err)
 	}
+	//nolint:exhaustive // StatusAcquired and StatusUnknown deliberately fall THROUGH
+	// this switch: acquiring the barrier is the success path and continues into the DB
+	// phase below, and an unknown status is handled by mapIdempotencyErr above. Adding
+	// cases that merely break would be dead code stating the opposite of the design.
 	switch status {
 	case cache.StatusPending:
 		return TxResult{}, fmt.Errorf("%w: %s in flight", errs.ErrTransactionPending, idemKey)
@@ -309,6 +313,10 @@ func (e *engine) ProcessWin(ctx context.Context, req WinRequest) (TxResult, erro
 	if err != nil {
 		return TxResult{}, mapIdempotencyErr(req.OperatorCode, err)
 	}
+	//nolint:exhaustive // StatusAcquired and StatusUnknown deliberately fall THROUGH
+	// this switch: acquiring the barrier is the success path and continues into the DB
+	// phase below, and an unknown status is handled by mapIdempotencyErr above. Adding
+	// cases that merely break would be dead code stating the opposite of the design.
 	switch status {
 	case cache.StatusPending:
 		return TxResult{}, fmt.Errorf("%w: %s in flight", errs.ErrTransactionPending, idemKey)
@@ -419,6 +427,10 @@ func (e *engine) ProcessRollback(ctx context.Context, req RollbackRequest) (TxRe
 	if err != nil {
 		return TxResult{}, mapIdempotencyErr(req.OperatorCode, err)
 	}
+	//nolint:exhaustive // StatusAcquired and StatusUnknown deliberately fall THROUGH
+	// this switch: acquiring the barrier is the success path and continues into the DB
+	// phase below, and an unknown status is handled by mapIdempotencyErr above. Adding
+	// cases that merely break would be dead code stating the opposite of the design.
 	switch status {
 	case cache.StatusPending:
 		return TxResult{}, fmt.Errorf("%w: %s in flight", errs.ErrTransactionPending, idemKey)

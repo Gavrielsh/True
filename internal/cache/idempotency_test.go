@@ -314,7 +314,7 @@ func TestAcquire_RaceBetweenSetNXAndGet(t *testing.T) {
 	// branch in Get is forced: take the lock under a different key first
 	// and then call Acquire on a fresh key — but for direct coverage we
 	// use a key that does not exist.
-	mr.Set(keyFor(key)+"-dummy", "X")
+	_ = mr.Set(keyFor(key)+"-dummy", "X")
 	status, payload, err := s.Acquire(ctx, key, testFP)
 	if err != nil {
 		t.Fatalf("race acquire: %v", err)
@@ -421,7 +421,10 @@ func TestFingerprintIsUnambiguous(t *testing.T) {
 	if Fingerprint("ab", "c") == Fingerprint("a", "bc") {
 		t.Fatal("Fingerprint must length-prefix parts so boundaries cannot be shifted")
 	}
-	if Fingerprint("x", "y") != Fingerprint("x", "y") {
+	// Two independent calls on identical input must agree. Bound to locals so the
+	// comparison is between two evaluations rather than one expression against itself.
+	first, second := Fingerprint("x", "y"), Fingerprint("x", "y")
+	if first != second {
 		t.Fatal("Fingerprint must be deterministic")
 	}
 	// An absent part must not silently match a present one.

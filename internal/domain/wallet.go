@@ -260,6 +260,13 @@ func (w Wallet) AllocateWin(family CurrencyFamily, amount Money) (WinAllocation,
 // ApplyWin returns a new Wallet with the WinAllocation credited.
 func (w Wallet) ApplyWin(a WinAllocation) Wallet {
 	out := w
+	//nolint:exhaustive // KNOWN GAP, deliberately left in place (M1.1-T2 is CI hygiene;
+	// changing money logic is out of its scope). CurrencySCUnplayed has no case and there
+	// is no default, so such a credit would be dropped SILENTLY and the wallet returned
+	// unchanged. It is unreachable today: AllocateWin only ever emits CurrencyGC or
+	// CurrencySCRedeemable and errors otherwise. It is latent, not live — but it fails
+	// quietly rather than loudly, so a defensive default belongs here the moment
+	// AllocateWin gains a third branch.
 	switch a.Credit.Currency {
 	case CurrencyGC:
 		out.GC = out.GC.Add(a.Credit.Amount)

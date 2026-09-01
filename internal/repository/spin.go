@@ -163,6 +163,10 @@ func (g *gameEngine) ProcessSpin(ctx context.Context, req SpinRequest) (SpinResu
 	if err != nil {
 		return SpinResult{}, mapIdempotencyErr(req.OperatorCode, err)
 	}
+	//nolint:exhaustive // StatusAcquired and StatusUnknown deliberately fall THROUGH this
+	// switch: acquiring the barrier is the success path and continues into the DB phase
+	// below, and an unknown status is handled by mapIdempotencyErr above. Adding cases that
+	// merely break would be dead code stating the opposite of the design.
 	switch status {
 	case cache.StatusPending:
 		return SpinResult{}, fmt.Errorf("%w: %s in flight", errs.ErrTransactionPending, idemKey)
@@ -182,6 +186,10 @@ func (g *gameEngine) ProcessSpin(ctx context.Context, req SpinRequest) (SpinResu
 	outcome, err := game.Spin(paytable, g.rng)
 	if err != nil {
 		e.releaseQuietly(ctx, idemKey)
+		//nolint:errorlint // The SENTINEL is wrapped with %w so errors.Is classifies this
+		// failure; the cause is rendered with %v deliberately, so a caller's errors.Is
+		// cannot match on the cause's identity. Promoting it to %w would widen error
+		// classification on a money path.
 		return SpinResult{}, fmt.Errorf("%w: %v", errs.ErrRNGUnavailable, err)
 	}
 	winAmount, err := domain.NewMoney(game.WinFor(req.BetAmount.Decimal(), outcome, domain.MoneyScale))

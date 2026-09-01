@@ -6,9 +6,9 @@
 # which is worse than having no pipeline.
 #
 # Arriving in later, separately-reviewed tasks:
-#   T2  staticcheck + golangci-lint      T5  govulncheck
 #   T3  -race test run                   T6  integration job (Postgres service container)
 #   T4  coverage floors                  T7  reconcile with the file-size guard
+#   T5  govulncheck
 #
 # Redis is deliberately NOT provisioned: every test uses miniredis in-process, so a Redis
 # service container would be unused infrastructure standing in for a guarantee nothing checks.
@@ -71,3 +71,40 @@ jobs:
         # The integration-tagged tests are excluded here by default (they carry
         # `//go:build integration` and need a real Postgres); they get their own job in T6.
         run: go test -count=1 ./...
+
+  lint:
+    name: Static analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          # Pinned. An unpinned linter turns an upstream release into a surprise red build
+          # on a change that touched nothing — the fastest way to teach a team to ignore CI.
+          # Bump it deliberately, as its own reviewed change.
+          version: v2.5.0
+          args: --timeout=10m
+
+      - name: staticcheck
+        # Run standalone as well as through golangci-lint. The two are not redundant: the
+        # bundled copy tracks golangci-lint's release cadence and can lag upstream, and the
+        # standalone tool applies check families the bundled linter does not enable.
+        #
+        # Pinned to v0.7.0 SPECIFICALLY because it requires Go >= 1.25.0, which is exactly
+        # what go.mod declares and setup-go installs above. The newer v0.8.1 requires
+        # Go >= 1.26 and would make `go install` silently download a second toolchain on
+        # every run — slower, and it would analyse the code under a Go version the project
+        # does not build with. Bump this together with go.mod, not ahead of it.
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          staticcheck ./...
