@@ -1,3 +1,5 @@
+//go:build integration
+
 package repository
 
 // settle_integration_test.go exercises the single-round-trip write path against
@@ -11,9 +13,28 @@ package repository
 // Run with:
 //
 //	TEST_POSTGRES_URL=postgres://postgres@127.0.0.1:5433/true_engine?sslmode=disable \
-//	    go test ./internal/repository/ -run Integration
+//	    go test -tags integration ./internal/repository/ -run Integration
 //
-// Skipped when TEST_POSTGRES_URL is unset, so the default suite stays hermetic.
+// BUILD TAG. Until M1.1-T6 this file carried no `integration` tag: it compiled
+// into every `go test ./...` run and skipped itself at runtime on an unset
+// TEST_POSTGRES_URL. That is the weaker of the two gates — a skip is invisible
+// in non-verbose output, so these five tests reported nothing for their entire
+// existence and had never once executed in CI. The tag makes the dependency on
+// Postgres structural rather than a runtime courtesy, and matches the
+// convention the cmd/engine integration tests already follow.
+//
+// The runtime skip is deliberately KEPT as well, for a developer who runs with
+// the tag but no database. CI closes that second gate separately: the job's
+// skip-guard step fails the build if any of these tests skip, so the pair
+// cannot combine into a green run that verified nothing.
+//
+// DATABASE ISOLATION. This suite must NOT share a database with the cmd/engine
+// grant tests. Those deliberately insert a single unbalanced probe row (an
+// IT_OP DEBIT) to prove the ledger refuses mutation, and because the table is
+// append-only that row can never be removed. assertDoubleEntryBalanced scans
+// ledger_entries table-wide — the strict form of the invariant, and the one
+// worth keeping — so it would report that foreign row as a real imbalance.
+// The CI job therefore points each package at its own database.
 
 import (
 	"context"
@@ -78,9 +99,25 @@ func (openIdem) Acquire(context.Context, string, string) (cache.AcquireStatus, s
 func (openIdem) Store(context.Context, string, string, string) error { return nil }
 func (openIdem) Release(context.Context, string) error               { return nil }
 
-// losingRNG always produces CHERRY, LEMON, CHERRY — reels 1 and 2 differ, so
-// the line pays nothing. Removes payout variance so balance assertions are
-// exact.
+// losingRNG produces CHERRY, LEMON, CHERRY — reels 1 and 2 differ, so the line
+// pays nothing. Removes payout variance so balance assertions are exact.
+//
+// ONE INSTANCE PER SPIN. The "always loses" property holds only while a spin's
+// three draws are CONSECUTIVE positions in this sequence. A single instance
+// shared by concurrent spins interleaves their draws, and ClassicThreeReel pays
+// on a LEADING PAIR for every symbol in the table — so an interleaved spin that
+// happens to draw CHERRY, CHERRY lands a 1x win. Those wins credit
+// SC_REDEEMABLE, fund further spins, and surface as extra successes that read
+// exactly like a double-spend while the wallet, the ledger and the
+// double-entry invariant all remain perfectly consistent.
+//
+// That is not hypothetical: it is what turned the first CI run of these tests
+// red, reporting "6 succeeded" against a one-bet balance on an engine whose
+// FOR UPDATE lock was working correctly the whole time.
+//
+// Concurrent tests therefore give each goroutine its own engine, hence its own
+// losingRNG. The pool stays shared, so the Postgres wallet-row contention that
+// is actually under test is unchanged.
 type losingRNG struct {
 	mu sync.Mutex
 	i  int
@@ -247,6 +284,10 @@ func assertDoubleEntryBalanced(t *testing.T, pool *pgxpool.Pool) {
 	}
 }
 
+// newIntegrationGame builds an engine with a PRIVATE losingRNG.
+//
+// Call it once per goroutine in the concurrent tests — see the losingRNG doc
+// for why sharing one across concurrent spins silently produces winning rounds.
 func newIntegrationGame(pool *pgxpool.Pool) GameEngine {
 	return NewGame(pool, openIdem{}, &losingRNG{}, discardLoggerRepo())
 }
@@ -263,12 +304,20 @@ func newIntegrationGame(pool *pgxpool.Pool) GameEngine {
 // is the property that makes an operator's retries safe.
 func TestIntegration_ConcurrentSameSpinSettlesOnce(t *testing.T) {
 	pool := integrationPool(t)
-	eng := newIntegrationGame(pool)
+
+	const goroutines = 100
+
+	// One engine per goroutine: a shared losingRNG interleaves draws across
+	// concurrent spins and stops losing. Built up front so engine construction
+	// never lands inside the timed contention window.
+	engines := make([]GameEngine, goroutines)
+	for i := range engines {
+		engines[i] = newIntegrationGame(pool)
+	}
 
 	playerID := seedPlayer(t, pool, "1000.0000")
 	spinID := "concurrent-same-" + uuid.NewString()
 
-	const goroutines = 100
 	var (
 		wg        sync.WaitGroup
 		mu        sync.Mutex
@@ -280,7 +329,7 @@ func TestIntegration_ConcurrentSameSpinSettlesOnce(t *testing.T) {
 	start := make(chan struct{})
 	wg.Add(goroutines)
 	for i := 0; i < goroutines; i++ {
-		go func() {
+		go func(eng GameEngine) {
 			defer wg.Done()
 			<-start // release all at once to maximise real contention
 			res, err := eng.ProcessSpin(context.Background(), SpinRequest{
@@ -300,7 +349,7 @@ func TestIntegration_ConcurrentSameSpinSettlesOnce(t *testing.T) {
 			case res.Status == StatusGhostRecovered || res.Status == StatusCached:
 				recovered++
 			}
-		}()
+		}(engines[i])
 	}
 	close(start)
 	wg.Wait()
@@ -350,12 +399,24 @@ func TestIntegration_ConcurrentSameSpinSettlesOnce(t *testing.T) {
 // and the balance must never go negative.
 func TestIntegration_ConcurrentDistinctSpinsCannotOverdraw(t *testing.T) {
 	pool := integrationPool(t)
-	eng := newIntegrationGame(pool)
+
+	const goroutines = 100
+
+	// One engine per goroutine, each with a private losingRNG.
+	//
+	// This is load-bearing for THIS test specifically. A shared RNG lets
+	// interleaved draws produce winning rounds; the wins refill the wallet and
+	// let further spins settle legitimately, which this test would then report
+	// as "DOUBLE SPEND: got 6" against an engine that never overdrew anything.
+	// The failure mode is a false accusation of the money path, so the harness
+	// must not be able to manufacture it.
+	engines := make([]GameEngine, goroutines)
+	for i := range engines {
+		engines[i] = newIntegrationGame(pool)
+	}
 
 	// Exactly one 10.0000 bet is affordable.
 	playerID := seedPlayer(t, pool, "10.0000")
-
-	const goroutines = 100
 	var (
 		wg           sync.WaitGroup
 		mu           sync.Mutex
@@ -367,7 +428,7 @@ func TestIntegration_ConcurrentDistinctSpinsCannotOverdraw(t *testing.T) {
 	start := make(chan struct{})
 	wg.Add(goroutines)
 	for i := 0; i < goroutines; i++ {
-		go func(n int) {
+		go func(n int, eng GameEngine) {
 			defer wg.Done()
 			<-start
 			_, err := eng.ProcessSpin(context.Background(), SpinRequest{
@@ -387,7 +448,7 @@ func TestIntegration_ConcurrentDistinctSpinsCannotOverdraw(t *testing.T) {
 			default:
 				other = append(other, err)
 			}
-		}(i)
+		}(i, engines[i])
 	}
 	close(start)
 	wg.Wait()
