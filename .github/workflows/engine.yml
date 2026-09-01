@@ -6,9 +6,8 @@
 # which is worse than having no pipeline.
 #
 # Arriving in later, separately-reviewed tasks:
-#   T2  staticcheck + golangci-lint      T5  govulncheck
-#   T3  -race test run                   T6  integration job (Postgres service container)
-#   T4  coverage floors                  T7  reconcile with the file-size guard
+#   T6  integration job (Postgres service container)
+#   T7  reconcile with the file-size guard
 #
 # Redis is deliberately NOT provisioned: every test uses miniredis in-process, so a Redis
 # service container would be unused infrastructure standing in for a guarantee nothing checks.
@@ -71,3 +70,143 @@ jobs:
         # The integration-tagged tests are excluded here by default (they carry
         # `//go:build integration` and need a real Postgres); they get their own job in T6.
         run: go test -count=1 ./...
+
+  lint:
+    name: Static analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          # Pinned. An unpinned linter turns an upstream release into a surprise red build
+          # on a change that touched nothing — the fastest way to teach a team to ignore CI.
+          # Bump it deliberately, as its own reviewed change.
+          version: v2.5.0
+          args: --timeout=10m
+
+      - name: staticcheck
+        # Run standalone as well as through golangci-lint. The two are not redundant: the
+        # bundled copy tracks golangci-lint's release cadence and can lag upstream, and the
+        # standalone tool applies check families the bundled linter does not enable.
+        #
+        # Pinned to v0.7.0 SPECIFICALLY because it requires Go >= 1.25.0, which is exactly
+        # what go.mod declares and setup-go installs above. The newer v0.8.1 requires
+        # Go >= 1.26 and would make `go install` silently download a second toolchain on
+        # every run — slower, and it would analyse the code under a Go version the project
+        # does not build with. Bump this together with go.mod, not ahead of it.
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          staticcheck ./...
+
+  race:
+    name: Race detector
+    runs-on: ubuntu-latest
+    # The race detector instruments every memory access, so the suite runs several times
+    # slower than the plain job above. Budgeted generously: a timeout kill reads as a red
+    # build indistinguishable from a real finding.
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Race-detector tests
+        # A SEPARATE JOB from "Build, vet, and unit tests" on purpose. Sharing one job would
+        # mean a data race and an ordinary assertion failure arrive as the same red X, and
+        # whichever fails first hides the other. Keeping them apart means the check name
+        # alone says which kind of defect was found — and a race, which is timing-dependent
+        # and may not reproduce, is never masked by a functional failure that will.
+        #
+        # This matters more here than in most services: the engine's whole concurrency story
+        # is pessimistic locking around wallet mutation, and a race in that path corrupts
+        # balances rather than crashing.
+        #
+        # -count=1 for the same reason as the unit-test job: a cached PASS from an earlier
+        # commit would make this gate report green without instrumenting anything.
+        run: go test -race -count=1 ./...
+
+  coverage:
+    name: Coverage floors
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Tests with coverage
+        # Its own job rather than an extra step on "Build, vet, and unit tests", for the
+        # same reason the race detector is separate: a coverage shortfall and a failing
+        # assertion are different problems, and a shared job would report them as one red
+        # X where the first failure hides the second. The cost is one more run of a
+        # ~30-second suite.
+        run: go test -count=1 -coverprofile=coverage.out ./...
+
+      - name: Enforce coverage floors
+        # The script prints EVERY package with its percentage and names precisely which
+        # one tripped, so a failure is actionable from the check output alone without
+        # re-running anything locally.
+        run: ./scripts/check-coverage.sh coverage.out
+
+      - name: Upload coverage profile
+        # Kept even when the gate fails — that is exactly when someone wants to open the
+        # profile and see which lines are uncovered.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-profile
+          path: coverage.out
+          retention-days: 7
+
+  vulncheck:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # The patch level matters here in a way it does not for the other jobs:
+          # govulncheck reports standard-library vulnerabilities against the Go version
+          # that BUILDS the code, so the go.mod directive is itself part of this gate.
+          # It is pinned at 1.25.13 because that is the highest patch release required by
+          # any stdlib advisory this module was exposed to.
+          go-version-file: go.mod
+          cache: true
+
+      - name: govulncheck
+        # Pinned like the other tools: an unpinned scanner turns a new release into a red
+        # build on a change that touched nothing. The VULNERABILITY DATABASE is still
+        # fetched fresh on every run, so pinning the binary does not freeze the findings —
+        # a newly disclosed CVE will fail this job tomorrow without any change here.
+        #
+        # govulncheck exits non-zero only for vulnerabilities your code can actually REACH.
+        # Advisories in required modules whose vulnerable symbols are never called are
+        # reported but do not fail the build, which is what keeps this gate meaningful
+        # rather than a standing wall of noise nobody reads.
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          govulncheck ./...

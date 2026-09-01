@@ -48,6 +48,9 @@ func Spin(p Paytable, rng RNG) (Outcome, error) {
 	if err := p.Validate(); err != nil {
 		return Outcome{}, err
 	}
+	//nolint:gosec // G115: TotalWeight sums the paytable's symbol weights, which
+	// Validate() constrains to small positive integers, so the sum is far below the
+	// int64 range and the conversion cannot wrap.
 	total := uint64(p.TotalWeight())
 
 	reels := make([]string, ReelCount)
@@ -69,6 +72,7 @@ func Spin(p Paytable, rng RNG) (Outcome, error) {
 func symbolForRoll(p Paytable, roll uint64) (Symbol, error) {
 	var acc uint64
 	for _, s := range p.Symbols {
+		//nolint:gosec // G115: as above, a validated small positive weight.
 		acc += uint64(s.Weight)
 		if roll < acc {
 			return s, nil

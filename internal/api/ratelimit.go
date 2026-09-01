@@ -133,6 +133,10 @@ func (rl *RateLimiter) allow(ctx context.Context, key string, limit int) (admitt
 	// every engine replica sharing this Redis: timestamp + 64 random bits is
 	// ample, far cheaper on this 10k-TPS path than a UUID (crypto/rand) and
 	// fmt.Sprintf (reflection).
+	//nolint:gosec // G404: this suffix only disambiguates two sliding-window members
+	// landing in the same millisecond. It is not a secret, a token, or a game outcome —
+	// nothing about rate limiting is weakened if it is predictable. The engine's actual
+	// randomness (game RNG) uses crypto/rand and has no config knob for anything weaker.
 	member := strconv.FormatInt(nowMillis, 36) + "-" + strconv.FormatUint(rand.Uint64(), 36)
 
 	res, err := rateLimitScript.Run(ctx, rl.client, []string{key},

@@ -53,13 +53,6 @@ func signLegacy(secret, body string) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-// withReplayHeaders stamps the timestamp/nonce that sign() assumed.
-func withReplayHeaders(req *http.Request) *http.Request {
-	req.Header.Set(HeaderTimestamp, testTimestamp)
-	req.Header.Set(HeaderNonce, testNonce)
-	return req
-}
-
 // ----------------------------------------------------------------------------
 // HMAC middleware
 // ----------------------------------------------------------------------------

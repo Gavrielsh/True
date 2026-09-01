@@ -321,6 +321,7 @@ func TestSpinFailsClosedOnEntropyError(t *testing.T) {
 func TestDrawDistributionMatchesWeights(t *testing.T) {
 	p := ClassicThreeReel
 	counts := map[string]int{}
+	//nolint:gosec // G115: validated paytable weights, as in spin.go.
 	for roll := uint64(0); roll < uint64(p.TotalWeight()); roll++ {
 		s, err := symbolForRoll(p, roll)
 		if err != nil {

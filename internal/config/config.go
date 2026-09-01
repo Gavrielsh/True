@@ -386,7 +386,10 @@ func (l *loader) dbConfig() DBConfig {
 	minConns := l.intEnv([]string{"DB_MIN_CONNS"}, defaultMinConns(maxConns), true)
 
 	cfg := DBConfig{
-		MaxConns:          int32(maxConns),
+		//nolint:gosec // G115: intEnv validates and bounds both values before this point
+		// (and MinConns <= MaxConns is checked below), so neither can exceed int32.
+		MaxConns: int32(maxConns),
+		//nolint:gosec // G115: as above — bounded by intEnv before reaching here.
 		MinConns:          int32(minConns),
 		MaxConnIdleTime:   l.duration("DB_MAX_CONN_IDLE_TIME", 30*time.Minute),
 		MaxConnLifetime:   l.duration("DB_MAX_CONN_LIFETIME", time.Hour),
