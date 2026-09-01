@@ -84,20 +84,6 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # `golangci-lint run` does NOT validate its own configuration: an unrecognised key
-      # is ignored in silence and the run still reports "0 issues". That is how a lint
-      # rule can appear to be enforced while doing nothing — the same class of defect
-      # Milestone 0 kept finding. `config verify` fails the build on an invalid file.
-      #
-      # This is not hypothetical: the build-tags setting below was first written under a
-      # `build:` key that does not exist. The linter accepted it, reported clean, and
-      # analysed none of the integration files.
-      - name: Verify the golangci-lint configuration is valid
-        uses: golangci/golangci-lint-action@v8
-        with:
-          version: v2.5.0
-          args: config verify
-
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v8
         with:
@@ -106,6 +92,27 @@ jobs:
           # Bump it deliberately, as its own reviewed change.
           version: v2.5.0
           args: --timeout=10m
+
+      # `golangci-lint run` does NOT validate its own configuration: an unrecognised key is
+      # ignored in silence and the run still reports "0 issues". That is how a lint rule can
+      # appear to be enforced while doing nothing — the same class of defect Milestone 0 kept
+      # finding. `config verify` fails the build on an invalid file.
+      #
+      # Not hypothetical: run.build-tags above was first written under a `build:` key that
+      # does not exist. The linter accepted it, reported clean, and analysed none of the
+      # integration files. Only injecting a deliberate compile error revealed it.
+      #
+      # This runs as a plain step rather than through the action, which can ONLY invoke
+      # `golangci-lint run` — passing `config verify` as args makes it read them as target
+      # directories and fail on "directory not found". The action puts the pinned binary on
+      # PATH for later steps; the fallback covers it if that ever stops being true, so the
+      # check can never be silently skipped.
+      - name: Verify the golangci-lint configuration is valid
+        run: |
+          if ! command -v golangci-lint >/dev/null 2>&1; then
+            go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.5.0
+          fi
+          golangci-lint config verify
 
       - name: staticcheck
         # Run standalone as well as through golangci-lint. The two are not redundant: the
