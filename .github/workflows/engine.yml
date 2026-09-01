@@ -6,8 +6,8 @@
 # which is worse than having no pipeline.
 #
 # Arriving in later, separately-reviewed tasks:
-#   T5  govulncheck                      T7  reconcile with the file-size guard
 #   T6  integration job (Postgres service container)
+#   T7  reconcile with the file-size guard
 #
 # Redis is deliberately NOT provisioned: every test uses miniredis in-process, so a Redis
 # service container would be unused infrastructure standing in for a guarantee nothing checks.
@@ -177,3 +177,36 @@ jobs:
           name: coverage-profile
           path: coverage.out
           retention-days: 7
+
+  vulncheck:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # The patch level matters here in a way it does not for the other jobs:
+          # govulncheck reports standard-library vulnerabilities against the Go version
+          # that BUILDS the code, so the go.mod directive is itself part of this gate.
+          # It is pinned at 1.25.13 because that is the highest patch release required by
+          # any stdlib advisory this module was exposed to.
+          go-version-file: go.mod
+          cache: true
+
+      - name: govulncheck
+        # Pinned like the other tools: an unpinned scanner turns a new release into a red
+        # build on a change that touched nothing. The VULNERABILITY DATABASE is still
+        # fetched fresh on every run, so pinning the binary does not freeze the findings —
+        # a newly disclosed CVE will fail this job tomorrow without any change here.
+        #
+        # govulncheck exits non-zero only for vulnerabilities your code can actually REACH.
+        # Advisories in required modules whose vulnerable symbols are never called are
+        # reported but do not fail the build, which is what keeps this gate meaningful
+        # rather than a standing wall of noise nobody reads.
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          govulncheck ./...
