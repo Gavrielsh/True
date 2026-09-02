@@ -1,0 +1,127 @@
+# Gate A, nightly — 100,000,000 spins.
+#
+# WHY THIS IS A SEPARATE WORKFLOW RATHER THAN A schedule: TRIGGER ON engine.yml
+#
+# Adding `schedule:` to engine.yml would drag build, lint, race, coverage,
+# vulncheck and the Postgres integration suite through every nightly run to get
+# at one job. Those already run on every push and every pull request; running
+# them again at 03:00 verifies nothing new and turns a focused signal into a
+# six-job wall that nobody reads. The alternative — one workflow with
+# `if: github.event_name == 'schedule'` sprinkled across seven jobs — is worse to
+# read and easy to get subtly wrong.
+#
+# WHAT THE EXTRA SPINS BUY
+#
+# The gate's band is 4σ/√n, so it tightens as √n. Twenty times the sample size
+# of the pull-request job narrows the acceptance band by √20 ≈ 4.5x:
+#
+#     5,000,000 spins  →  ±0.98pp   (per pull request, ~4 seconds)
+#   100,000,000 spins  →  ±0.22pp   (nightly, ~80 seconds)
+#
+# That is the point of running it nightly rather than making every pull request
+# pay for it: a bias too small to move the 0.98pp band still moves the 0.22pp one,
+# and drift that subtle is not urgent enough to block a merge on — but it is
+# absolutely worth knowing about by morning.
+name: RTP nightly
+
+on:
+  schedule:
+    # 03:17 UTC. Deliberately not on the hour: GitHub's scheduler queues hourly
+    # jobs in a spike and delays them, sometimes by a lot.
+    - cron: "17 3 * * *"
+  # So the deep run can be triggered against a branch before merging something
+  # that touches the paytable, the RNG, or the evaluator.
+  workflow_dispatch:
+    inputs:
+      spins:
+        description: "Spins to run (default 100,000,000)"
+        required: false
+        default: "100000000"
+
+permissions:
+  contents: read
+
+jobs:
+  rtp-deep:
+    name: RTP convergence — deep run
+    runs-on: ubuntu-latest
+    # ~80 seconds of spins at ~1.3M spins/sec, plus toolchain setup. The ceiling
+    # is generous because a runner that is merely slow should not be reported as
+    # an RTP failure.
+    timeout-minutes: 45
+
+    env:
+      RTP_SPINS: ${{ github.event.inputs.spins || '100000000' }}
+      RTP_REPORT_PATH: ${{ github.workspace }}/rtp-report.json
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Monte-Carlo RTP convergence (deep)
+        run: |
+          set -o pipefail
+          echo "running ${RTP_SPINS} spins"
+          go test -count=1 -timeout 40m -v ./internal/game/ \
+            -run TestMonteCarloRTPConvergence 2>&1 | tee rtp.log
+
+      # Same evidence check as the pull-request job: the report proves the run
+      # happened at the size claimed and reached a verdict. A deep run that
+      # quietly executed the 1,000,000-spin default would report green while
+      # measuring a band 4.5x wider than the one this job exists to apply.
+      - name: Assert the deep run happened at full size
+        if: always()
+        run: |
+          if [ ! -f "$RTP_REPORT_PATH" ]; then
+            echo "::error::rtp-report.json was not produced — the gate never ran."
+            exit 1
+          fi
+          if grep -qE '^--- SKIP' rtp.log; then
+            echo "::error::the RTP gate skipped; it must not be skippable."
+            grep -E '^--- SKIP' rtp.log
+            exit 1
+          fi
+
+          python3 - "$RTP_REPORT_PATH" "$RTP_SPINS" <<'PY'
+          import json, sys
+          report_path, want_spins = sys.argv[1], int(sys.argv[2])
+          r = json.load(open(report_path))
+
+          print(f"spins            {r['spins']}")
+          print(f"theoretical rtp  {r['theoretical_rtp']}")
+          print(f"empirical rtp    {r['empirical_rtp']}")
+          print(f"delta            {r['delta']}  (z = {r['z_score']})")
+          print(f"tolerance        {r['tolerance']}  ({r['sigma_multiplier']}σ)")
+          print(f"within tolerance {r['within_tolerance']}")
+
+          failed = False
+          if r["spins"] != want_spins:
+              print(f"::error::report says {r['spins']} spins, expected {want_spins}.")
+              failed = True
+          if not r["within_tolerance"]:
+              print("::error::RTP drifted outside the derived band at deep sample size.")
+              failed = True
+          if not float(r["tolerance"]) > 0:
+              print(f"::error::tolerance {r['tolerance']} is not positive.")
+              failed = True
+          sys.exit(1 if failed else 0)
+          PY
+
+      # Retained far longer than the pull-request report: these are the run-to-run
+      # series worth reading as a trend. A z-score that is individually within the
+      # band every night but sits on the same side of zero for weeks is drift the
+      # single-run gate is not designed to catch, and the artifacts are the only
+      # record that would show it.
+      - name: Upload rtp-report.json
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtp-report-nightly-${{ github.run_number }}
+          path: ${{ env.RTP_REPORT_PATH }}
+          retention-days: 90
+          if-no-files-found: error

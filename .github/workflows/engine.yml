@@ -386,3 +386,136 @@ jobs:
           check "internal/repository" repo.log 'TestIntegration_' 5
 
           exit "$fail"
+
+  rtp:
+    name: RTP convergence (Gate A)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      # 5,000,000 spins on every pull request. The gate's tolerance is derived
+      # from this number — 4σ/√n — so raising it tightens the check automatically:
+      # 5e6 gives a band of ~0.98pp, where the nightly 1e8 gives ~0.22pp.
+      RTP_SPINS: "5000000"
+      RTP_REPORT_PATH: ${{ github.workspace }}/rtp-report.json
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # ────────────────────────────────────────────────────────────────────────
+      # THE GATE ITSELF.
+      #
+      # Runs the production Spin path — crypto/rand, the weighted strip walk, the
+      # evaluator — 5,000,000 times and compares the realised return against
+      # Paytable.TheoreticalRTP(). The exhaustive test proves the evaluator and
+      # the closed-form RTP agree; it never draws anything, so it cannot see the
+      # RNG. This is the check that can.
+      #
+      # Failure is two-sided: an engine paying too much and an engine paying too
+      # little are both defects, one financial and one regulatory.
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Monte-Carlo RTP convergence
+        run: |
+          set -o pipefail
+          go test -count=1 -v ./internal/game/ \
+            -run 'TestMonteCarloRTPConvergence|TestTheoreticalVarianceMatchesExhaustive|TestRTPGateIsTwoSided|TestRTPToleranceScalesWithSampleSize|TestRTPGateRejectsInvalidSampleSize|TestExhaustiveReturnMatchesTheory' \
+            2>&1 | tee rtp.log
+
+      # ────────────────────────────────────────────────────────────────────────
+      # The gate is only worth having if it actually ran, at the size it claims,
+      # and reached a verdict. Three separate ways that could silently fail:
+      #   - the test skips (see the -short step below)
+      #   - the -run filter stops matching after a rename, so nothing executes
+      #   - RTP_SPINS is mistyped and the gate quietly runs its 1e6 default
+      # The report is the evidence for all three, so it is checked rather than
+      # trusted. This is the same reasoning as the integration job's skip-guard.
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Assert the gate ran at full size and reached a verdict
+        if: always()
+        run: |
+          if [ ! -f "$RTP_REPORT_PATH" ]; then
+            echo "::error::rtp-report.json was not produced — the gate never ran."
+            exit 1
+          fi
+
+          skipped=$(grep -cE '^--- SKIP' rtp.log || true)
+          if [ "$skipped" -ne 0 ]; then
+            echo "::error::${skipped} RTP test(s) SKIPPED; none may be."
+            grep -E '^--- SKIP' rtp.log
+            exit 1
+          fi
+
+          python3 - "$RTP_REPORT_PATH" "$RTP_SPINS" <<'PY'
+          import json, sys
+          report_path, want_spins = sys.argv[1], int(sys.argv[2])
+          r = json.load(open(report_path))
+
+          print(f"spins            {r['spins']}")
+          print(f"theoretical rtp  {r['theoretical_rtp']}")
+          print(f"empirical rtp    {r['empirical_rtp']}")
+          print(f"delta            {r['delta']}  (z = {r['z_score']})")
+          print(f"tolerance        {r['tolerance']}  ({r['sigma_multiplier']}σ)")
+          print(f"within tolerance {r['within_tolerance']}")
+
+          failed = False
+          if r["spins"] != want_spins:
+              print(f"::error::report says {r['spins']} spins, expected {want_spins} — "
+                    "RTP_SPINS is not reaching the test.")
+              failed = True
+          if not r["within_tolerance"]:
+              print("::error::RTP drifted outside the derived band; see the delta above.")
+              failed = True
+          if r["sigma_multiplier"] != 4:
+              print(f"::error::sigma multiplier is {r['sigma_multiplier']}, expected 4.")
+              failed = True
+          # A tolerance that is not a positive number means the band was never
+          # derived, and a gate with no band passes everything.
+          if not float(r["tolerance"]) > 0:
+              print(f"::error::tolerance {r['tolerance']} is not positive.")
+              failed = True
+          sys.exit(1 if failed else 0)
+          PY
+
+      # ────────────────────────────────────────────────────────────────────────
+      # Requirement: this gate must never be -short-skippable.
+      #
+      # Asserted behaviourally rather than by reading the source. The test it
+      # replaced opened with `if testing.Short() { t.Skip(...) }`, so the one
+      # check that exercises the RNG against the payout model vanished under a
+      # flag while the job still reported green. Run it WITH -short — at a small
+      # sample size, since only the skip behaviour is under test here — and fail
+      # if anything skips.
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Prove the gate cannot be skipped with -short
+        env:
+          RTP_SPINS: "50000"
+          RTP_REPORT_PATH: ${{ runner.temp }}/rtp-short-probe.json
+        run: |
+          set -o pipefail
+          go test -short -count=1 -v ./internal/game/ -run TestMonteCarloRTPConvergence 2>&1 | tee rtp-short.log
+
+          if grep -qE '^--- SKIP' rtp-short.log; then
+            echo "::error::the RTP gate skipped under -short; it must not be skippable."
+            grep -E '^--- SKIP' rtp-short.log
+            exit 1
+          fi
+          if ! grep -qE '^--- PASS: TestMonteCarloRTPConvergence' rtp-short.log; then
+            echo "::error::the RTP gate did not run under -short."
+            exit 1
+          fi
+          echo "confirmed: the gate runs under -short and does not skip"
+
+      - name: Upload rtp-report.json
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtp-report-pr
+          path: ${{ env.RTP_REPORT_PATH }}
+          retention-days: 30
+          if-no-files-found: error
