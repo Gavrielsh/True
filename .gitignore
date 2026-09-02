@@ -29,6 +29,12 @@ rtp-report.json
 rtp.log
 rtp-short.log
 
+# Gate B artifacts: the GC/SC identity report and the logs its CI guard parses.
+currency-identity-report.json
+identity.log
+identity-structure.log
+identity-crosscheck.log
+
 # Integration test logs captured by the CI skip-guard — one per suite, since
 # cmd/engine and internal/repository run against separate databases.
 engine.log

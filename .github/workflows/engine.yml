@@ -519,3 +519,121 @@ jobs:
           path: ${{ env.RTP_REPORT_PATH }}
           retention-days: 30
           if-no-files-found: error
+
+  identity:
+    name: GC/SC identity (Gate B)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      # 10,000,000 spins PER CURRENCY. The cross-check compares two independent
+      # means, so its band carries √(2/n) — at this sample size that is ~0.98pp,
+      # the same width as Gate A's single-sample band at 5,000,000.
+      CURRENCY_SPINS: "10000000"
+      CURRENCY_REPORT_PATH: ${{ github.workspace }}/currency-identity-report.json
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # ────────────────────────────────────────────────────────────────────────
+      # STRUCTURAL ENFORCEMENT, first and separately.
+      #
+      # If the outcome layer can see a currency, every downstream number is
+      # suspect and the identity result below means nothing. `go build` already
+      # fails on a currency parameter (the compile-time pins in
+      # internal/game/currency_agnostic.go), so reaching this step at all proves
+      # the signatures held; these tests close the routes around them — an
+      # import of internal/domain, or a NEW exported function taking a currency.
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Structural enforcement (currency-blind outcome layer)
+        run: |
+          set -o pipefail
+          go test -count=1 -v ./internal/game/ \
+            -run 'TestGamePackageIsCurrencyBlind|TestExportedSignaturesCarryNoCurrency|TestPaytableHashIsStableAndDiscriminating|TestRegisteredGamesIsIsolated' \
+            2>&1 | tee identity-structure.log
+
+      - name: Identity and divergence isolation
+        run: |
+          set -o pipefail
+          go test -count=1 -v ./internal/repository/ \
+            -run 'TestCurrencyModelIdentity|TestCurrencyDivergenceIsOnlyWalletAndLedger|TestSeededEntropyIsDeterministicAndVaried|TestCrossCheckBandScalesWithSampleSize' \
+            2>&1 | tee identity.log
+
+      - name: Statistical cross-check (10,000,000 spins per currency)
+        run: |
+          set -o pipefail
+          go test -count=1 -timeout 25m -v ./internal/repository/ \
+            -run TestCurrencyRTPCrossCheck 2>&1 | tee identity-crosscheck.log
+
+      # Same reasoning as Gate A's guard: the report is the evidence, so it is
+      # checked rather than the exit code trusted. A cross-check that quietly ran
+      # its 250,000-spin default would report green against a band six times
+      # wider than the one this job exists to apply.
+      - name: Assert the gate ran at full size and reached a verdict
+        if: always()
+        run: |
+          fail=0
+          for log in identity-structure.log identity.log identity-crosscheck.log; do
+            if [ ! -f "$log" ]; then
+              echo "::error::${log} is missing — that step never ran."
+              fail=1
+              continue
+            fi
+            skipped=$(grep -cE '^--- SKIP' "$log" || true)
+            if [ "$skipped" -ne 0 ]; then
+              echo "::error::${log}: ${skipped} test(s) SKIPPED; none may be."
+              grep -E '^--- SKIP' "$log"
+              fail=1
+            fi
+          done
+
+          if [ ! -f "$CURRENCY_REPORT_PATH" ]; then
+            echo "::error::currency-identity-report.json was not produced."
+            exit 1
+          fi
+
+          python3 - "$CURRENCY_REPORT_PATH" "$CURRENCY_SPINS" <<'PY'
+          import json, sys
+          report_path, want_spins = sys.argv[1], int(sys.argv[2])
+          r = json.load(open(report_path))
+
+          print(f"game             {r['game_id']} v{r['paytable_version']}")
+          print(f"paytable hash    {r['paytable_hash']}")
+          print(f"spins/currency   {r['spins_per_currency']}")
+          print(f"theoretical rtp  {r['theoretical_rtp']}")
+          print(f"GC empirical     {r['gc_empirical_rtp']}")
+          print(f"SC empirical     {r['sc_empirical_rtp']}")
+          print(f"difference       {r['difference']}  (z = {r['z_score']})")
+          print(f"tolerance        {r['tolerance']}  ({r['sigma_multiplier']}σ)")
+          print(f"within tolerance {r['within_tolerance']}")
+
+          failed = False
+          if r["spins_per_currency"] != want_spins:
+              print(f"::error::report says {r['spins_per_currency']} spins per currency, "
+                    f"expected {want_spins} — CURRENCY_SPINS is not reaching the test.")
+              failed = True
+          if not r["within_tolerance"]:
+              print("::error::GC and SC returns diverge beyond analytic noise.")
+              failed = True
+          if not float(r["tolerance"]) > 0:
+              print(f"::error::tolerance {r['tolerance']} is not positive.")
+              failed = True
+          sys.exit(1 if failed else 0)
+          PY
+
+          exit "$fail"
+
+      - name: Upload currency-identity-report.json
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: currency-identity-report
+          path: ${{ env.CURRENCY_REPORT_PATH }}
+          retention-days: 30
+          if-no-files-found: error

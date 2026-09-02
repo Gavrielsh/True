@@ -20,7 +20,11 @@
 package game
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/shopspring/decimal"
 )
@@ -300,6 +304,73 @@ var registry = map[string]Paytable{
 func Lookup(gameID string) (Paytable, bool) {
 	p, ok := registry[gameID]
 	return p, ok
+}
+
+// RegisteredGames returns every shipped paytable, ordered by game id.
+//
+// Exists so certification gates can iterate the registry rather than hardcode a
+// list. A gate that names its games by hand silently stops covering the new one
+// the day a second game ships, which is the moment coverage matters most.
+//
+// Returns copies in a fresh slice: the registry is process-global and must not
+// be mutable through a caller's handle.
+func RegisteredGames() []Paytable {
+	ids := make([]string, 0, len(registry))
+	for id := range registry {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	out := make([]Paytable, 0, len(ids))
+	for _, id := range ids {
+		p := registry[id]
+		symbols := make([]Symbol, len(p.Symbols))
+		copy(symbols, p.Symbols)
+		p.Symbols = symbols
+		out = append(out, p)
+	}
+	return out
+}
+
+// CanonicalForm renders the paytable as a deterministic string covering every
+// field that can change what a spin pays.
+//
+// Field order is fixed and symbols are emitted in declaration order, which IS
+// the reel strip order — reordering symbols does not change the probabilities
+// (each is weight/total) but it does change the strip, and a certification
+// artifact should notice that.
+//
+// Used by Hash. Kept separate and exported so a mismatch can be diffed by eye
+// rather than only observed as two different hex strings.
+func (p Paytable) CanonicalForm() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "game_id=%s\n", p.GameID)
+	fmt.Fprintf(&b, "version=%s\n", p.Version)
+	fmt.Fprintf(&b, "declared_rtp=%s\n", p.DeclaredRTP.String())
+	fmt.Fprintf(&b, "max_win_multiplier=%s\n", p.MaxWinMultiplier.String())
+	fmt.Fprintf(&b, "reel_count=%d\n", ReelCount)
+	fmt.Fprintf(&b, "symbol_count=%d\n", len(p.Symbols))
+	for i, s := range p.Symbols {
+		fmt.Fprintf(&b, "symbol[%d]=%s weight=%d pay_three=%s pay_two=%s\n",
+			i, s.ID, s.Weight, s.PayThree.String(), s.PayTwo.String())
+	}
+	return b.String()
+}
+
+// Hash is the SHA-256 of CanonicalForm, hex encoded.
+//
+// This is the paytable's identity for certification purposes: two engines
+// agreeing on this hash are running the same math model. Gate B asserts the GC
+// and SC paths resolve paytables with the same hash, which is what makes
+// "the promotional game and the sweepstakes game are the same game" a checkable
+// claim rather than an assurance.
+//
+// Not a security primitive — nothing here is adversarial — but SHA-256 rather
+// than a shorter digest because a collision in a certification record is not
+// worth the bytes saved.
+func (p Paytable) Hash() string {
+	sum := sha256.Sum256([]byte(p.CanonicalForm()))
+	return hex.EncodeToString(sum[:])
 }
 
 // DefaultGameID is used when a request omits game_id.
