@@ -293,6 +293,24 @@ func (h *Handlers) Spin(c *gin.Context) {
 		respondError(c, err)
 		return
 	}
+	// GATE C FAIL-CLOSED GUARD.
+	//
+	// feedback_class is derived server-side and is the only thing a client may
+	// use to decide whether to celebrate a round. If it does not follow from the
+	// round's own net position, the response is refused rather than sent.
+	//
+	// Failing the request is the lesser harm. A 500 on a settled spin is
+	// recoverable — the ledger already committed and the operator can replay the
+	// idempotency key. A wrongly-classified round is a loss disguised as a win,
+	// delivered to a player, and no amount of later correction takes that back.
+	//
+	// respondError maps an unrecognised error to INTERNAL_ERROR, so the operator
+	// sees a generic failure rather than the internals of the classifier.
+	if err := result.ValidateFeedback(); err != nil {
+		respondError(c, err)
+		return
+	}
+
 	c.JSON(http.StatusOK, spinResponse{Code: errors.CodeOK, Result: result})
 }
 

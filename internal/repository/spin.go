@@ -103,6 +103,51 @@ type SpinResult struct {
 	Outcome                game.Outcome   `json:"outcome"`
 	PostBalances           BalanceSummary `json:"post_balances"`
 	Status                 ResultStatus   `json:"status"`
+
+	// NetPosition is WinAmount − BetAmount: what the player actually gained or
+	// lost on this round. Negative on a loss, exactly zero on a stake-returning
+	// spin, positive on a real win. Carried on the wire so the class below is
+	// auditable rather than something a client must take on faith.
+	NetPosition domain.Money `json:"net_position"`
+
+	// FeedbackClass is the server's verdict on how this round may be presented,
+	// and the ONLY field a client may use to decide whether to celebrate.
+	//
+	// Gate C: it is derived here, never by the caller. `WinAmount > 0` is the
+	// obvious client-side test and is exactly wrong — on classic-3reel a leading
+	// CHERRY or LEMON pair pays ×1, returning the stake and nothing more, and
+	// those two outcomes are 10.99% of all spins.
+	FeedbackClass domain.FeedbackClass `json:"feedback_class"`
+}
+
+// withFeedback derives NetPosition and FeedbackClass from the round's own
+// amounts and returns the completed result.
+//
+// SINGLE DERIVATION POINT, deliberately. There are two places a SpinResult is
+// built — a fresh settlement and a ghost recovery — and a third will be added
+// eventually. Setting the fields by hand at each site is how one of them ends up
+// with a stale or copy-pasted class; routing every construction through here
+// means a new site gets the right answer by default and a wrong one has to be
+// written on purpose.
+func (r SpinResult) withFeedback() SpinResult {
+	r.NetPosition = domain.NetPosition(r.WinAmount, r.BetAmount)
+	r.FeedbackClass = domain.ClassifyFeedback(r.NetPosition)
+	return r
+}
+
+// ValidateFeedback re-derives the class from the amounts and reports any
+// disagreement.
+//
+// Called on the response path as a fail-closed guard: withFeedback is the only
+// sanctioned producer, but these are exported struct fields on a value that
+// travels to the client, and anything that can name them can set them. A round
+// whose class does not follow from its own numbers is refused rather than sent.
+func (r SpinResult) ValidateFeedback() error {
+	if want := domain.NetPosition(r.WinAmount, r.BetAmount); !want.Equal(r.NetPosition) {
+		return fmt.Errorf("spin: net_position %s does not equal win %s − bet %s (want %s)",
+			r.NetPosition, r.WinAmount, r.BetAmount, want)
+	}
+	return domain.ValidateFeedback(r.NetPosition, r.FeedbackClass)
 }
 
 // GameEngine is the server-authoritative spin surface. Deliberately separate
@@ -333,7 +378,7 @@ func (g *gameEngine) settleSpinTx(
 		Outcome:                outcome,
 		PostBalances:           balanceSummaryOf(post),
 		Status:                 StatusProcessed,
-	}, nil
+	}.withFeedback(), nil
 }
 
 // recoverGhostSpinRound reconstructs a settled round after a 23505 on either
@@ -391,7 +436,7 @@ func (g *gameEngine) recoverGhostSpinRound(ctx context.Context, req SpinRequest)
 		Outcome:                stored.Outcome,
 		PostBalances:           balanceSummaryOf(current),
 		Status:                 StatusGhostRecovered,
-	}
+	}.withFeedback()
 	e.cacheSpinQuietly(ctx, idempotencyKey(req.OperatorCode, req.OperatorTransactionID),
 		requestFingerprint(req.PlayerID, req.BodyHash), result)
 	metrics.GhostSpinsRecovered.Inc()
@@ -447,7 +492,16 @@ func decodeCachedSpin(payload string) (SpinResult, error) {
 		return SpinResult{}, fmt.Errorf("decode cached spin: %w", err)
 	}
 	out.Status = StatusCached
-	return out, nil
+
+	// Re-derive rather than trust the cached values.
+	//
+	// Two reasons. A payload written before Gate C shipped carries no
+	// feedback_class at all, and an empty class would fail the fail-closed check
+	// on the response path — a replayed spin must not 500 because of when it was
+	// first cached. And the cache is external state: re-deriving from the round's
+	// own amounts means a tampered or truncated entry cannot smuggle a WIN onto a
+	// round that did not earn one.
+	return out.withFeedback(), nil
 }
 
 func (e *engine) cacheSpinQuietly(ctx context.Context, idemKey, fingerprint string, result SpinResult) {
