@@ -23,6 +23,12 @@ node_modules/
 coverage.out
 *.coverprofile
 
+# Gate A artifacts: the Monte-Carlo report and the logs its CI guards parse.
+# The report is a per-run measurement, uploaded as a CI artifact, never committed.
+rtp-report.json
+rtp.log
+rtp-short.log
+
 # Integration test logs captured by the CI skip-guard — one per suite, since
 # cmd/engine and internal/repository run against separate databases.
 engine.log

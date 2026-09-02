@@ -121,42 +121,13 @@ func TestExhaustiveReturnMatchesTheory(t *testing.T) {
 	t.Logf("exhaustive realised RTP = %s (theory %s)", realised.Round(7), theory.Round(7))
 }
 
-// TestSpinConvergesToRTP runs the real crypto RNG over many spins and checks
-// the empirical return lands near theory. Tolerance is wide because this is a
-// smoke test for wiring, not a statistical proof — TestExhaustiveReturn is
-// the exact check.
-func TestSpinConvergesToRTP(t *testing.T) {
-	if testing.Short() {
-		t.Skip("monte-carlo skipped in -short")
-	}
-	p := ClassicThreeReel
-	rng := NewCryptoRNG()
-
-	const spins = 200_000
-	bet := decimal.NewFromInt(1)
-	totalWon := decimal.Zero
-
-	for i := 0; i < spins; i++ {
-		out, err := Spin(p, rng)
-		if err != nil {
-			t.Fatalf("spin %d: %v", i, err)
-		}
-		totalWon = totalWon.Add(WinFor(bet, out, 4))
-	}
-
-	empirical := totalWon.Div(decimal.NewFromInt(spins))
-	theory := p.TheoreticalRTP()
-	delta := empirical.Sub(theory).Abs()
-
-	// The distribution is heavy-tailed (CROWN ×400 at p=6.4e-5), so 200k
-	// spins carry real variance. 8pp catches a wiring bug without flaking.
-	tolerance := decimal.RequireFromString("0.08")
-	if delta.GreaterThan(tolerance) {
-		t.Errorf("empirical RTP %s deviates from theory %s by %s (tolerance %s)",
-			empirical.Round(5), theory.Round(5), delta.Round(5), tolerance)
-	}
-	t.Logf("empirical RTP over %d spins = %s (theory %s)", spins, empirical.Round(5), theory.Round(5))
-}
+// The Monte-Carlo convergence check that used to live here is now Gate A, in
+// rtp_gate_test.go. It moved because it changed character: it compared the
+// empirical return against a hardcoded 0.08 band at 200,000 spins — roughly 6.5σ,
+// unrelated to the sample size, and skipped entirely under -short. The
+// replacement derives its band from the paytable's own variance, fails on drift
+// in either direction, runs 5,000,000 spins on a pull request and 100,000,000
+// nightly, and cannot be skipped.
 
 // ----------------------------------------------------------------------------
 // Evaluator rules

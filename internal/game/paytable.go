@@ -167,6 +167,80 @@ func (p Paytable) TheoreticalRTP() decimal.Decimal {
 	return rtp
 }
 
+// TheoreticalVariance computes the exact variance of the per-spin return
+// multiplier X, derived from the weights and payouts alone.
+//
+// X is the multiplier a single spin returns per unit staked: PayThree_s for a
+// three-of-a-kind, PayTwo_s for a leading pair, 0 otherwise. Those three events
+// are mutually exclusive, so the second moment has the same shape as the first
+// with the payouts squared:
+//
+//	E[X²] = Σ_s [ p_s³ · PayThree_s² ]
+//	      + Σ_s [ p_s² · (1 - p_s) · PayTwo_s² ]
+//
+//	Var(X) = E[X²] − E[X]²          where E[X] = TheoreticalRTP()
+//
+// WHY THIS EXISTS. It is the input to the Monte-Carlo gate's tolerance. A
+// convergence test needs a band, and a band picked by eye is a magic number
+// that either hides real drift or flakes; σ/√n is the band the mathematics
+// actually dictates. Deriving σ here — next to the RTP it belongs with, and
+// exhaustively verified by TestTheoreticalVarianceMatchesExhaustive — keeps the
+// gate's threshold a consequence of the paytable rather than a constant someone
+// tuned until CI went quiet.
+//
+// Exact rational computation, like TheoreticalRTP: no sampling, no float.
+func (p Paytable) TheoreticalVariance() decimal.Decimal {
+	total := decimal.NewFromInt(int64(p.TotalWeight()))
+	if total.IsZero() {
+		return decimal.Zero
+	}
+
+	one := decimal.NewFromInt(1)
+	second := decimal.Zero
+
+	for _, s := range p.Symbols {
+		prob := decimal.NewFromInt(int64(s.Weight)).Div(total)
+
+		// Three of a kind: p³ · PayThree²
+		three := prob.Pow(decimal.NewFromInt(3)).Mul(s.PayThree.Mul(s.PayThree))
+
+		// Exactly two (reels 1 and 2, reel 3 differs): p² · (1-p) · PayTwo²
+		two := prob.Pow(decimal.NewFromInt(2)).
+			Mul(one.Sub(prob)).
+			Mul(s.PayTwo.Mul(s.PayTwo))
+
+		second = second.Add(three).Add(two)
+	}
+
+	mean := p.TheoreticalRTP()
+	return second.Sub(mean.Mul(mean))
+}
+
+// stdDevPrecision is the number of decimal places carried through the square
+// root. The variance itself is exact; only this root is approximate, and 24
+// places is ~17 orders of magnitude finer than the tolerance it feeds.
+const stdDevPrecision = 24
+
+// TheoreticalStdDev returns σ = √Var(X), the per-spin standard deviation of the
+// return multiplier.
+//
+// This is the ONLY inexact step in the derivation — a square root has no exact
+// decimal representation in general. It is carried to stdDevPrecision places,
+// which is far below any tolerance this feeds.
+func (p Paytable) TheoreticalStdDev() (decimal.Decimal, error) {
+	variance := p.TheoreticalVariance()
+	if variance.IsNegative() {
+		// Unreachable for a validated paytable: E[X²] ≥ E[X]² by Jensen. Report
+		// it rather than return a NaN-shaped value if the model is ever broken.
+		return decimal.Zero, fmt.Errorf("game: negative variance %s", variance)
+	}
+	root, err := variance.PowWithPrecision(decimal.New(5, -1), stdDevPrecision)
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("game: variance square root: %w", err)
+	}
+	return root, nil
+}
+
 // SymbolByID returns the symbol with the given id.
 func (p Paytable) SymbolByID(id string) (Symbol, bool) {
 	for _, s := range p.Symbols {
