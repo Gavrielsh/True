@@ -447,7 +447,20 @@ func (e *engine) processRedeemTx(ctx context.Context, req RedeemRequest) (result
 // Validation / normalization
 // ----------------------------------------------------------------------------
 
-// validUserStatuses mirrors the user_status ENUM (migration 000001).
+// validUserStatuses is the set of statuses a player may be CREATED in. It is
+// deliberately NOT the full user_status ENUM.
+//
+// 000009 added SELF_EXCLUDED, and it is omitted here on purpose: a
+// self-exclusion is a transition a player makes from an existing account, with
+// an agreed term and an audit row recording who asked for it and when. An
+// operator provisioning a player directly into that status would produce an
+// exclusion with no origin, no term, and no entry in
+// player_status_transitions — a compliance record that asserts a player excluded
+// themselves before the account existed. ProcessStatusTransition (task A2) is
+// the only supported way in, and it writes the audit row in the same
+// transaction as the users UPDATE.
+//
+// Statuses reachable only by transition, never at creation: SELF_EXCLUDED.
 var validUserStatuses = map[string]struct{}{
 	"KYC_PENDING": {}, "ACTIVE": {}, "SUSPENDED": {}, "CLOSED": {},
 }

@@ -66,6 +66,13 @@ var wantGrants = map[string][]string{
 	"users":                    {"INSERT", "SELECT"},
 	"daily_ggr":                {"INSERT", "SELECT", "UPDATE"}, // written by an UPSERT
 	"ggr_aggregator_state":     {"SELECT", "UPDATE"},           // watermark row
+	// player_status_transitions (000009) is a compliance audit log and carries
+	// the SAME append-only privilege set as the ledger: INSERT + SELECT only. A
+	// recorded transition is never rewritten, and a self-exclusion is never
+	// erased. Note that `users` still holds no UPDATE — ProcessStatusTransition
+	// (task A2) is what will need it, and it is granted alongside that code
+	// rather than ahead of it.
+	"player_status_transitions": {"INSERT", "SELECT"},
 }
 
 func integrationURL(t *testing.T) string {
@@ -152,7 +159,11 @@ func TestLedgerGrants_ForbiddenPrivilegesNeverGranted(t *testing.T) {
 	defer cancel()
 	conn, _ := migrateAndConnect(ctx, t)
 
-	for _, table := range []string{"ledger_entries", "ledger_transactions"} {
+	// player_status_transitions (000009) is append-only for the same reason the
+	// ledger is — it is the evidence file for self-exclusion and for operator and
+	// regulator actions — so the prohibition is stated for it here too, not left
+	// to wantGrants alone.
+	for _, table := range []string{"ledger_entries", "ledger_transactions", "player_status_transitions"} {
 		for _, priv := range []string{"UPDATE", "DELETE", "TRUNCATE"} {
 			var n int
 			if err := conn.QueryRow(ctx, `
