@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -18,9 +19,11 @@ type fakeCasino struct {
 	create   func(context.Context, repository.CreatePlayerRequest) (repository.CreatePlayerResult, error)
 	purchase func(context.Context, repository.PurchaseRequest) (repository.TxResult, error)
 	redeem   func(context.Context, repository.RedeemRequest) (repository.TxResult, error)
+	status   func(context.Context, repository.StatusTransitionRequest) (repository.StatusTransitionResult, error)
 
 	lastPurchase repository.PurchaseRequest
 	lastRedeem   repository.RedeemRequest
+	lastStatus   repository.StatusTransitionRequest
 }
 
 func (f *fakeCasino) CreatePlayer(ctx context.Context, req repository.CreatePlayerRequest) (repository.CreatePlayerResult, error) {
@@ -33,6 +36,10 @@ func (f *fakeCasino) ProcessPurchase(ctx context.Context, req repository.Purchas
 func (f *fakeCasino) ProcessRedeem(ctx context.Context, req repository.RedeemRequest) (repository.TxResult, error) {
 	f.lastRedeem = req
 	return f.redeem(ctx, req)
+}
+func (f *fakeCasino) ProcessStatusTransition(ctx context.Context, req repository.StatusTransitionRequest) (repository.StatusTransitionResult, error) {
+	f.lastStatus = req
+	return f.status(ctx, req)
 }
 
 // casinoRouter mounts the casino handlers behind a stub middleware that injects
@@ -49,6 +56,7 @@ func casinoRouter(c repository.CasinoEngine) *gin.Engine {
 	g.POST("/player/create", h.CreatePlayer)
 	g.POST("/store/purchase", h.Purchase)
 	g.POST("/store/redeem", h.Redeem)
+	g.POST("/player/status", h.UpdateStatus)
 	return r
 }
 
@@ -236,5 +244,125 @@ func TestRedeemHandler_InsufficientMaps400(t *testing.T) {
 	}
 	if got := decodeErr(t, w).Code; got != errs.CodeInsufficientFunds {
 		t.Errorf("code: got %s want %s", got, errs.CodeInsufficientFunds)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// player/status
+// ----------------------------------------------------------------------------
+
+func TestUpdateStatusHandler_HappyPath(t *testing.T) {
+	t.Parallel()
+	playerID := uuid.New()
+	until := time.Now().UTC().Add(repository.MinSelfExclusionTerm)
+	eng := &fakeCasino{status: func(_ context.Context, req repository.StatusTransitionRequest) (repository.StatusTransitionResult, error) {
+		return repository.StatusTransitionResult{
+			PlayerID: req.PlayerID, TransitionID: uuid.New(),
+			FromStatus: repository.StatusActive, ToStatus: req.ToStatus,
+			SelfExclusionUntil: &until, OccurredAt: time.Now().UTC(),
+		}, nil
+	}}
+	r := casinoRouter(eng)
+	body := `{"player_id":"` + playerID.String() + `","to_status":"SELF_EXCLUDED",` +
+		`"actor_type":"PLAYER","actor_ref":"ticket-9","reason":"player requested an exclusion",` +
+		`"self_exclusion_days":180}`
+	w := doJSON(r, http.MethodPost, "/api/v1/player/status", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	// Every field must reach the engine unaltered — an actor or a reason
+	// silently dropped here would produce an audit row that misattributes a
+	// compliance action.
+	got := eng.lastStatus
+	if got.OperatorCode != "OP1" {
+		t.Errorf("operator_code = %q, want OP1", got.OperatorCode)
+	}
+	if got.PlayerID != playerID {
+		t.Errorf("player_id = %s, want %s", got.PlayerID, playerID)
+	}
+	if got.ToStatus != repository.StatusSelfExcluded {
+		t.Errorf("to_status = %q", got.ToStatus)
+	}
+	if got.ActorType != "PLAYER" || got.ActorRef != "ticket-9" {
+		t.Errorf("actor = %q/%q", got.ActorType, got.ActorRef)
+	}
+	if got.Reason != "player requested an exclusion" {
+		t.Errorf("reason = %q", got.Reason)
+	}
+	if got.SelfExclusionDays != repository.MinSelfExclusionDays {
+		t.Errorf("self_exclusion_days = %d, want %d", got.SelfExclusionDays, repository.MinSelfExclusionDays)
+	}
+}
+
+// TestUpdateStatusHandler_ErrorMapping pins the status code each compliance
+// refusal produces. These codes drive an operator's retry policy: a 409 means
+// "already done, stop", a 422 means "never going to work, a human must look".
+// Getting them the wrong way round would have an integration retry an
+// irrevocable exclusion forever.
+func TestUpdateStatusHandler_ErrorMapping(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantCode   errs.Code
+	}{
+		{"self-exclusion in force", errs.ErrSelfExclusionActive, http.StatusUnprocessableEntity, errs.CodeSelfExclusionActive},
+		{"term too short", errs.ErrSelfExclusionTooShort, http.StatusUnprocessableEntity, errs.CodeSelfExclusionTooShort},
+		{"illegal transition", errs.ErrStatusTransitionInvalid, http.StatusUnprocessableEntity, errs.CodeStatusTransitionInvalid},
+		{"already in that status", errs.ErrStatusUnchanged, http.StatusConflict, errs.CodeStatusUnchanged},
+		{"unknown player", errs.ErrPlayerNotFound, http.StatusNotFound, errs.CodePlayerNotFound},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			eng := &fakeCasino{status: func(_ context.Context, _ repository.StatusTransitionRequest) (repository.StatusTransitionResult, error) {
+				return repository.StatusTransitionResult{}, c.err
+			}}
+			r := casinoRouter(eng)
+			body := `{"player_id":"` + uuid.New().String() + `","to_status":"ACTIVE",` +
+				`"actor_type":"OPERATOR","reason":"attempting a transition"}`
+			w := doJSON(r, http.MethodPost, "/api/v1/player/status", body)
+			if w.Code != c.wantStatus {
+				t.Errorf("status: got %d want %d", w.Code, c.wantStatus)
+			}
+			if got := decodeErr(t, w).Code; got != c.wantCode {
+				t.Errorf("code: got %s want %s", got, c.wantCode)
+			}
+		})
+	}
+}
+
+// TestUpdateStatusHandler_RejectsMalformedRequests: the engine is never reached
+// for a request that cannot be a valid transition.
+func TestUpdateStatusHandler_RejectsMalformedRequests(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"bad player id", `{"player_id":"not-a-uuid","to_status":"SUSPENDED","actor_type":"OPERATOR","reason":"x"}`},
+		{"missing to_status", `{"player_id":"` + uuid.New().String() + `","actor_type":"OPERATOR","reason":"x"}`},
+		{"missing actor_type", `{"player_id":"` + uuid.New().String() + `","to_status":"SUSPENDED","reason":"x"}`},
+		{"missing reason", `{"player_id":"` + uuid.New().String() + `","to_status":"SUSPENDED","actor_type":"OPERATOR"}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			called := false
+			eng := &fakeCasino{status: func(_ context.Context, _ repository.StatusTransitionRequest) (repository.StatusTransitionResult, error) {
+				called = true
+				return repository.StatusTransitionResult{}, nil
+			}}
+			r := casinoRouter(eng)
+			w := doJSON(r, http.MethodPost, "/api/v1/player/status", c.body)
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("status: got %d want 400; body=%s", w.Code, w.Body.String())
+			}
+			if called {
+				t.Error("a malformed request reached the engine")
+			}
+		})
 	}
 }

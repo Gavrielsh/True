@@ -57,6 +57,13 @@ type CasinoEngine interface {
 	// ProcessRedeem deducts SC_REDEEMABLE (only) against HOUSE_REDEMPTION_POOL
 	// for a fiat redemption. Idempotent + Ghost-Spin safe.
 	ProcessRedeem(ctx context.Context, req RedeemRequest) (TxResult, error)
+
+	// ProcessStatusTransition is the ONLY write path for users.status. It
+	// commits the status change and its audit row together, takes the same
+	// wallet lock as the money paths so a transition cannot interleave with a
+	// settling wager, and refuses to lift a self-exclusion before its term
+	// expires. See status.go.
+	ProcessStatusTransition(ctx context.Context, req StatusTransitionRequest) (StatusTransitionResult, error)
 }
 
 // NewCasino builds the casino wrapper from the same dependencies as New. The

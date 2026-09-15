@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/Gavrielsh/True/internal/domain"
 	"github.com/Gavrielsh/True/internal/repository"
@@ -55,6 +56,36 @@ type redeemDTO struct {
 	PlayerID              string          `json:"player_id"               binding:"required"`
 	Amount                string          `json:"amount"                  binding:"required"`
 	Metadata              json.RawMessage `json:"metadata,omitempty"`
+}
+
+// statusTransitionDTO is the POST /api/v1/player/status wire format.
+//
+// self_exclusion_days is a whole-day COUNT, required when to_status is
+// SELF_EXCLUDED and rejected otherwise. Deliberately not an end timestamp: an
+// instant computed by the caller is already stale when it arrives, so a request
+// for exactly the 180-day minimum would be refused for having spent a few
+// milliseconds in transport. A day count is measured by the engine's own clock
+// at the instant the transition commits — see the note in
+// repository/status.go.
+type statusTransitionDTO struct {
+	PlayerID          string `json:"player_id"                    binding:"required"`
+	ToStatus          string `json:"to_status"                    binding:"required"`
+	ActorType         string `json:"actor_type"                   binding:"required"`
+	ActorRef          string `json:"actor_ref,omitempty"`
+	Reason            string `json:"reason"                       binding:"required"`
+	SelfExclusionDays int    `json:"self_exclusion_days,omitempty"`
+}
+
+// statusTransitionResponse is the POST /api/v1/player/status 2xx payload.
+//
+// A dedicated type rather than the shared successResponse, which embeds
+// repository.TxResult: a status change produces no ledger transaction, and
+// widening that envelope to carry either shape would blur the distinction
+// between "money moved" and "a compliance flag moved" in every response on the
+// API. createPlayerResponse already sets this precedent for the same reason.
+type statusTransitionResponse struct {
+	Code   errors.Code                       `json:"code"`
+	Result repository.StatusTransitionResult `json:"result"`
 }
 
 // createPlayerResponse is the POST /api/v1/player/create 2xx payload.
@@ -178,6 +209,47 @@ func (h *CasinoHandlers) Redeem(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, successResponse{Code: errors.CodeOK, Result: result})
+}
+
+// UpdateStatus handles POST /api/v1/player/status — the only route that can
+// change a player's status.
+//
+// Mounted OUTSIDE the jurisdiction fence (see router.go): a player must always
+// be able to exclude themselves, and an operator must always be able to close an
+// account, regardless of where the request originates.
+func (h *CasinoHandlers) UpdateStatus(c *gin.Context) {
+	var dto statusTransitionDTO
+	if err := c.ShouldBindJSON(&dto); err != nil {
+		respondErrorCode(c, http.StatusBadRequest, errors.CodeInvalidAmount, "invalid request body")
+		return
+	}
+
+	playerID, ok := parsePlayerID(c, dto.PlayerID)
+	if !ok {
+		return
+	}
+
+	operatorCode := OperatorCodeFromContext(c.Request.Context())
+	ctx, span := telemetry.StartSpan(c.Request.Context(), "http.player_status",
+		attribute.String("operator_code", operatorCode),
+		attribute.String("player_id", playerID.String()),
+		attribute.String("to_status", dto.ToStatus))
+
+	result, err := h.casino.ProcessStatusTransition(ctx, repository.StatusTransitionRequest{
+		OperatorCode:      operatorCode,
+		PlayerID:          playerID,
+		ToStatus:          dto.ToStatus,
+		ActorType:         dto.ActorType,
+		ActorRef:          dto.ActorRef,
+		Reason:            dto.Reason,
+		SelfExclusionDays: dto.SelfExclusionDays,
+	})
+	telemetry.EndSpan(span, err)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, statusTransitionResponse{Code: errors.CodeOK, Result: result})
 }
 
 // parseOptionalAmount parses a money string that may be empty. An empty/omitted

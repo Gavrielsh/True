@@ -63,15 +63,19 @@ var wantGrants = map[string][]string{
 	"ledger_transactions":      {"INSERT", "SELECT"},
 	"ledger_transaction_dedup": {"DELETE", "INSERT", "SELECT"}, // retention-pruned, not financial history
 	"wallets":                  {"INSERT", "SELECT", "UPDATE"}, // balances mutate under SELECT ... FOR UPDATE
-	"users":                    {"INSERT", "SELECT"},
-	"daily_ggr":                {"INSERT", "SELECT", "UPDATE"}, // written by an UPSERT
-	"ggr_aggregator_state":     {"SELECT", "UPDATE"},           // watermark row
+	// users gained UPDATE in 000010, alongside ProcessStatusTransition — the
+	// first and only writer of users.status. No DELETE: a player row is never
+	// removed. Closure is a status, and an erased player would take their audit
+	// trail's referent with them.
+	"users":                {"INSERT", "SELECT", "UPDATE"},
+	"daily_ggr":            {"INSERT", "SELECT", "UPDATE"}, // written by an UPSERT
+	"ggr_aggregator_state": {"SELECT", "UPDATE"},           // watermark row
 	// player_status_transitions (000009) is a compliance audit log and carries
 	// the SAME append-only privilege set as the ledger: INSERT + SELECT only. A
 	// recorded transition is never rewritten, and a self-exclusion is never
-	// erased. Note that `users` still holds no UPDATE — ProcessStatusTransition
-	// (task A2) is what will need it, and it is granted alongside that code
-	// rather than ahead of it.
+	// erased. This is what makes the users UPDATE above safe to grant: the
+	// status can move, but never without leaving a record that cannot be
+	// revised afterwards.
 	"player_status_transitions": {"INSERT", "SELECT"},
 }
 

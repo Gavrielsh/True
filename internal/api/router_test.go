@@ -174,3 +174,113 @@ func TestRouter_Metrics(t *testing.T) {
 // small money helpers local to this file
 func m(t *testing.T, s string) domain.Money { return mustMoney(t, s) }
 func mzero(t *testing.T) domain.Money       { return mustMoney(t, "0.0000") }
+
+// TestRouter_ComplianceRouteIsNotGeoFenced pins a deliberate exception in the
+// middleware chain.
+//
+// POST /api/v1/player/status carries the full zero-trust stack — HMAC, operator
+// rate limiting, replay protection — but is mounted OUTSIDE the jurisdiction
+// fence, while every money route stays behind it. The reason is that a player
+// must always be able to exclude themselves and an operator must always be able
+// to close an account: refusing a self-exclusion because the request appeared to
+// originate in a prohibited state would use a player-protection control to deny
+// a player protection.
+//
+// It is asserted rather than left to a comment because the exception is
+// invisible at the call site — a future refactor that moves the group below the
+// fence, or replaces it with a plain v1.POST, would silently re-fence the route
+// and nothing else would notice.
+func TestRouter_ComplianceRouteIsNotGeoFenced(t *testing.T) {
+	t.Parallel()
+
+	// Same low-entropy placeholder the other router tests use; a realistic-
+	// looking literal here trips gosec's hardcoded-credential detector for no
+	// benefit.
+	const secret = "shared-secret"
+	const (
+		blockedIP  = "203.0.113.7"
+		remoteAddr = blockedIP + ":51000"
+	)
+
+	resolver := &fakeResolver{regions: map[string]string{blockedIP: "US-WA"}} // blocked jurisdiction
+	gf := newFence(t, resolver, nil, nil)
+
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+
+	casino := &fakeCasino{
+		redeem: func(context.Context, repository.RedeemRequest) (repository.TxResult, error) {
+			return repository.TxResult{}, nil
+		},
+		status: func(_ context.Context, req repository.StatusTransitionRequest) (repository.StatusTransitionResult, error) {
+			return repository.StatusTransitionResult{
+				PlayerID: req.PlayerID, TransitionID: uuid.New(),
+				FromStatus: repository.StatusActive, ToStatus: req.ToStatus,
+			}, nil
+		},
+	}
+
+	r := NewRouter(Config{
+		Casino:   casino,
+		Redis:    client,
+		Secrets:  map[string]string{"OP1": secret},
+		GeoFence: gf,
+		Logger:   discardLogger(),
+	})
+
+	playerID := uuid.New().String()
+
+	// Control: a money route from the same blocked address IS refused. Without
+	// this the test could pass against a fence that does nothing at all.
+	t.Run("money route is fenced", func(t *testing.T) {
+		body := `{"operator_transaction_id":"geo-red-1","player_id":"` + playerID + `","amount":"5.0000"}`
+		req := signedRequest(http.MethodPost, "/api/v1/store/redeem", body, secret, uuid.NewString())
+		req.RemoteAddr = remoteAddr
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("store/redeem from a blocked region: got %d want 403; body=%s", w.Code, w.Body.String())
+		}
+		var body2 errorResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &body2); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if body2.Code != errs.CodeGeoBlocked {
+			t.Errorf("code: got %s want %s", body2.Code, errs.CodeGeoBlocked)
+		}
+	})
+
+	// The exception: the same address may still self-exclude.
+	t.Run("self-exclusion is not fenced", func(t *testing.T) {
+		body := `{"player_id":"` + playerID + `","to_status":"SELF_EXCLUDED","actor_type":"PLAYER",` +
+			`"reason":"player requested an exclusion","self_exclusion_days":180}`
+		req := signedRequest(http.MethodPost, "/api/v1/player/status", body, secret, uuid.NewString())
+		req.RemoteAddr = remoteAddr
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code == http.StatusForbidden {
+			t.Fatalf("a self-exclusion was geo-blocked; a protective action must never be "+
+				"refused on jurisdiction. body=%s", w.Body.String())
+		}
+		if w.Code != http.StatusOK {
+			t.Fatalf("player/status: got %d want 200; body=%s", w.Code, w.Body.String())
+		}
+	})
+
+	// And it is still a signed route: dropping the fence must not have dropped
+	// the perimeter with it.
+	t.Run("but it still requires a valid signature", func(t *testing.T) {
+		body := `{"player_id":"` + playerID + `","to_status":"SUSPENDED","actor_type":"OPERATOR","reason":"unsigned"}`
+		req := signedRequest(http.MethodPost, "/api/v1/player/status", body, "the-wrong-secret", uuid.NewString())
+		req.RemoteAddr = remoteAddr
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("an unsigned compliance request: got %d want 401", w.Code)
+		}
+	})
+}

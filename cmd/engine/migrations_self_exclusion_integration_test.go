@@ -340,8 +340,14 @@ func TestSelfExclusion_DownUpCycleIsRepeatable(t *testing.T) {
 	if err := m.Up(); err != nil {
 		t.Fatalf("initial up: %v", err)
 	}
-	if err := m.Steps(-1); err != nil {
-		t.Fatalf("down one step (000009): %v", err)
+	// Migrate to a PINNED version rather than stepping back a fixed number of
+	// times. Steps(-1) meant "undo 000009" only while 000009 was the head; the
+	// moment 000010 landed it unwound that instead and this test failed for a
+	// reason that had nothing to do with what it checks. Naming the version this
+	// test needs to land on keeps it correct as migrations accumulate.
+	const versionBeforeSelfExclusion = 8
+	if err := m.Migrate(versionBeforeSelfExclusion); err != nil {
+		t.Fatalf("migrate down to %d: %v", versionBeforeSelfExclusion, err)
 	}
 
 	cycleConn, err := pgx.Connect(ctx, cycleURL)

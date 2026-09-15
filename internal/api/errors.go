@@ -57,6 +57,19 @@ func httpStatusFor(code errors.Code) int {
 		// 503 — transient infrastructure failure; the spin was NOT settled
 		// and the same key is safe to retry.
 		return http.StatusServiceUnavailable
+	case errors.CodeStatusUnchanged:
+		// 409, matching the other "you are colliding with existing state"
+		// codes. Zone 2 reads this as "already applied" when replaying a
+		// transition, so a retried compliance action is safe rather than noisy.
+		return http.StatusConflict
+	case errors.CodeStatusTransitionInvalid,
+		errors.CodeSelfExclusionActive,
+		errors.CodeSelfExclusionTooShort:
+		// 422 like CodeWinExceedsCeiling: the request is well-formed and was
+		// refused by policy. Retrying the identical request never helps — an
+		// illegal move stays illegal, and an active exclusion is not waited out
+		// by a retry loop.
+		return http.StatusUnprocessableEntity
 	default:
 		return http.StatusInternalServerError
 	}
@@ -126,6 +139,17 @@ func publicMessageFor(code errors.Code) string {
 		return "idempotency key already used for a different request"
 	case errors.CodeRNGUnavailable:
 		return "game temporarily unavailable"
+	case errors.CodeStatusUnchanged:
+		return "player already holds the requested status"
+	case errors.CodeStatusTransitionInvalid:
+		return "status transition not permitted"
+	case errors.CodeSelfExclusionActive:
+		// Deliberately does not disclose the expiry date: this response goes to
+		// an operator integration, and the term belongs in the player-facing
+		// surface the gateway renders, not in a generic engine error body.
+		return "self-exclusion is in force and cannot be lifted"
+	case errors.CodeSelfExclusionTooShort:
+		return "self-exclusion term is below the permitted minimum"
 	default:
 		return "internal error"
 	}
