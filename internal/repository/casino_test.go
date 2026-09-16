@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/pashagolub/pgxmock/v4"
+	"github.com/shopspring/decimal"
 
 	"github.com/Gavrielsh/True/internal/domain"
 	errs "github.com/Gavrielsh/True/pkg/errors"
@@ -27,6 +28,30 @@ const (
 // ----------------------------------------------------------------------------
 // CreatePlayer
 // ----------------------------------------------------------------------------
+
+// Playthrough (000012) added one statement to each of these flows: a purchase
+// records the obligation its promotional SC creates, and a redemption reads
+// whether any obligation is still outstanding.
+var (
+	rxInsertPlaythrough      = `INSERT INTO sc_playthrough`
+	rxOutstandingPlaythrough = `SELECT COALESCE\(SUM\(required_amount`
+)
+
+// expectPlaythroughGrant registers the obligation a promotional SC grant
+// creates. A purchase with no SC promo writes no row and must NOT expect one.
+func expectPlaythroughGrant(mock pgxmock.PgxPoolIface, playerID uuid.UUID) {
+	mock.ExpectExec(rxInsertPlaythrough).
+		WithArgs(playerID, pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+}
+
+// expectPlaythroughSatisfied registers the redemption gate's read, answering
+// that nothing is outstanding.
+func expectPlaythroughSatisfied(mock pgxmock.PgxPoolIface, playerID uuid.UUID) {
+	mock.ExpectQuery(rxOutstandingPlaythrough).
+		WithArgs(playerID).
+		WillReturnRows(pgxmock.NewRows([]string{"outstanding"}).AddRow(decimal.Zero))
+}
 
 func TestCreatePlayer_NewPlayer(t *testing.T) {
 	t.Parallel()
@@ -151,6 +176,7 @@ func TestProcessPurchase_GCWithPromo(t *testing.T) {
 	mock.ExpectExec(rxInsertDedup).
 		WithArgs(operatorCode, "op-pur-1", ledgerTxID).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	expectPlaythroughGrant(mock, playerID)
 	// GC: player CREDIT + HOUSE_ISSUANCE_POOL DEBIT.
 	mock.ExpectExec(rxInsertLedgerEntry).
 		WithArgs(ledgerTxID, playerID, "PLAYER_WALLET", "GC", "CREDIT", dec("100.0000"), dec("100.0000")).
@@ -274,6 +300,7 @@ func TestProcessRedeem_HappyPath_DrawsRedeemableOnly(t *testing.T) {
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("0.0000", "0.0000", "50.0000"))
 	expectPlayerStatus(mock, playerID, "ACTIVE")
+	expectPlaythroughSatisfied(mock, playerID)
 	// Redeem 20 → SC_REDEEMABLE 50 → 30. GC/SC_UNPLAYED untouched.
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("0.0000"), dec("0.0000"), dec("30.0000"), playerID).
@@ -319,6 +346,7 @@ func TestProcessRedeem_InsufficientRedeemable_RollsBack(t *testing.T) {
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("0.0000", "1000.0000", "5.0000"))
 	expectPlayerStatus(mock, playerID, "ACTIVE")
+	expectPlaythroughSatisfied(mock, playerID)
 	mock.ExpectRollback() // allocator rejects before any mutating SQL
 
 	_, err := e.ProcessRedeem(context.Background(), RedeemRequest{

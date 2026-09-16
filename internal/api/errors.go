@@ -62,6 +62,12 @@ func httpStatusFor(code errors.Code) int {
 		// codes. Zone 2 reads this as "already applied" when replaying a
 		// transition, so a retried compliance action is safe rather than noisy.
 		return http.StatusConflict
+	case errors.CodePlaythroughOutstanding:
+		// 403 alongside the other "this player may not do this" answers. The
+		// balance exists; the wagering attached to a promotional grant has not
+		// been discharged. Never 400 INSUFFICIENT_FUNDS — a cashier that told
+		// the player to earn more would be describing the wrong problem.
+		return http.StatusForbidden
 	case errors.CodeLimitExceeded:
 		// 403, alongside CodePlayerNotActive: the request is well-formed and the
 		// funds exist, but this player may not make it. A retry of the identical
@@ -162,6 +168,8 @@ func publicMessageFor(code errors.Code) string {
 		return "a self-exclusion may be extended, never shortened"
 	case errors.CodeLimitExceeded:
 		return "the wager exceeds a limit set on this account"
+	case errors.CodePlaythroughOutstanding:
+		return "promotional sweeps coins must be played through before redemption"
 	default:
 		return "internal error"
 	}

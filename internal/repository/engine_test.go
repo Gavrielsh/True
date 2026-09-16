@@ -199,9 +199,20 @@ func expectPlayerStatus(mock pgxmock.PgxPoolIface, playerID uuid.UUID, status st
 // credited whatever the caps say, since refusing money a player has already won
 // would be taking it rather than protecting them.
 var (
-	rxSelectPlayerLimits = `FROM player_limits`
-	rxUpsertLimitUsage   = `INSERT INTO player_limit_usage`
+	rxSelectPlayerLimits  = `FROM player_limits`
+	rxUpsertLimitUsage    = `INSERT INTO player_limit_usage`
+	rxPlaythroughProgress = `UPDATE sc_playthrough`
 )
+
+// expectPlaythroughProgress registers the waterfall that credits wagered
+// SC_UNPLAYED against outstanding grants. It runs on every settled wager,
+// including GC ones — where the SC_UNPLAYED contribution is zero and the
+// statement is skipped entirely, so only the SC paths expect it.
+func expectPlaythroughProgress(mock pgxmock.PgxPoolIface, playerID uuid.UUID) {
+	mock.ExpectExec(rxPlaythroughProgress).
+		WithArgs(playerID, pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+}
 
 // expectNoPlayerLimits registers the limits lookup enforceWagerLimits runs right
 // after the status guard, returning no rows — a player who has set none.
@@ -340,6 +351,7 @@ func TestProcessBet_SC_SplitsUnplayedThenRedeemable(t *testing.T) {
 		WithArgs(ledgerTxID, nil, "HOUSE_BET_POOL", "SC_REDEEMABLE", "CREDIT", dec("20.0000"), nil).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	expectWagerUsage(mock, playerID)
+	expectPlaythroughProgress(mock, playerID)
 	mock.ExpectCommit()
 
 	got, err := e.ProcessBet(context.Background(), BetRequest{

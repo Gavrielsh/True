@@ -287,6 +287,13 @@ func (e *engine) processBetTx(ctx context.Context, req BetRequest) (result TxRes
 		return TxResult{}, err
 	}
 
+	// 5c. Playthrough progress, from the SC_UNPLAYED portion of the allocation
+	//     ONLY — wagering SC_REDEEMABLE spends money already won and already
+	//     played through once, and must not discharge a new grant.
+	if err := applyPlaythroughProgress(ctx, tx, req.PlayerID, scUnplayedDebited(alloc)); err != nil {
+		return TxResult{}, err
+	}
+
 	// 6. COMMIT — releases the FOR UPDATE lock and durably persists everything.
 	if err := tx.Commit(ctx); err != nil {
 		return TxResult{}, fmt.Errorf("commit: %w", err)

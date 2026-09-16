@@ -74,6 +74,12 @@ var (
 	// themselves. Distinct from ErrInsufficientFunds — the money is there, and
 	// the player asked us not to let them spend it.
 	ErrLimitExceeded = stderrors.New("player limit exceeded")
+
+	// ErrPlaythroughOutstanding: the player holds promotional SC they have not
+	// yet wagered through, so redemption is refused. Distinct from
+	// ErrInsufficientFunds — the redeemable balance is there; the sweepstakes
+	// wagering requirement attached to a grant has not been discharged.
+	ErrPlaythroughOutstanding = stderrors.New("sweeps playthrough requirement outstanding")
 )
 
 // Code is the stable identifier surfaced to operators (e.g. in webhook
@@ -104,6 +110,7 @@ const (
 	CodeSelfExclusionTooShort    Code = "SELF_EXCLUSION_TOO_SHORT"
 	CodeSelfExclusionNotExtended Code = "SELF_EXCLUSION_NOT_EXTENDED"
 	CodeLimitExceeded            Code = "PLAYER_LIMIT_EXCEEDED"
+	CodePlaythroughOutstanding   Code = "PLAYTHROUGH_OUTSTANDING"
 	// CodeGeoBlocked is returned by the jurisdiction fence (no sentinel error:
 	// the middleware rejects before any domain call).
 	CodeGeoBlocked Code = "GEO_BLOCKED"
@@ -156,6 +163,8 @@ func CodeFor(err error) Code {
 		return CodeSelfExclusionNotExtended
 	case stderrors.Is(err, ErrLimitExceeded):
 		return CodeLimitExceeded
+	case stderrors.Is(err, ErrPlaythroughOutstanding):
+		return CodePlaythroughOutstanding
 	default:
 		return CodeInternal
 	}

@@ -88,6 +88,12 @@ var wantGrants = map[string][]string{
 	// player_limit_changes: the evidence the cooling-off period was served.
 	// Append-only like every other audit table here.
 	"player_limit_changes": {"INSERT", "SELECT"},
+	// sc_playthrough (000012): SELECT for the redemption gate, INSERT to record
+	// a grant, UPDATE to advance the counter. NO DELETE, and that is the
+	// load-bearing omission — DELETE would let an outstanding wagering
+	// obligation be made to disappear, which is exactly what the record exists
+	// to prevent. A grant is discharged by being wagered, never by being removed.
+	"sc_playthrough": {"INSERT", "SELECT", "UPDATE"},
 }
 
 func integrationURL(t *testing.T) string {

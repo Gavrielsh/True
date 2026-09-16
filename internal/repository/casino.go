@@ -314,6 +314,14 @@ func (e *engine) processPurchaseTx(ctx context.Context, req PurchaseRequest) (re
 	}
 	span.SetAttributes(attribute.String("ledger_transaction_id", ledgerTxID.String()))
 
+	// The promotional SC this purchase issues carries a 1x wagering
+	// requirement. Recorded in the SAME transaction as the grant, so a grant can
+	// never exist without the obligation it creates — the failure mode that
+	// would let promotional coins be redeemed straight back out as cash.
+	if err := recordPlaythroughGrant(ctx, tx, req.PlayerID, ledgerTxID, req.SCPromoAmount); err != nil {
+		return TxResult{}, err
+	}
+
 	// Double-entry: each issued currency is a player CREDIT balanced by a
 	// HOUSE_ISSUANCE_POOL DEBIT of the same amount.
 	for _, c := range alloc.Credits {
@@ -397,6 +405,15 @@ func (e *engine) processRedeemTx(ctx context.Context, req RedeemRequest) (result
 
 	// KYC/compliance guard — same tx handle, serialized by the lock above.
 	if err := requirePlayerActive(ctx, tx, req.PlayerID); err != nil {
+		return TxResult{}, err
+	}
+
+	// The sweepstakes wagering requirement. Checked BEFORE the allocation so a
+	// player with an outstanding grant is told which rule stopped them, rather
+	// than being handed an insufficient-funds error about a balance they
+	// visibly have. Same tx handle, so a wager committing concurrently either
+	// discharges the last grant before this read or after it — never halfway.
+	if err := assertPlaythroughSatisfied(ctx, tx, req.PlayerID); err != nil {
 		return TxResult{}, err
 	}
 

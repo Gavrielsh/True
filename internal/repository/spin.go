@@ -327,6 +327,13 @@ func (g *gameEngine) settleSpinTx(
 		return SpinResult{}, err
 	}
 
+	// Playthrough progress from the SC_UNPLAYED portion of the stake only. The
+	// win credited above lands in SC_REDEEMABLE and discharges nothing — a grant
+	// is played through by being STAKED, not by paying out.
+	if err := applyPlaythroughProgress(ctx, tx, req.PlayerID, scUnplayedDebited(alloc)); err != nil {
+		return SpinResult{}, err
+	}
+
 	var winLedgerIDPtr *uuid.UUID
 	if hasWin {
 		winLedgerIDPtr = &winLedgerID
