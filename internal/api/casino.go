@@ -76,6 +76,27 @@ type statusTransitionDTO struct {
 	SelfExclusionDays int    `json:"self_exclusion_days,omitempty"`
 }
 
+// setPlayerLimitDTO is the POST /api/v1/player/limits wire format.
+//
+// amount is a decimal STRING like every other money field on this API. A limit
+// is compared against a stake, so it has to be the same kind of number as the
+// stake — a JSON number here would reintroduce float rounding on exactly the
+// value that decides whether a player may wager.
+type setPlayerLimitDTO struct {
+	PlayerID  string `json:"player_id"  binding:"required"`
+	Kind      string `json:"limit_kind" binding:"required"`
+	Period    string `json:"period"     binding:"required"`
+	Amount    string `json:"amount"     binding:"required"`
+	ActorType string `json:"actor_type" binding:"required"`
+	ActorRef  string `json:"actor_ref,omitempty"`
+}
+
+// setPlayerLimitResponse is the POST /api/v1/player/limits 2xx payload.
+type setPlayerLimitResponse struct {
+	Code   errors.Code                     `json:"code"`
+	Result repository.SetPlayerLimitResult `json:"result"`
+}
+
 // statusTransitionResponse is the POST /api/v1/player/status 2xx payload.
 //
 // A dedicated type rather than the shared successResponse, which embeds
@@ -250,6 +271,56 @@ func (h *CasinoHandlers) UpdateStatus(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, statusTransitionResponse{Code: errors.CodeOK, Result: result})
+}
+
+// SetPlayerLimit handles POST /api/v1/player/limits.
+//
+// Mounted on the same unfenced compliance group as /player/status: setting or
+// lowering a limit is a protective act, and must not be refused on
+// jurisdiction. Raising one is not protective, but splitting the route by
+// direction would mean the client has to know the current value to know which
+// endpoint to call — and a player who cannot reach the endpoint at all cannot
+// lower their limit either.
+func (h *CasinoHandlers) SetPlayerLimit(c *gin.Context) {
+	var dto setPlayerLimitDTO
+	if err := c.ShouldBindJSON(&dto); err != nil {
+		respondErrorCode(c, http.StatusBadRequest, errors.CodeInvalidAmount, "invalid request body")
+		return
+	}
+
+	playerID, ok := parsePlayerID(c, dto.PlayerID)
+	if !ok {
+		return
+	}
+	// parseAmount is the same decimal-string parser every money field uses, so a
+	// limit and the stake it bounds are parsed by identical rules.
+	amount, ok := parseAmount(c, dto.Amount)
+	if !ok {
+		return
+	}
+
+	operatorCode := OperatorCodeFromContext(c.Request.Context())
+	ctx, span := telemetry.StartSpan(c.Request.Context(), "http.player_limit",
+		attribute.String("operator_code", operatorCode),
+		attribute.String("player_id", playerID.String()),
+		attribute.String("limit_kind", dto.Kind),
+		attribute.String("period", dto.Period))
+
+	result, err := h.casino.ProcessSetPlayerLimit(ctx, repository.SetPlayerLimitRequest{
+		OperatorCode: operatorCode,
+		PlayerID:     playerID,
+		Kind:         dto.Kind,
+		Period:       dto.Period,
+		Amount:       amount,
+		ActorType:    dto.ActorType,
+		ActorRef:     dto.ActorRef,
+	})
+	telemetry.EndSpan(span, err)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, setPlayerLimitResponse{Code: errors.CodeOK, Result: result})
 }
 
 // parseOptionalAmount parses a money string that may be empty. An empty/omitted

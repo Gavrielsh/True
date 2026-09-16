@@ -64,10 +64,14 @@ func TestAssertTransitionAllowed_Matrix(t *testing.T) {
 			StatusClosed:       nil,
 		},
 		StatusSelfExcluded: {
-			StatusKYCPending:   nil, // term expired, so no longer protected
-			StatusActive:       nil,
-			StatusSuspended:    nil,
-			StatusSelfExcluded: errs.ErrStatusUnchanged,
+			StatusKYCPending: nil, // term expired, so no longer protected
+			StatusActive:     nil,
+			StatusSuspended:  nil,
+			// The one permitted same-status pair: a player extending their own
+			// exclusion. Permitted HERE only in the sense that it is not a
+			// no-op — whether it actually extends anything is
+			// assertSelfExclusionExtends' decision, tested below.
+			StatusSelfExcluded: nil,
 			StatusClosed:       nil,
 		},
 		StatusClosed: {
@@ -170,6 +174,71 @@ func TestAssertTransitionAllowed_NilTermFailsClosed(t *testing.T) {
 	err := assertTransitionAllowed(StatusSelfExcluded, StatusActive, nil, testNow)
 	if !errors.Is(err, errs.ErrSelfExclusionActive) {
 		t.Errorf("a SELF_EXCLUDED row with no term must fail closed: got %v", err)
+	}
+}
+
+// TestAssertSelfExclusionExtends covers the gap A2 shipped with: a self-excluded
+// player could not ask for longer.
+//
+// The rule that matters is the second case. A player 170 days into a 180-day
+// term who requests "180 days" is asking for a term that ends SOONER than the
+// one they are serving — a lift dressed as an extension. A floor check alone
+// would wave it through, because 180 days clears the 180-day minimum.
+func TestAssertSelfExclusionExtends(t *testing.T) {
+	t.Parallel()
+
+	current := at(10 * 24 * time.Hour) // 10 days left to serve
+
+	cases := []struct {
+		name     string
+		from, to string
+		current  *time.Time
+		newUntil time.Time
+		wantErr  error
+	}{
+		{
+			"a longer term extends",
+			StatusSelfExcluded, StatusSelfExcluded, current,
+			testNow.Add(MinSelfExclusionTerm), nil,
+		},
+		{
+			"one nanosecond longer still extends",
+			StatusSelfExcluded, StatusSelfExcluded, current,
+			current.Add(time.Nanosecond), nil,
+		},
+		{
+			"an identical term is not an extension",
+			StatusSelfExcluded, StatusSelfExcluded, current,
+			*current, errs.ErrSelfExclusionNotExtended,
+		},
+		{
+			"a shorter term is a lift in disguise",
+			StatusSelfExcluded, StatusSelfExcluded, current,
+			current.Add(-24 * time.Hour), errs.ErrSelfExclusionNotExtended,
+		},
+		{
+			"no recorded term fails closed",
+			StatusSelfExcluded, StatusSelfExcluded, nil,
+			testNow.Add(MinSelfExclusionTerm), errs.ErrSelfExclusionActive,
+		},
+		{
+			// A first exclusion is not an extension and this rule must not fire.
+			"entering a self-exclusion is unaffected",
+			StatusActive, StatusSelfExcluded, nil,
+			testNow.Add(MinSelfExclusionTerm), nil,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := assertSelfExclusionExtends(c.from, c.to, c.current, c.newUntil)
+			switch {
+			case c.wantErr == nil && err != nil:
+				t.Errorf("got %v, want nil", err)
+			case c.wantErr != nil && !errors.Is(err, c.wantErr):
+				t.Errorf("got %v, want %v", err, c.wantErr)
+			}
+		})
 	}
 }
 

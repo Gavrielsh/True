@@ -284,6 +284,9 @@ func (e *engine) processStatusTransitionTx(ctx context.Context, req StatusTransi
 	if req.ToStatus == StatusSelfExcluded {
 		u := now.Add(time.Duration(req.SelfExclusionDays) * 24 * time.Hour).UTC()
 		newUntil = &u
+		if err := assertSelfExclusionExtends(fromStatus, req.ToStatus, currentUntil, u); err != nil {
+			return StatusTransitionResult{}, err
+		}
 	}
 
 	tag, err := tx.Exec(ctx, sqlUpdatePlayerStatus, req.PlayerID, req.ToStatus, newUntil)
@@ -352,6 +355,17 @@ func (e *engine) processStatusTransitionTx(ctx context.Context, req StatusTransi
 // because they are pending KYC is a system operators route around.
 func assertTransitionAllowed(from, to string, currentUntil *time.Time, now time.Time) error {
 	if from == to {
+		// The ONE same-status case that is a real event: a self-excluded player
+		// asking for LONGER.
+		//
+		// A2 shipped without this and it was the wrong way round — a player
+		// could shorten their protection (by waiting the term out) but never
+		// deepen it. Whether the request actually extends anything is decided by
+		// assertSelfExclusionExtends, which needs the requested term and so runs
+		// after this; here it is enough that the case is not a no-op.
+		if to == StatusSelfExcluded {
+			return nil
+		}
 		return fmt.Errorf("%w: already %s", errs.ErrStatusUnchanged, to)
 	}
 
@@ -426,6 +440,33 @@ func assertSelfExclusionTerm(to string, days int) error {
 	if days > maxSelfExclusionDays {
 		return fmt.Errorf("%w: %d days is implausible (maximum %d); a permanent decision is %s",
 			errs.ErrInvalidAmount, days, maxSelfExclusionDays, StatusClosed)
+	}
+	return nil
+}
+
+// assertSelfExclusionExtends guards the one same-status transition that is
+// permitted: an extension must genuinely extend.
+//
+// Without this, "extend my exclusion" is a lift with extra steps — a player
+// 170 days into a 180-day term could ask for a fresh 180 days and, if the check
+// only looked at the floor, a term ENDING SOONER than the one they were serving
+// would be accepted whenever the remaining term exceeded the minimum. The new
+// expiry must therefore be strictly later than the one in force, compared on the
+// same database clock everything else here uses.
+func assertSelfExclusionExtends(from, to string, currentUntil *time.Time, newUntil time.Time) error {
+	if from != StatusSelfExcluded || to != StatusSelfExcluded {
+		return nil
+	}
+	// No recorded term: fail closed rather than treat the absence as "anything
+	// extends it". 000010's constraint makes this row shape impossible going
+	// forward; the rule does not depend on that having been applied.
+	if currentUntil == nil {
+		return fmt.Errorf("%w: no term recorded to extend", errs.ErrSelfExclusionActive)
+	}
+	if !newUntil.After(*currentUntil) {
+		return fmt.Errorf("%w: requested term ends %s, current term runs to %s",
+			errs.ErrSelfExclusionNotExtended,
+			newUntil.UTC().Format(time.RFC3339), currentUntil.UTC().Format(time.RFC3339))
 	}
 	return nil
 }

@@ -62,9 +62,17 @@ func httpStatusFor(code errors.Code) int {
 		// codes. Zone 2 reads this as "already applied" when replaying a
 		// transition, so a retried compliance action is safe rather than noisy.
 		return http.StatusConflict
+	case errors.CodeLimitExceeded:
+		// 403, alongside CodePlayerNotActive: the request is well-formed and the
+		// funds exist, but this player may not make it. A retry of the identical
+		// wager is refused identically until the period rolls over — it is a
+		// permission answer, not a balance answer, and must never be mistaken
+		// for INSUFFICIENT_FUNDS by a client deciding what to show.
+		return http.StatusForbidden
 	case errors.CodeStatusTransitionInvalid,
 		errors.CodeSelfExclusionActive,
-		errors.CodeSelfExclusionTooShort:
+		errors.CodeSelfExclusionTooShort,
+		errors.CodeSelfExclusionNotExtended:
 		// 422 like CodeWinExceedsCeiling: the request is well-formed and was
 		// refused by policy. Retrying the identical request never helps — an
 		// illegal move stays illegal, and an active exclusion is not waited out
@@ -150,6 +158,10 @@ func publicMessageFor(code errors.Code) string {
 		return "self-exclusion is in force and cannot be lifted"
 	case errors.CodeSelfExclusionTooShort:
 		return "self-exclusion term is below the permitted minimum"
+	case errors.CodeSelfExclusionNotExtended:
+		return "a self-exclusion may be extended, never shortened"
+	case errors.CodeLimitExceeded:
+		return "the wager exceeds a limit set on this account"
 	default:
 		return "internal error"
 	}

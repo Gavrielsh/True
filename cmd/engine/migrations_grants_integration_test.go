@@ -77,6 +77,17 @@ var wantGrants = map[string][]string{
 	// status can move, but never without leaving a record that cannot be
 	// revised afterwards.
 	"player_status_transitions": {"INSERT", "SELECT"},
+	// player_limits (000011): SELECT to evaluate, INSERT and UPDATE to set and
+	// revise. NO DELETE — a limit is removed by raising it, which serves the
+	// 24-hour cooling-off period, never by deleting the row and skipping the wait.
+	"player_limits": {"INSERT", "SELECT", "UPDATE"},
+	// player_limit_usage: the running total, read and moved on the wager path.
+	// No DELETE: expired period buckets are retention-pruned by maintenance, so
+	// the wager path cannot make today's spend disappear.
+	"player_limit_usage": {"INSERT", "SELECT", "UPDATE"},
+	// player_limit_changes: the evidence the cooling-off period was served.
+	// Append-only like every other audit table here.
+	"player_limit_changes": {"INSERT", "SELECT"},
 }
 
 func integrationURL(t *testing.T) string {
@@ -167,7 +178,10 @@ func TestLedgerGrants_ForbiddenPrivilegesNeverGranted(t *testing.T) {
 	// ledger is — it is the evidence file for self-exclusion and for operator and
 	// regulator actions — so the prohibition is stated for it here too, not left
 	// to wantGrants alone.
-	for _, table := range []string{"ledger_entries", "ledger_transactions", "player_status_transitions"} {
+	for _, table := range []string{
+		"ledger_entries", "ledger_transactions",
+		"player_status_transitions", "player_limit_changes",
+	} {
 		for _, priv := range []string{"UPDATE", "DELETE", "TRUNCATE"} {
 			var n int
 			if err := conn.QueryRow(ctx, `

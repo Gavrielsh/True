@@ -193,6 +193,39 @@ func expectPlayerStatus(mock pgxmock.PgxPoolIface, playerID uuid.UUID, status st
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow(status))
 }
 
+// Player limits (000011) added two statements to the wagering paths. They are
+// expected explicitly rather than folded into expectPlayerStatus, because the
+// two paths differ: a BET is CHECKED against limits and a WIN is not — a win is
+// credited whatever the caps say, since refusing money a player has already won
+// would be taking it rather than protecting them.
+var (
+	rxSelectPlayerLimits = `FROM player_limits`
+	rxUpsertLimitUsage   = `INSERT INTO player_limit_usage`
+)
+
+// expectNoPlayerLimits registers the limits lookup enforceWagerLimits runs right
+// after the status guard, returning no rows — a player who has set none.
+func expectNoPlayerLimits(mock pgxmock.PgxPoolIface, playerID uuid.UUID) {
+	mock.ExpectQuery(rxSelectPlayerLimits).
+		WithArgs(playerID, pgxmock.AnyArg()).
+		WillReturnRows(pgxmock.NewRows([]string{"limit_kind", "period", "effective_amount", "used"}))
+}
+
+// expectLimitUsage registers one usage upsert. The statement is driven by a
+// SELECT over player_limits, so for a player with no limits it legitimately
+// affects zero rows.
+func expectLimitUsage(mock pgxmock.PgxPoolIface, playerID uuid.UUID, kind string) {
+	mock.ExpectExec(rxUpsertLimitUsage).
+		WithArgs(playerID, kind, pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 0))
+}
+
+// expectWagerUsage registers both counters a settled wager moves.
+func expectWagerUsage(mock pgxmock.PgxPoolIface, playerID uuid.UUID) {
+	expectLimitUsage(mock, playerID, LimitWager)
+	expectLimitUsage(mock, playerID, LimitLoss)
+}
+
 // ----------------------------------------------------------------------------
 // Happy path: GC bet (single debit, no SC split)
 // ----------------------------------------------------------------------------
@@ -208,6 +241,7 @@ func TestProcessBet_GC_HappyPath(t *testing.T) {
 		WithArgs(playerID).
 		WillReturnRows(walletRows("100.0000", "0.0000", "0.0000"))
 	expectPlayerStatus(mock, playerID, "ACTIVE")
+	expectNoPlayerLimits(mock, playerID)
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("90.0000"), dec("0.0000"), dec("0.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
@@ -226,6 +260,7 @@ func TestProcessBet_GC_HappyPath(t *testing.T) {
 	mock.ExpectExec(rxInsertLedgerEntry).
 		WithArgs(ledgerTxID, nil, "HOUSE_BET_POOL", "GC", "CREDIT", dec("10.0000"), nil).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	expectWagerUsage(mock, playerID)
 	mock.ExpectCommit()
 
 	got, err := e.ProcessBet(context.Background(), BetRequest{
@@ -278,6 +313,7 @@ func TestProcessBet_SC_SplitsUnplayedThenRedeemable(t *testing.T) {
 		WithArgs(playerID).
 		WillReturnRows(walletRows("0.0000", "30.0000", "100.0000"))
 	expectPlayerStatus(mock, playerID, "ACTIVE")
+	expectNoPlayerLimits(mock, playerID)
 	// Post-state: 0/0/80 — debit 30 from unplayed, 20 from redeemable.
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("0.0000"), dec("0.0000"), dec("80.0000"), playerID).
@@ -303,6 +339,7 @@ func TestProcessBet_SC_SplitsUnplayedThenRedeemable(t *testing.T) {
 	mock.ExpectExec(rxInsertLedgerEntry).
 		WithArgs(ledgerTxID, nil, "HOUSE_BET_POOL", "SC_REDEEMABLE", "CREDIT", dec("20.0000"), nil).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	expectWagerUsage(mock, playerID)
 	mock.ExpectCommit()
 
 	got, err := e.ProcessBet(context.Background(), BetRequest{
@@ -354,6 +391,7 @@ func TestProcessWin_SC_AlwaysRoutesToRedeemable(t *testing.T) {
 	mock.ExpectExec(rxInsertLedgerEntry).
 		WithArgs(ledgerTxID, nil, "HOUSE_WIN_POOL", "SC_REDEEMABLE", "DEBIT", dec("7.0000"), nil).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	expectLimitUsage(mock, playerID, LimitLoss)
 	mock.ExpectCommit()
 
 	got, err := e.ProcessWin(context.Background(), WinRequest{
@@ -390,6 +428,7 @@ func TestProcessBet_InsufficientFunds_ReleasesLockAndRollsBack(t *testing.T) {
 		WithArgs(playerID).
 		WillReturnRows(walletRows("5.0000", "0.0000", "0.0000"))
 	expectPlayerStatus(mock, playerID, "ACTIVE")
+	expectNoPlayerLimits(mock, playerID)
 	// No UPDATE, no INSERTs — the allocator rejects before any mutating SQL.
 	mock.ExpectRollback()
 
@@ -527,6 +566,7 @@ func TestProcessBet_GhostSpinRecovery_OnUniqueViolation(t *testing.T) {
 		WithArgs(playerID).
 		WillReturnRows(walletRows("90.0000", "0.0000", "0.0000")) // post-state of original commit
 	expectPlayerStatus(mock, playerID, "ACTIVE")
+	expectNoPlayerLimits(mock, playerID)
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("80.0000"), dec("0.0000"), dec("0.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
@@ -600,6 +640,7 @@ func TestProcessBet_GhostSpin_RejectsTxIDReuseAcrossPlayers(t *testing.T) {
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerA).
 		WillReturnRows(walletRows("100.0000", "0.0000", "0.0000"))
 	expectPlayerStatus(mock, playerA, "ACTIVE")
+	expectNoPlayerLimits(mock, playerA)
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("90.0000"), dec("0.0000"), dec("0.0000"), playerA).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
@@ -947,6 +988,7 @@ func TestProcessBet_CommitFails(t *testing.T) {
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("100.0000", "0.0000", "0.0000"))
 	expectPlayerStatus(mock, playerID, "ACTIVE")
+	expectNoPlayerLimits(mock, playerID)
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("90.0000"), dec("0.0000"), dec("0.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
@@ -962,6 +1004,7 @@ func TestProcessBet_CommitFails(t *testing.T) {
 	mock.ExpectExec(rxInsertLedgerEntry).
 		WithArgs(ledgerTxID, nil, "HOUSE_BET_POOL", "GC", "CREDIT", dec("10.0000"), nil).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	expectWagerUsage(mock, playerID)
 	mock.ExpectCommit().WillReturnError(errors.New("commit failed"))
 
 	_, err := e.ProcessBet(context.Background(), BetRequest{
@@ -987,6 +1030,7 @@ func TestProcessBet_UpdateZeroRowsAffected_FailsClosed(t *testing.T) {
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("100.0000", "0.0000", "0.0000"))
 	expectPlayerStatus(mock, playerID, "ACTIVE")
+	expectNoPlayerLimits(mock, playerID)
 	// UPDATE returns 0 rows: schema corruption / bad routing — engine must reject.
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("90.0000"), dec("0.0000"), dec("0.0000"), playerID).
@@ -1010,6 +1054,7 @@ func TestProcessBet_GhostSpin_LedgerLookupMisses(t *testing.T) {
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("100.0000", "0.0000", "0.0000"))
 	expectPlayerStatus(mock, playerID, "ACTIVE")
+	expectNoPlayerLimits(mock, playerID)
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("90.0000"), dec("0.0000"), dec("0.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
@@ -1337,9 +1382,12 @@ func TestProcessBet_PlayerStatusGuard(t *testing.T) {
 				WillReturnRows(walletRows("100.0000", "0.0000", "0.0000"))
 			expectPlayerStatus(mock, playerID, tc.status)
 			if tc.blocked {
-				// Guard aborts BEFORE any UPDATE/INSERT — only the rollback follows.
+				// Guard aborts BEFORE any UPDATE/INSERT — and before the limits
+				// lookup, which is the correct order: a player who may not
+				// transact at all is refused without consulting their caps.
 				mock.ExpectRollback()
 			} else {
+				expectNoPlayerLimits(mock, playerID)
 				mock.ExpectExec(rxUpdateWallet).
 					WithArgs(dec("90.0000"), dec("0.0000"), dec("0.0000"), playerID).
 					WillReturnResult(pgxmock.NewResult("UPDATE", 1))
@@ -1355,6 +1403,7 @@ func TestProcessBet_PlayerStatusGuard(t *testing.T) {
 				mock.ExpectExec(rxInsertLedgerEntry).
 					WithArgs(ledgerTxID, nil, "HOUSE_BET_POOL", "GC", "CREDIT", dec("10.0000"), nil).
 					WillReturnResult(pgxmock.NewResult("INSERT", 1))
+				expectWagerUsage(mock, playerID)
 				mock.ExpectCommit()
 			}
 

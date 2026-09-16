@@ -20,10 +20,12 @@ type fakeCasino struct {
 	purchase func(context.Context, repository.PurchaseRequest) (repository.TxResult, error)
 	redeem   func(context.Context, repository.RedeemRequest) (repository.TxResult, error)
 	status   func(context.Context, repository.StatusTransitionRequest) (repository.StatusTransitionResult, error)
+	setLimit func(context.Context, repository.SetPlayerLimitRequest) (repository.SetPlayerLimitResult, error)
 
 	lastPurchase repository.PurchaseRequest
 	lastRedeem   repository.RedeemRequest
 	lastStatus   repository.StatusTransitionRequest
+	lastLimit    repository.SetPlayerLimitRequest
 }
 
 func (f *fakeCasino) CreatePlayer(ctx context.Context, req repository.CreatePlayerRequest) (repository.CreatePlayerResult, error) {
@@ -41,6 +43,10 @@ func (f *fakeCasino) ProcessStatusTransition(ctx context.Context, req repository
 	f.lastStatus = req
 	return f.status(ctx, req)
 }
+func (f *fakeCasino) ProcessSetPlayerLimit(ctx context.Context, req repository.SetPlayerLimitRequest) (repository.SetPlayerLimitResult, error) {
+	f.lastLimit = req
+	return f.setLimit(ctx, req)
+}
 
 // casinoRouter mounts the casino handlers behind a stub middleware that injects
 // a verified operator code (simulating a successful HMAC pass).
@@ -57,6 +63,7 @@ func casinoRouter(c repository.CasinoEngine) *gin.Engine {
 	g.POST("/store/purchase", h.Purchase)
 	g.POST("/store/redeem", h.Redeem)
 	g.POST("/player/status", h.UpdateStatus)
+	g.POST("/player/limits", h.SetPlayerLimit)
 	return r
 }
 
@@ -364,5 +371,143 @@ func TestUpdateStatusHandler_RejectsMalformedRequests(t *testing.T) {
 				t.Error("a malformed request reached the engine")
 			}
 		})
+	}
+}
+
+// ----------------------------------------------------------------------------
+// player/limits
+// ----------------------------------------------------------------------------
+
+func TestSetPlayerLimitHandler_HappyPath(t *testing.T) {
+	t.Parallel()
+	playerID := uuid.New()
+	eng := &fakeCasino{setLimit: func(_ context.Context, req repository.SetPlayerLimitRequest) (repository.SetPlayerLimitResult, error) {
+		return repository.SetPlayerLimitResult{
+			PlayerID: req.PlayerID, ChangeID: uuid.New(),
+			Kind: req.Kind, Period: req.Period,
+			Direction: "DECREASE", Amount: req.Amount,
+		}, nil
+	}}
+	r := casinoRouter(eng)
+	body := `{"player_id":"` + playerID.String() + `","limit_kind":"LOSS","period":"DAILY",` +
+		`"amount":"25.5000","actor_type":"PLAYER","actor_ref":"rg-page"}`
+	w := doJSON(r, http.MethodPost, "/api/v1/player/limits", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	got := eng.lastLimit
+	if got.OperatorCode != "OP1" {
+		t.Errorf("operator_code = %q, want OP1 (from the verified HMAC context)", got.OperatorCode)
+	}
+	if got.PlayerID != playerID || got.Kind != "LOSS" || got.Period != "DAILY" {
+		t.Errorf("request = %+v", got)
+	}
+	// The limit must arrive as an exact decimal. A float round-trip here would
+	// silently shift the cap that decides whether a player may wager.
+	if got.Amount.String() != "25.5000" {
+		t.Errorf("amount = %s, want 25.5000", got.Amount)
+	}
+	if got.ActorType != "PLAYER" || got.ActorRef != "rg-page" {
+		t.Errorf("actor = %q/%q", got.ActorType, got.ActorRef)
+	}
+}
+
+// TestSetPlayerLimitHandler_IncreaseReportsWhatIsActuallyInForce guards the
+// field a client is most likely to render wrongly: during a cooling-off period
+// `amount` is the OLD cap, and `pending_amount` is what the player asked for. A
+// UI that showed the pending value would tell a player they have headroom they
+// do not have.
+func TestSetPlayerLimitHandler_IncreaseReportsWhatIsActuallyInForce(t *testing.T) {
+	t.Parallel()
+	effectiveAt := time.Now().UTC().Add(repository.LimitIncreaseCoolOff)
+	pending := mustMoney(t, "500.0000")
+	eng := &fakeCasino{setLimit: func(_ context.Context, req repository.SetPlayerLimitRequest) (repository.SetPlayerLimitResult, error) {
+		return repository.SetPlayerLimitResult{
+			PlayerID: req.PlayerID, ChangeID: uuid.New(),
+			Kind: req.Kind, Period: req.Period, Direction: "INCREASE",
+			Amount:        mustMoney(t, "10.0000"),
+			PendingAmount: &pending,
+			EffectiveAt:   &effectiveAt,
+		}, nil
+	}}
+	r := casinoRouter(eng)
+	body := `{"player_id":"` + uuid.New().String() + `","limit_kind":"WAGER","period":"DAILY",` +
+		`"amount":"500.0000","actor_type":"PLAYER"}`
+	w := doJSON(r, http.MethodPost, "/api/v1/player/limits", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	var resp setPlayerLimitResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Result.Amount.String() != "10.0000" {
+		t.Errorf("amount = %s, want the cap actually in force (10.0000)", resp.Result.Amount)
+	}
+	if resp.Result.PendingAmount == nil || resp.Result.PendingAmount.String() != "500.0000" {
+		t.Errorf("pending_amount = %v, want 500.0000", resp.Result.PendingAmount)
+	}
+	if resp.Result.EffectiveAt == nil {
+		t.Error("an increase must report when it becomes effective")
+	}
+}
+
+func TestSetPlayerLimitHandler_ErrorMapping(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantCode   errs.Code
+	}{
+		{"already at that value", errs.ErrStatusUnchanged, http.StatusConflict, errs.CodeStatusUnchanged},
+		{"unknown player", errs.ErrPlayerNotFound, http.StatusNotFound, errs.CodePlayerNotFound},
+		{"player not active", errs.ErrPlayerNotActive, http.StatusForbidden, errs.CodePlayerNotActive},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			eng := &fakeCasino{setLimit: func(_ context.Context, _ repository.SetPlayerLimitRequest) (repository.SetPlayerLimitResult, error) {
+				return repository.SetPlayerLimitResult{}, c.err
+			}}
+			body := `{"player_id":"` + uuid.New().String() + `","limit_kind":"LOSS","period":"DAILY",` +
+				`"amount":"10.0000","actor_type":"PLAYER"}`
+			w := doJSON(casinoRouter(eng), http.MethodPost, "/api/v1/player/limits", body)
+			if w.Code != c.wantStatus {
+				t.Errorf("status: got %d want %d", w.Code, c.wantStatus)
+			}
+			if got := decodeErr(t, w).Code; got != c.wantCode {
+				t.Errorf("code: got %s want %s", got, c.wantCode)
+			}
+		})
+	}
+}
+
+// TestLimitExceededIsNotInsufficientFunds pins the distinction a client acts on.
+//
+// The money IS there — the player asked us not to let them spend it. Mapping
+// this to INSUFFICIENT_FUNDS would have the UI tell a player to top up, which is
+// the exact opposite of what a limit is for.
+func TestLimitExceededIsNotInsufficientFunds(t *testing.T) {
+	t.Parallel()
+	eng := &fakeEngine{bet: func(_ context.Context, _ repository.BetRequest) (repository.TxResult, error) {
+		return repository.TxResult{}, errs.ErrLimitExceeded
+	}}
+	r := handlerRouter(eng)
+	body := `{"operator_transaction_id":"lim-1","player_id":"` + uuid.New().String() +
+		`","currency":"SC","amount":"10.0000"}`
+	w := doJSON(r, http.MethodPost, "/api/v1/bet", body)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("status: got %d want 403; body=%s", w.Code, w.Body.String())
+	}
+	got := decodeErr(t, w).Code
+	if got == errs.CodeInsufficientFunds {
+		t.Fatal("a limit refusal was reported as INSUFFICIENT_FUNDS; the client would tell the player to top up")
+	}
+	if got != errs.CodeLimitExceeded {
+		t.Errorf("code: got %s want %s", got, errs.CodeLimitExceeded)
 	}
 }

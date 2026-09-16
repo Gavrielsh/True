@@ -218,6 +218,13 @@ func (e *engine) processBetTx(ctx context.Context, req BetRequest) (result TxRes
 		return TxResult{}, err
 	}
 
+	// 1c. Player limits, on the same tx handle and for the same reason: the
+	//     check and the consumption must be one serialized observation. See
+	//     limits.go.
+	if err := enforceWagerLimits(ctx, tx, req.PlayerID, req.Amount); err != nil {
+		return TxResult{}, err
+	}
+
 	// 2. Pure domain math — runs entirely in CPU, no I/O. The lock window
 	//    therefore stays bounded by the surrounding SQL roundtrips, not by
 	//    any allocator or formatting code.
@@ -271,6 +278,13 @@ func (e *engine) processBetTx(ctx context.Context, req BetRequest) (result TxRes
 		if err := insertHouseEntry(ctx, tx, ledgerTxID, "HOUSE_BET_POOL", d.Currency, "CREDIT", d.Amount); err != nil {
 			return TxResult{}, err
 		}
+	}
+
+	// 5b. Record what the wager consumed, still inside the lock. On this path
+	//     the stake counts as a full loss: the WIN (if any) arrives as a
+	//     SEPARATE transaction and gives the loss headroom back then.
+	if err := recordWagerUsage(ctx, tx, req.PlayerID, req.Amount, req.Amount); err != nil {
+		return TxResult{}, err
 	}
 
 	// 6. COMMIT — releases the FOR UPDATE lock and durably persists everything.
@@ -391,6 +405,17 @@ func (e *engine) processWinTx(ctx context.Context, req WinRequest) (result TxRes
 		return TxResult{}, err
 	}
 	if err := insertHouseEntry(ctx, tx, ledgerTxID, "HOUSE_WIN_POOL", credit.Credit.Currency, "DEBIT", credit.Credit.Amount); err != nil {
+		return TxResult{}, err
+	}
+
+	// A win REDUCES net loss for the period — the negative delta that makes a
+	// LOSS limit measure net rather than turnover. WAGER is untouched: the
+	// stake was counted when the bet settled, and a win is not a wager.
+	//
+	// No limit CHECK on this path, deliberately. Refusing to credit a win a
+	// player has already earned because it would breach a cap would be taking
+	// their money, not protecting them; limits bind what a player may STAKE.
+	if err := addLimitUsage(ctx, tx, req.PlayerID, LimitLoss, req.Amount.Decimal().Neg()); err != nil {
 		return TxResult{}, err
 	}
 

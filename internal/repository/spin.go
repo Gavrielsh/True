@@ -252,6 +252,15 @@ func (g *gameEngine) settleSpinTx(
 		return SpinResult{}, fmt.Errorf("%w: player status is %s", errs.ErrPlayerNotActive, status)
 	}
 
+	// ── Player limits, INSIDE the lock ───────────────────────────────────────
+	// Read and decided on this tx handle, so twenty concurrent spins serialize
+	// on the wallet row and each one sees the total the previous committed.
+	// Outside the lock they would all read the same stale total and all pass.
+	// See limits.go.
+	if err := enforceWagerLimits(ctx, tx, req.PlayerID, req.BetAmount); err != nil {
+		return SpinResult{}, err
+	}
+
 	// ── Pure domain math — UNCHANGED, still the only place money is computed ──
 	// No I/O between these calls; the allocators run in microseconds on values
 	// already in hand.
@@ -309,6 +318,14 @@ func (g *gameEngine) settleSpinTx(
 		return SpinResult{}, fmt.Errorf("settle spin: %w", err)
 	}
 	span.SetAttributes(attribute.String("bet_ledger_transaction_id", betLedgerID.String()))
+
+	// ── Record what the round consumed, still inside the lock ────────────────
+	// After the settlement, so a round that fails to settle consumes nothing.
+	// The LOSS delta is the NET — stake less return — which is negative on a
+	// winning round and correctly gives the headroom back.
+	if err := recordWagerUsage(ctx, tx, req.PlayerID, req.BetAmount, req.BetAmount.Sub(winAmount)); err != nil {
+		return SpinResult{}, err
+	}
 
 	var winLedgerIDPtr *uuid.UUID
 	if hasWin {

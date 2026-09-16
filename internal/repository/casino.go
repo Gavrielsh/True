@@ -64,6 +64,11 @@ type CasinoEngine interface {
 	// settling wager, and refuses to lift a self-exclusion before its term
 	// expires. See status.go.
 	ProcessStatusTransition(ctx context.Context, req StatusTransitionRequest) (StatusTransitionResult, error)
+
+	// ProcessSetPlayerLimit sets or revises a player-set wagering limit,
+	// applying the cooling-off asymmetry: a decrease takes effect immediately, an
+	// increase only after LimitIncreaseCoolOff. See limits.go.
+	ProcessSetPlayerLimit(ctx context.Context, req SetPlayerLimitRequest) (SetPlayerLimitResult, error)
 }
 
 // NewCasino builds the casino wrapper from the same dependencies as New. The

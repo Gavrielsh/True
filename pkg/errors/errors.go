@@ -65,6 +65,15 @@ var (
 	// minimum. Named separately from generic validation because the caller must
 	// be told WHICH rule to satisfy in order to resubmit.
 	ErrSelfExclusionTooShort = stderrors.New("self-exclusion term is below the minimum")
+	// ErrSelfExclusionNotExtended: a self-excluded player asked to change their
+	// term to one that does not extend it. Refused as an attempt to shorten an
+	// exclusion, which is the same act as lifting it early.
+	ErrSelfExclusionNotExtended = stderrors.New("self-exclusion term must be extended, not shortened")
+
+	// ErrLimitExceeded: the wager would take the player past a limit they set
+	// themselves. Distinct from ErrInsufficientFunds — the money is there, and
+	// the player asked us not to let them spend it.
+	ErrLimitExceeded = stderrors.New("player limit exceeded")
 )
 
 // Code is the stable identifier surfaced to operators (e.g. in webhook
@@ -89,10 +98,12 @@ const (
 	CodeIdempotencyMismatch Code = "IDEMPOTENCY_KEY_REUSED"
 	CodeWinExceedsCeiling   Code = "WIN_EXCEEDS_CEILING"
 
-	CodeStatusUnchanged         Code = "STATUS_UNCHANGED"
-	CodeStatusTransitionInvalid Code = "STATUS_TRANSITION_INVALID"
-	CodeSelfExclusionActive     Code = "SELF_EXCLUSION_ACTIVE"
-	CodeSelfExclusionTooShort   Code = "SELF_EXCLUSION_TOO_SHORT"
+	CodeStatusUnchanged          Code = "STATUS_UNCHANGED"
+	CodeStatusTransitionInvalid  Code = "STATUS_TRANSITION_INVALID"
+	CodeSelfExclusionActive      Code = "SELF_EXCLUSION_ACTIVE"
+	CodeSelfExclusionTooShort    Code = "SELF_EXCLUSION_TOO_SHORT"
+	CodeSelfExclusionNotExtended Code = "SELF_EXCLUSION_NOT_EXTENDED"
+	CodeLimitExceeded            Code = "PLAYER_LIMIT_EXCEEDED"
 	// CodeGeoBlocked is returned by the jurisdiction fence (no sentinel error:
 	// the middleware rejects before any domain call).
 	CodeGeoBlocked Code = "GEO_BLOCKED"
@@ -141,6 +152,10 @@ func CodeFor(err error) Code {
 		return CodeSelfExclusionActive
 	case stderrors.Is(err, ErrSelfExclusionTooShort):
 		return CodeSelfExclusionTooShort
+	case stderrors.Is(err, ErrSelfExclusionNotExtended):
+		return CodeSelfExclusionNotExtended
+	case stderrors.Is(err, ErrLimitExceeded):
+		return CodeLimitExceeded
 	default:
 		return CodeInternal
 	}

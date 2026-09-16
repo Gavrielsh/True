@@ -157,6 +157,9 @@ func NewRouter(cfg Config) *gin.Engine {
 			// only the jurisdiction check is omitted, and only because a
 			// protective action must never be geo-denied.
 			compliance.POST("/player/status", casino.UpdateStatus)
+			// Player-set wagering limits, unfenced for the same reason: lowering
+			// a limit is a protective act.
+			compliance.POST("/player/limits", casino.SetPlayerLimit)
 		}
 	}
 
