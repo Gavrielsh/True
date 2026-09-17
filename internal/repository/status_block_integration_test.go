@@ -43,6 +43,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -209,28 +210,58 @@ func TestIntegration_BlockedStatusRefusesEveryMoneyPath(t *testing.T) {
 // TestIntegration_BlockTakesHoldUnderConcurrentTraffic is the race the
 // sequential matrix cannot see.
 //
-// Thirty spins are fired at a player while a blocking transition commits into
-// the middle of them. Both contend for the same wallet row, so every spin lands
-// strictly before or strictly after the block — never inside it.
+// Traffic runs continuously at a player while a blocking transition commits
+// into the middle of it. Both contend for the same wallet row, so every spin
+// lands strictly before or strictly after the block — never inside it.
 //
 // Three things are asserted, and the third is the one that would catch a real
 // defect: that the wallet moved by EXACTLY the value of the spins that
 // succeeded. A spin that settled money and then reported an error, or one
 // refused after its debit, would balance the first two assertions and break this
 // one.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// WHY THE RACE IS DRIVEN BY SIGNALS AND NOT BY SLEEPS
+// ─────────────────────────────────────────────────────────────────────────────
+// The obvious shape — fire a fixed burst of spins, sleep a third of the way in,
+// then block — is not a test. It is a bet on the relative speed of a goroutine
+// timer and a Postgres transaction, and the bet is lost on a loaded runner: this
+// suite's earlier form failed in CI with all thirty spins settled and none
+// blocked, which proves nothing about ordering either way.
+//
+// So nothing here is timed. Workers spin in a LOOP until told to stop, and the
+// test advances only on evidence:
+//
+//	phase 1  wait until a spin has actually COMMITTED   → traffic is in flight
+//	phase 2  commit the block while the loop is running → the block is mid-stream
+//	phase 3  wait until a spin has actually been REFUSED → the block took hold
+//
+// Each phase's precondition is established by the previous one, so both halves
+// of the assertion are guaranteed by construction rather than by scheduling
+// luck. The caps below exist only so a genuine defect fails the run instead of
+// hanging it.
 func TestIntegration_BlockTakesHoldUnderConcurrentTraffic(t *testing.T) {
 	for _, status := range blockedStatuses {
 		t.Run(status, func(t *testing.T) {
 			pool := integrationPool(t)
 			casino := newIntegrationCasino(pool)
-			game := newIntegrationGame(pool)
 
-			playerID := seedPlayer(t, pool, "1000.0000")
+			// Seeded far above what the loop can spend: an insufficient-funds
+			// error mid-run would be reported as an unexpected error and mask
+			// the property under test.
+			playerID := seedPlayer(t, pool, "5000.0000")
 			before := walletTotal(t, pool, playerID)
 
 			const (
-				concurrency = 30
-				stake       = "1.0000"
+				workers = 4
+				stake   = "1.0000"
+				// maxAttempts bounds the loop so a block that never takes hold
+				// fails the test rather than spinning the wallet to zero. Spins
+				// serialize on the wallet row, so this is seconds of traffic —
+				// orders of magnitude more than one transition needs.
+				maxAttempts = 2000
+				// deadline is the liveness backstop for a wedged lock.
+				deadline = 60 * time.Second
 			)
 
 			var (
@@ -239,79 +270,110 @@ func TestIntegration_BlockTakesHoldUnderConcurrentTraffic(t *testing.T) {
 				settled  int
 				blocked  int
 				otherErr []error
+				attempts atomic.Int64
+
+				settledOnce   sync.Once
+				blockedOnce   sync.Once
+				exhaustedOnce sync.Once
 			)
-			start := make(chan struct{})
 
-			// Spins are STAGGERED rather than released in one burst. A burst does
-			// not race the transition at all: thirty goroutines queue on the
-			// wallet lock before the block's transaction even begins, so all
-			// thirty settle ahead of it and the run proves nothing about
-			// ordering. Spreading them over a window wider than the transition
-			// takes is what puts the block genuinely mid-stream.
-			const stagger = 5 * time.Millisecond
+			stop := make(chan struct{})
+			firstSettled := make(chan struct{})
+			firstBlocked := make(chan struct{})
+			exhausted := make(chan struct{})
 
-			for i := 0; i < concurrency; i++ {
+			for w := 0; w < workers; w++ {
+				// One engine PER GOROUTINE: a shared losingRNG interleaves its
+				// draws across concurrent spins and stops losing, which would
+				// credit a win and break the wallet arithmetic below.
+				game := newIntegrationGame(pool)
 				wg.Add(1)
-				go func(i int) {
+				go func(w int, game GameEngine) {
 					defer wg.Done()
-					<-start
-					time.Sleep(time.Duration(i) * stagger)
-					_, err := game.ProcessSpin(context.Background(), SpinRequest{
-						OperatorCode:          "OP1",
-						OperatorTransactionID: fmt.Sprintf("blk-race-%s-%d", uuid.NewString(), i),
-						PlayerID:              playerID,
-						Family:                domain.FamilySC,
-						BetAmount:             mustMoney(t, stake),
-					})
-					mu.Lock()
-					defer mu.Unlock()
-					switch {
-					case err == nil:
-						settled++
-					case errors.Is(err, errs.ErrPlayerNotActive):
-						blocked++
-					default:
-						otherErr = append(otherErr, err)
+					for i := 0; ; i++ {
+						select {
+						case <-stop:
+							return
+						default:
+						}
+						if attempts.Add(1) > maxAttempts {
+							exhaustedOnce.Do(func() { close(exhausted) })
+							return
+						}
+						_, err := game.ProcessSpin(context.Background(), SpinRequest{
+							OperatorCode:          "OP1",
+							OperatorTransactionID: fmt.Sprintf("blk-race-%s-%d-%d", uuid.NewString(), w, i),
+							PlayerID:              playerID,
+							Family:                domain.FamilySC,
+							BetAmount:             mustMoney(t, stake),
+						})
+						mu.Lock()
+						switch {
+						case err == nil:
+							settled++
+							settledOnce.Do(func() { close(firstSettled) })
+						case errors.Is(err, errs.ErrPlayerNotActive):
+							blocked++
+							blockedOnce.Do(func() { close(firstBlocked) })
+						default:
+							otherErr = append(otherErr, err)
+						}
+						mu.Unlock()
 					}
-				}(i)
+				}(w, game)
 			}
 
-			// The block, racing the traffic. Applied through the real write path
-			// for SUSPENDED; SELF_EXCLUDED needs a term already in force, and
-			// forceSelfExclusion writes the same row the guard reads, so both
-			// contend with the spins identically.
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				<-start
-				// Land roughly a third of the way through the stream, so some
-				// spins are committed before it and the rest arrive after.
-				time.Sleep(concurrency / 3 * stagger)
-				applyBlock(t, pool, casino, playerID, status)
-			}()
+			// drain halts the workers and waits for them, so no spin is still in
+			// flight when the assertions read the wallet — and so a failing path
+			// leaves nothing running behind the test.
+			drain := func() {
+				close(stop)
+				wg.Wait()
+			}
 
-			close(start)
-			wg.Wait()
+			// Phase 1 — traffic is genuinely in flight. Waiting for a COMMITTED
+			// spin (not merely a started one) is what makes `settled > 0` a fact
+			// rather than a hope.
+			select {
+			case <-firstSettled:
+			case <-exhausted:
+				drain()
+				t.Fatalf("no spin settled in %d attempts: %v", maxAttempts, otherErr)
+			case <-time.After(deadline):
+				drain()
+				t.Fatalf("no spin settled within %s: %v", deadline, otherErr)
+			}
+
+			// Phase 2 — the block, landing mid-stream. The workers are still
+			// spinning while this transaction takes the same wallet lock.
+			applyBlock(t, pool, casino, playerID, status)
+
+			// Phase 3 — the block took hold. Every spin that starts after the
+			// commit contends for a row whose player is no longer active, so this
+			// resolves as fast as one more spin can run.
+			select {
+			case <-firstBlocked:
+			case <-exhausted:
+				drain()
+				t.Fatalf("the block committed but no spin was refused in %d attempts "+
+					"(settled %d) — the guard is not reading the committed status", maxAttempts, settled)
+			case <-time.After(deadline):
+				drain()
+				t.Fatalf("the block committed but no spin was refused within %s (settled %d)",
+					deadline, settled)
+			}
+			drain()
 
 			if len(otherErr) > 0 {
 				t.Fatalf("unexpected errors: %v", otherErr)
 			}
-			if settled+blocked != concurrency {
-				t.Fatalf("accounted for %d of %d spins", settled+blocked, concurrency)
+			// Guaranteed by the phases above; asserted anyway, because a pass
+			// that skipped either half would be evidence of nothing.
+			if settled == 0 || blocked == 0 {
+				t.Fatalf("the run did not straddle the block (settled %d, blocked %d)", settled, blocked)
 			}
-			// The block must actually have landed mid-flight; if every spin
-			// settled, the test proved nothing about ordering and needs a
-			// tighter race rather than a passing tick.
-			// Both halves must be non-empty, or the run did not exercise a
-			// mid-stream block and its pass would be an accident of scheduling
-			// rather than evidence.
-			if blocked == 0 {
-				t.Fatalf("no spin was blocked — the transition never raced the traffic, "+
-					"so this run demonstrates nothing (settled %d)", settled)
-			}
-			if settled == 0 {
-				t.Fatalf("no spin settled — the block landed before the traffic started, "+
-					"so this run says nothing about an in-flight request (blocked %d)", blocked)
+			if total := settled + blocked; int64(total) > attempts.Load() {
+				t.Fatalf("accounted for %d spins from %d attempts", total, attempts.Load())
 			}
 
 			// THE assertion: the wallet moved by exactly what the settled spins
@@ -327,7 +389,7 @@ func TestIntegration_BlockTakesHoldUnderConcurrentTraffic(t *testing.T) {
 			assertDoubleEntryBalanced(t, pool)
 
 			// And the block is total afterwards: no straggler gets through.
-			if _, err := game.ProcessSpin(context.Background(), SpinRequest{
+			if _, err := newIntegrationGame(pool).ProcessSpin(context.Background(), SpinRequest{
 				OperatorCode: "OP1", OperatorTransactionID: "blk-after-" + uuid.NewString(),
 				PlayerID: playerID, Family: domain.FamilySC, BetAmount: mustMoney(t, stake),
 			}); !errors.Is(err, errs.ErrPlayerNotActive) {
