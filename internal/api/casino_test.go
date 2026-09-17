@@ -71,6 +71,7 @@ func casinoRouter(c repository.CasinoEngine) *gin.Engine {
 	g.POST("/player/create", h.CreatePlayer)
 	g.POST("/store/purchase", h.Purchase)
 	g.POST("/store/redeem", h.Redeem)
+	g.POST("/store/redeem/refund", h.RedemptionRefund)
 	g.POST("/player/status", h.UpdateStatus)
 	g.POST("/player/limits", h.SetPlayerLimit)
 	return r
@@ -518,5 +519,121 @@ func TestLimitExceededIsNotInsufficientFunds(t *testing.T) {
 	}
 	if got != errs.CodeLimitExceeded {
 		t.Errorf("code: got %s want %s", got, errs.CodeLimitExceeded)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// store/redeem/refund
+// ----------------------------------------------------------------------------
+
+func TestRedemptionRefundHandler_ForwardsTheExactAmountAndReference(t *testing.T) {
+	t.Parallel()
+	playerID := uuid.New()
+	originalDebit := uuid.New()
+	eng := &fakeCasino{refund: func(_ context.Context, req repository.RedemptionRefundRequest) (repository.TxResult, error) {
+		return repository.TxResult{
+			PlayerID: req.PlayerID, TransactionType: "REDEMPTION_REFUND", Amount: req.Amount,
+			PostBalances: repository.BalanceSummary{GC: mustMoney(t, "0.0000"), SCUnplayed: mustMoney(t, "0.0000"), SCRedeemable: mustMoney(t, "125.5000")},
+			Status:       repository.StatusProcessed,
+		}, nil
+	}}
+	r := casinoRouter(eng)
+
+	body := `{"operator_transaction_id":"redeem-refund:abc","player_id":"` + playerID.String() +
+		`","amount":"125.5000","reference_transaction_id":"` + originalDebit.String() + `"}`
+	w := doJSON(r, http.MethodPost, "/api/v1/store/redeem/refund", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d want 200; body=%s", w.Code, w.Body.String())
+	}
+	// The operator comes from the trusted HMAC context, never the body.
+	if eng.lastRefund.OperatorCode != "OP1" {
+		t.Errorf("operator: got %q want OP1", eng.lastRefund.OperatorCode)
+	}
+	// The amount is parsed precisely — scale intact, no float anywhere near it.
+	if eng.lastRefund.Amount.String() != "125.5000" {
+		t.Errorf("amount: got %s want 125.5000", eng.lastRefund.Amount)
+	}
+	if eng.lastRefund.ReferenceTransactionID != originalDebit {
+		t.Errorf("reference: got %s want %s", eng.lastRefund.ReferenceTransactionID, originalDebit)
+	}
+}
+
+func TestRedemptionRefundHandler_ReferenceIsOptional(t *testing.T) {
+	t.Parallel()
+	playerID := uuid.New()
+	eng := &fakeCasino{refund: func(_ context.Context, req repository.RedemptionRefundRequest) (repository.TxResult, error) {
+		return repository.TxResult{PlayerID: req.PlayerID, Status: repository.StatusProcessed,
+			PostBalances: repository.BalanceSummary{GC: mustMoney(t, "0.0000"), SCUnplayed: mustMoney(t, "0.0000"), SCRedeemable: mustMoney(t, "1.0000")}}, nil
+	}}
+	r := casinoRouter(eng)
+
+	// A refund whose original debit id was lost is still better than no refund.
+	body := `{"operator_transaction_id":"redeem-refund:def","player_id":"` + playerID.String() + `","amount":"1.0000"}`
+	w := doJSON(r, http.MethodPost, "/api/v1/store/redeem/refund", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d want 200; body=%s", w.Code, w.Body.String())
+	}
+	if eng.lastRefund.ReferenceTransactionID != uuid.Nil {
+		t.Errorf("reference: got %s want the nil UUID", eng.lastRefund.ReferenceTransactionID)
+	}
+}
+
+// A NEGATIVE amount is not the handler's to refuse, and this pins where that
+// boundary actually is. parseAmount validates parseability and scale only —
+// identically for bet, win, redeem and refund — while the SIGN is checked by the
+// engine's validate(), which is the layer that can refuse it without any
+// database work (see TestProcessRedemptionRefund_Validation). What the handler
+// owes is that the value reaches the engine UNMANGLED rather than silently
+// zeroed, because a sign quietly lost between the two layers would turn a
+// refund into a second debit.
+func TestRedemptionRefundHandler_ForwardsSignForTheEngineToRefuse(t *testing.T) {
+	t.Parallel()
+	playerID := uuid.New()
+	eng := &fakeCasino{refund: func(_ context.Context, _ repository.RedemptionRefundRequest) (repository.TxResult, error) {
+		return repository.TxResult{}, errs.ErrInvalidAmount
+	}}
+	r := casinoRouter(eng)
+
+	body := `{"operator_transaction_id":"x","player_id":"` + playerID.String() + `","amount":"-1.0000"}`
+	w := doJSON(r, http.MethodPost, "/api/v1/store/redeem/refund", body)
+
+	if eng.lastRefund.Amount.String() != "-1.0000" {
+		t.Errorf("amount reached the engine as %s, want -1.0000 — the sign must survive the hop",
+			eng.lastRefund.Amount)
+	}
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status: got %d want 400 (the engine's refusal, surfaced); body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestRedemptionRefundHandler_RejectsMalformedInput(t *testing.T) {
+	t.Parallel()
+	playerID := uuid.New()
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"missing amount", `{"operator_transaction_id":"x","player_id":"` + playerID.String() + `"}`},
+		{"amount as a number", `{"operator_transaction_id":"x","player_id":"` + playerID.String() + `","amount":125.5}`},
+		{"bad player id", `{"operator_transaction_id":"x","player_id":"not-a-uuid","amount":"1.0000"}`},
+		// A malformed reference is refused rather than silently dropped: a caller
+		// that meant to link the pair should learn that it failed to.
+		{"bad reference", `{"operator_transaction_id":"x","player_id":"` + playerID.String() + `","amount":"1.0000","reference_transaction_id":"nope"}`},
+		{"missing transaction id", `{"player_id":"` + playerID.String() + `","amount":"1.0000"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			eng := &fakeCasino{}
+			w := doJSON(casinoRouter(eng), http.MethodPost, "/api/v1/store/redeem/refund", tc.body)
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("status: got %d want 400; body=%s", w.Code, w.Body.String())
+			}
+			// Nothing reached the ledger.
+			if eng.lastRefund.OperatorTransactionID != "" {
+				t.Errorf("a malformed request reached the engine: %+v", eng.lastRefund)
+			}
+		})
 	}
 }

@@ -205,3 +205,60 @@ func TestApplyRedeem_OnlyReducesRedeemable(t *testing.T) {
 		t.Errorf("GC/SCUnplayed must be untouched; got GC=%s SCU=%s", post.GC, post.SCUnplayed)
 	}
 }
+
+func TestAllocateRedemptionRefund(t *testing.T) {
+	t.Parallel()
+
+	// The refund is NOT symmetric with AllocateRedeem, and that asymmetry is the
+	// property worth pinning: a redemption can fail for want of balance, a refund
+	// cannot. The money being returned was already taken from this wallet.
+	empty := Wallet{}
+	alloc, err := empty.AllocateRedemptionRefund(mustMoney(t, "100.0000"))
+	if err != nil {
+		t.Fatalf("refund against an empty wallet was refused: %v", err)
+	}
+	if alloc.Credit.Currency != CurrencySCRedeemable {
+		t.Errorf("credited %s, want SC_REDEEMABLE — SC_UNPLAYED would impose a fresh playthrough",
+			alloc.Credit.Currency)
+	}
+	if alloc.Credit.Amount.String() != "100.0000" {
+		t.Errorf("credit amount %s, want 100.0000", alloc.Credit.Amount)
+	}
+
+	// Applying it moves ONLY the redeemable bucket.
+	w := Wallet{GC: mustMoney(t, "5.0000"), SCUnplayed: mustMoney(t, "7.0000"), SCRedeemable: mustMoney(t, "1.0000")}
+	got := w.ApplyRedemptionRefund(alloc)
+	if got.SCRedeemable.String() != "101.0000" {
+		t.Errorf("SCRedeemable %s, want 101.0000", got.SCRedeemable)
+	}
+	if got.GC.String() != "5.0000" || got.SCUnplayed.String() != "7.0000" {
+		t.Errorf("other buckets moved: GC=%s SCUnplayed=%s", got.GC, got.SCUnplayed)
+	}
+
+	// A refund is exactly reversible against the redemption it undoes.
+	base := Wallet{SCRedeemable: mustMoney(t, "250.0000")}
+	redeemAlloc, err := base.AllocateRedeem(mustMoney(t, "125.5000"))
+	if err != nil {
+		t.Fatalf("AllocateRedeem: %v", err)
+	}
+	afterRedeem := base.ApplyRedeem(redeemAlloc)
+	refundAlloc, err := afterRedeem.AllocateRedemptionRefund(mustMoney(t, "125.5000"))
+	if err != nil {
+		t.Fatalf("AllocateRedemptionRefund: %v", err)
+	}
+	restored := afterRedeem.ApplyRedemptionRefund(refundAlloc)
+	if restored.SCRedeemable.String() != base.SCRedeemable.String() {
+		t.Errorf("round trip left %s, want the original %s", restored.SCRedeemable, base.SCRedeemable)
+	}
+}
+
+func TestAllocateRedemptionRefund_RejectsNonPositive(t *testing.T) {
+	t.Parallel()
+	w := Wallet{SCRedeemable: mustMoney(t, "10.0000")}
+
+	for _, amount := range []string{"0", "0.0000"} {
+		if _, err := w.AllocateRedemptionRefund(mustMoney(t, amount)); !errors.Is(err, errs.ErrInvalidAmount) {
+			t.Errorf("amount %q: got %v, want ErrInvalidAmount", amount, err)
+		}
+	}
+}
