@@ -22,6 +22,12 @@ type Engine interface {
 	// Suitable for the /session endpoint where reads can be slightly stale.
 	GetBalances(ctx context.Context, playerID uuid.UUID) (domain.Wallet, error)
 
+	// GetSessionSnapshot loads the wallet TOGETHER WITH the player's lifecycle
+	// status and outstanding playthrough, in one consistent read. It is what a
+	// gateway needs to refuse a doomed money operation early; it grants
+	// nothing and locks nothing. See session.go.
+	GetSessionSnapshot(ctx context.Context, playerID uuid.UUID) (SessionSnapshot, error)
+
 	// ProcessBet runs the golden flow for a bet: Redis idempotency →
 	// BEGIN (READ COMMITTED) → SELECT FOR UPDATE → AllocateBet → UPDATE
 	// wallets → INSERT ledger_transactions → INSERT ledger_entries →

@@ -320,7 +320,10 @@ func (h *Handlers) Session(c *gin.Context) {
 	// backend can't pin a connection for a dropped client.
 	ctx, cancel := context.WithTimeout(c.Request.Context(), h.readTimeout)
 	defer cancel()
-	wallet, err := h.engine.GetBalances(ctx, playerID)
+	// One consistent read: balance, status and outstanding playthrough from a
+	// single MVCC snapshot, so a caller can never be handed a combination that
+	// never existed (see repository/session.go).
+	snap, err := h.engine.GetSessionSnapshot(ctx, playerID)
 	if err != nil {
 		respondError(c, err)
 		return
@@ -329,10 +332,12 @@ func (h *Handlers) Session(c *gin.Context) {
 		Code:     errors.CodeOK,
 		PlayerID: playerID.String(),
 		Balances: repository.BalanceSummary{
-			GC:           wallet.GC,
-			SCUnplayed:   wallet.SCUnplayed,
-			SCRedeemable: wallet.SCRedeemable,
+			GC:           snap.Wallet.GC,
+			SCUnplayed:   snap.Wallet.SCUnplayed,
+			SCRedeemable: snap.Wallet.SCRedeemable,
 		},
+		Status:                 snap.Status,
+		PlaythroughOutstanding: snap.PlaythroughOutstanding,
 	})
 }
 
