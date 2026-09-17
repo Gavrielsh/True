@@ -131,3 +131,42 @@ func (w Wallet) ApplyRedeem(a RedeemAllocation) Wallet {
 	out.SCRedeemable = out.SCRedeemable.Sub(a.Debit.Amount)
 	return out
 }
+
+// RedemptionRefundAllocation is the SC_REDEEMABLE credit that returns what a
+// redemption took but never paid out.
+type RedemptionRefundAllocation struct {
+	Credit Credit
+}
+
+// AllocateRedemptionRefund computes the SC_REDEEMABLE credit for refunding a
+// redemption, without mutating the wallet.
+//
+// THE MIRROR OF AllocateRedeem, AND DELIBERATELY NOT ITS EQUAL.
+// A redemption can fail for want of balance; a REFUND cannot. The money being
+// returned was already taken from this wallet, so there is no sufficiency test
+// to perform and no way for the player's current balance to make the refund
+// invalid. The only thing that can be wrong here is the amount itself.
+//
+// It credits SC_REDEEMABLE, not SC_UNPLAYED, because that is the bucket the
+// redemption debited. Returning it as unplayed would silently impose a fresh
+// playthrough requirement on money the player had already made redeemable —
+// taking their money and then, on giving it back, making it harder to withdraw.
+func (w Wallet) AllocateRedemptionRefund(amount Money) (RedemptionRefundAllocation, error) {
+	if !amount.IsPositive() {
+		return RedemptionRefundAllocation{}, fmt.Errorf(
+			"%w: refund amount must be > 0, got %s",
+			errs.ErrInvalidAmount, amount,
+		)
+	}
+	return RedemptionRefundAllocation{
+		Credit: Credit{Currency: CurrencySCRedeemable, Amount: amount},
+	}, nil
+}
+
+// ApplyRedemptionRefund returns a new Wallet with the refund credited to
+// SC_REDEEMABLE.
+func (w Wallet) ApplyRedemptionRefund(a RedemptionRefundAllocation) Wallet {
+	out := w
+	out.SCRedeemable = out.SCRedeemable.Add(a.Credit.Amount)
+	return out
+}

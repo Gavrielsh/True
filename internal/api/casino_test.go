@@ -21,11 +21,13 @@ type fakeCasino struct {
 	redeem   func(context.Context, repository.RedeemRequest) (repository.TxResult, error)
 	status   func(context.Context, repository.StatusTransitionRequest) (repository.StatusTransitionResult, error)
 	setLimit func(context.Context, repository.SetPlayerLimitRequest) (repository.SetPlayerLimitResult, error)
+	refund   func(context.Context, repository.RedemptionRefundRequest) (repository.TxResult, error)
 
 	lastPurchase repository.PurchaseRequest
 	lastRedeem   repository.RedeemRequest
 	lastStatus   repository.StatusTransitionRequest
 	lastLimit    repository.SetPlayerLimitRequest
+	lastRefund   repository.RedemptionRefundRequest
 }
 
 func (f *fakeCasino) CreatePlayer(ctx context.Context, req repository.CreatePlayerRequest) (repository.CreatePlayerResult, error) {
@@ -38,6 +40,13 @@ func (f *fakeCasino) ProcessPurchase(ctx context.Context, req repository.Purchas
 func (f *fakeCasino) ProcessRedeem(ctx context.Context, req repository.RedeemRequest) (repository.TxResult, error) {
 	f.lastRedeem = req
 	return f.redeem(ctx, req)
+}
+func (f *fakeCasino) ProcessRedemptionRefund(ctx context.Context, req repository.RedemptionRefundRequest) (repository.TxResult, error) {
+	f.lastRefund = req
+	if f.refund == nil {
+		return repository.TxResult{}, nil
+	}
+	return f.refund(ctx, req)
 }
 func (f *fakeCasino) ProcessStatusTransition(ctx context.Context, req repository.StatusTransitionRequest) (repository.StatusTransitionResult, error) {
 	f.lastStatus = req

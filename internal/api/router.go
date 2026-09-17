@@ -151,6 +151,9 @@ func NewRouter(cfg Config) *gin.Engine {
 			v1.POST("/player/create", casino.CreatePlayer)
 			v1.POST("/store/purchase", casino.Purchase)
 			v1.POST("/store/redeem", casino.Redeem)
+			// The compensating credit for a redemption that was debited and never
+			// paid. Inside the fence with the other money routes.
+			v1.POST("/store/redeem/refund", casino.RedemptionRefund)
 
 			// The status write path, on the unfenced compliance group above.
 			// Signed, rate-limited and replay-protected like everything else —

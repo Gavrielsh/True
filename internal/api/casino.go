@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/Gavrielsh/True/internal/domain"
@@ -56,6 +57,21 @@ type redeemDTO struct {
 	PlayerID              string          `json:"player_id"               binding:"required"`
 	Amount                string          `json:"amount"                  binding:"required"`
 	Metadata              json.RawMessage `json:"metadata,omitempty"`
+}
+
+// redemptionRefundDTO is the POST /api/v1/store/redeem/refund wire format.
+//
+// `amount` must be EXACTLY what the redemption debited. The engine credits what
+// it is told and cannot look the original up, so a caller sending a different
+// figure is the one failure this design cannot catch — which is why the
+// gateway forwards its stored decimal string verbatim rather than recomputing
+// it.
+type redemptionRefundDTO struct {
+	OperatorTransactionID  string          `json:"operator_transaction_id" binding:"required"`
+	PlayerID               string          `json:"player_id"               binding:"required"`
+	Amount                 string          `json:"amount"                  binding:"required"`
+	ReferenceTransactionID string          `json:"reference_transaction_id,omitempty"`
+	Metadata               json.RawMessage `json:"metadata,omitempty"`
 }
 
 // statusTransitionDTO is the POST /api/v1/player/status wire format.
@@ -238,6 +254,62 @@ func (h *CasinoHandlers) Redeem(c *gin.Context) {
 // Mounted OUTSIDE the jurisdiction fence (see router.go): a player must always
 // be able to exclude themselves, and an operator must always be able to close an
 // account, regardless of where the request originates.
+// RedemptionRefund handles POST /api/v1/store/redeem/refund — returning
+// SC_REDEEMABLE a redemption took but never paid out.
+//
+// Behind the same HMAC + replay perimeter as every other money route: it is a
+// CREDIT, so an unauthenticated caller reaching it could mint balance. Nothing
+// about "it is only a refund" makes it less sensitive than the debit it
+// reverses — if anything more, since a debit is bounded by the player's balance
+// and a credit is bounded by nothing.
+func (h *CasinoHandlers) RedemptionRefund(c *gin.Context) {
+	var dto redemptionRefundDTO
+	if err := c.ShouldBindJSON(&dto); err != nil {
+		respondErrorCode(c, http.StatusBadRequest, errors.CodeInvalidAmount, "invalid request body")
+		return
+	}
+
+	playerID, ok := parsePlayerID(c, dto.PlayerID)
+	if !ok {
+		return
+	}
+	amount, ok := parseAmount(c, dto.Amount)
+	if !ok {
+		return
+	}
+
+	// Optional: a malformed reference is refused rather than silently dropped —
+	// a caller that meant to link the pair should learn it failed to.
+	var reference uuid.UUID
+	if dto.ReferenceTransactionID != "" {
+		parsed, err := uuid.Parse(dto.ReferenceTransactionID)
+		if err != nil {
+			respondErrorCode(c, http.StatusBadRequest, errors.CodeInvalidAmount, "invalid reference_transaction_id")
+			return
+		}
+		reference = parsed
+	}
+
+	operatorCode := OperatorCodeFromContext(c.Request.Context())
+	ctx, span := moneySpan(c, "http.redemption_refund", operatorCode, dto.OperatorTransactionID, playerID)
+
+	result, err := h.casino.ProcessRedemptionRefund(ctx, repository.RedemptionRefundRequest{
+		OperatorCode:           operatorCode,
+		OperatorTransactionID:  dto.OperatorTransactionID,
+		PlayerID:               playerID,
+		Amount:                 amount,
+		ReferenceTransactionID: reference,
+		Metadata:               dto.Metadata,
+		BodyHash:               BodyHashFromContext(c.Request.Context()),
+	})
+	telemetry.EndSpan(span, err)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, successResponse{Code: errors.CodeOK, Result: result})
+}
+
 func (h *CasinoHandlers) UpdateStatus(c *gin.Context) {
 	var dto statusTransitionDTO
 	if err := c.ShouldBindJSON(&dto); err != nil {

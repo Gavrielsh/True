@@ -58,6 +58,11 @@ type CasinoEngine interface {
 	// for a fiat redemption. Idempotent + Ghost-Spin safe.
 	ProcessRedeem(ctx context.Context, req RedeemRequest) (TxResult, error)
 
+	// ProcessRedemptionRefund returns SC_REDEEMABLE a redemption debited but
+	// never paid out, debiting HOUSE_REDEMPTION_POOL. It is the ONE money path
+	// that deliberately does NOT refuse a blocked player — see refund.go.
+	ProcessRedemptionRefund(ctx context.Context, req RedemptionRefundRequest) (TxResult, error)
+
 	// ProcessStatusTransition is the ONLY write path for users.status. It
 	// commits the status change and its audit row together, takes the same
 	// wallet lock as the money paths so a transition cannot interleave with a
