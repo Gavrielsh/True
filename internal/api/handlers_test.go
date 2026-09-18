@@ -30,6 +30,11 @@ type fakeEngine struct {
 	win      func(context.Context, repository.WinRequest) (repository.TxResult, error)
 	rollback func(context.Context, repository.RollbackRequest) (repository.TxResult, error)
 	balances func(context.Context, uuid.UUID) (domain.Wallet, error)
+	// snapshot is optional: when nil, GetSessionSnapshot is derived from
+	// `balances` and reports an ACTIVE player with nothing outstanding, so the
+	// tests that predate the session endpoint carrying compliance facts keep
+	// exercising it unchanged.
+	snapshot func(context.Context, uuid.UUID) (repository.SessionSnapshot, error)
 
 	lastBet repository.BetRequest // captured for assertions
 }
@@ -46,6 +51,16 @@ func (f *fakeEngine) ProcessRollback(ctx context.Context, req repository.Rollbac
 }
 func (f *fakeEngine) GetBalances(ctx context.Context, id uuid.UUID) (domain.Wallet, error) {
 	return f.balances(ctx, id)
+}
+func (f *fakeEngine) GetSessionSnapshot(ctx context.Context, id uuid.UUID) (repository.SessionSnapshot, error) {
+	if f.snapshot != nil {
+		return f.snapshot(ctx, id)
+	}
+	w, err := f.balances(ctx, id)
+	if err != nil {
+		return repository.SessionSnapshot{}, err
+	}
+	return repository.SessionSnapshot{Wallet: w, Status: "ACTIVE", PlaythroughOutstanding: domain.Money{}}, nil
 }
 
 func mustMoney(t *testing.T, s string) domain.Money {

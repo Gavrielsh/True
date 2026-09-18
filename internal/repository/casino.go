@@ -57,6 +57,31 @@ type CasinoEngine interface {
 	// ProcessRedeem deducts SC_REDEEMABLE (only) against HOUSE_REDEMPTION_POOL
 	// for a fiat redemption. Idempotent + Ghost-Spin safe.
 	ProcessRedeem(ctx context.Context, req RedeemRequest) (TxResult, error)
+
+	// ProcessPromoGrant issues GC and/or SC_UNPLAYED against HOUSE_PROMO_POOL
+	// with NO purchase behind it — the AMOE free-entry route and its siblings.
+	// Recorded as PROMO_CREDIT, so "issued for payment" and "issued for free"
+	// are separable in the ledger by type AND by counterparty account. Unlike
+	// the refund path it DOES refuse a blocked player: a grant offers new coins,
+	// and a self-excluded player must not be offered any. See promo.go.
+	ProcessPromoGrant(ctx context.Context, req PromoGrantRequest) (TxResult, error)
+
+	// ProcessRedemptionRefund returns SC_REDEEMABLE a redemption debited but
+	// never paid out, debiting HOUSE_REDEMPTION_POOL. It is the ONE money path
+	// that deliberately does NOT refuse a blocked player — see refund.go.
+	ProcessRedemptionRefund(ctx context.Context, req RedemptionRefundRequest) (TxResult, error)
+
+	// ProcessStatusTransition is the ONLY write path for users.status. It
+	// commits the status change and its audit row together, takes the same
+	// wallet lock as the money paths so a transition cannot interleave with a
+	// settling wager, and refuses to lift a self-exclusion before its term
+	// expires. See status.go.
+	ProcessStatusTransition(ctx context.Context, req StatusTransitionRequest) (StatusTransitionResult, error)
+
+	// ProcessSetPlayerLimit sets or revises a player-set wagering limit,
+	// applying the cooling-off asymmetry: a decrease takes effect immediately, an
+	// increase only after LimitIncreaseCoolOff. See limits.go.
+	ProcessSetPlayerLimit(ctx context.Context, req SetPlayerLimitRequest) (SetPlayerLimitResult, error)
 }
 
 // NewCasino builds the casino wrapper from the same dependencies as New. The
@@ -302,6 +327,14 @@ func (e *engine) processPurchaseTx(ctx context.Context, req PurchaseRequest) (re
 	}
 	span.SetAttributes(attribute.String("ledger_transaction_id", ledgerTxID.String()))
 
+	// The promotional SC this purchase issues carries a 1x wagering
+	// requirement. Recorded in the SAME transaction as the grant, so a grant can
+	// never exist without the obligation it creates — the failure mode that
+	// would let promotional coins be redeemed straight back out as cash.
+	if err := recordPlaythroughGrant(ctx, tx, req.PlayerID, ledgerTxID, req.SCPromoAmount); err != nil {
+		return TxResult{}, err
+	}
+
 	// Double-entry: each issued currency is a player CREDIT balanced by a
 	// HOUSE_ISSUANCE_POOL DEBIT of the same amount.
 	for _, c := range alloc.Credits {
@@ -388,6 +421,15 @@ func (e *engine) processRedeemTx(ctx context.Context, req RedeemRequest) (result
 		return TxResult{}, err
 	}
 
+	// The sweepstakes wagering requirement. Checked BEFORE the allocation so a
+	// player with an outstanding grant is told which rule stopped them, rather
+	// than being handed an insufficient-funds error about a balance they
+	// visibly have. Same tx handle, so a wager committing concurrently either
+	// discharges the last grant before this read or after it — never halfway.
+	if err := assertPlaythroughSatisfied(ctx, tx, req.PlayerID); err != nil {
+		return TxResult{}, err
+	}
+
 	// AllocateRedeem enforces SC_REDEEMABLE-only and rejects on insufficient
 	// redeemable balance even if SC_UNPLAYED would otherwise cover it.
 	alloc, err := wallet.AllocateRedeem(req.Amount)
@@ -447,7 +489,20 @@ func (e *engine) processRedeemTx(ctx context.Context, req RedeemRequest) (result
 // Validation / normalization
 // ----------------------------------------------------------------------------
 
-// validUserStatuses mirrors the user_status ENUM (migration 000001).
+// validUserStatuses is the set of statuses a player may be CREATED in. It is
+// deliberately NOT the full user_status ENUM.
+//
+// 000009 added SELF_EXCLUDED, and it is omitted here on purpose: a
+// self-exclusion is a transition a player makes from an existing account, with
+// an agreed term and an audit row recording who asked for it and when. An
+// operator provisioning a player directly into that status would produce an
+// exclusion with no origin, no term, and no entry in
+// player_status_transitions — a compliance record that asserts a player excluded
+// themselves before the account existed. ProcessStatusTransition (task A2) is
+// the only supported way in, and it writes the audit row in the same
+// transaction as the users UPDATE.
+//
+// Statuses reachable only by transition, never at creation: SELF_EXCLUDED.
 var validUserStatuses = map[string]struct{}{
 	"KYC_PENDING": {}, "ACTIVE": {}, "SUSPENDED": {}, "CLOSED": {},
 }

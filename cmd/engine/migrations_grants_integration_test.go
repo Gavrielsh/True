@@ -63,9 +63,48 @@ var wantGrants = map[string][]string{
 	"ledger_transactions":      {"INSERT", "SELECT"},
 	"ledger_transaction_dedup": {"DELETE", "INSERT", "SELECT"}, // retention-pruned, not financial history
 	"wallets":                  {"INSERT", "SELECT", "UPDATE"}, // balances mutate under SELECT ... FOR UPDATE
-	"users":                    {"INSERT", "SELECT"},
-	"daily_ggr":                {"INSERT", "SELECT", "UPDATE"}, // written by an UPSERT
-	"ggr_aggregator_state":     {"SELECT", "UPDATE"},           // watermark row
+	// users gained UPDATE in 000010, alongside ProcessStatusTransition — the
+	// first and only writer of users.status. No DELETE: a player row is never
+	// removed. Closure is a status, and an erased player would take their audit
+	// trail's referent with them.
+	"users":                {"INSERT", "SELECT", "UPDATE"},
+	"daily_ggr":            {"INSERT", "SELECT", "UPDATE"}, // written by an UPSERT
+	"ggr_aggregator_state": {"SELECT", "UPDATE"},           // watermark row
+	// player_status_transitions (000009) is a compliance audit log and carries
+	// the SAME append-only privilege set as the ledger: INSERT + SELECT only. A
+	// recorded transition is never rewritten, and a self-exclusion is never
+	// erased. This is what makes the users UPDATE above safe to grant: the
+	// status can move, but never without leaving a record that cannot be
+	// revised afterwards.
+	"player_status_transitions": {"INSERT", "SELECT"},
+	// player_limits (000011): SELECT to evaluate, INSERT and UPDATE to set and
+	// revise. NO DELETE — a limit is removed by raising it, which serves the
+	// 24-hour cooling-off period, never by deleting the row and skipping the wait.
+	"player_limits": {"INSERT", "SELECT", "UPDATE"},
+	// player_limit_usage: the running total, read and moved on the wager path.
+	// No DELETE: expired period buckets are retention-pruned by maintenance, so
+	// the wager path cannot make today's spend disappear.
+	"player_limit_usage": {"INSERT", "SELECT", "UPDATE"},
+	// player_limit_changes: the evidence the cooling-off period was served.
+	// Append-only like every other audit table here.
+	"player_limit_changes": {"INSERT", "SELECT"},
+	// sc_playthrough (000012): SELECT for the redemption gate, INSERT to record
+	// a grant, UPDATE to advance the counter. NO DELETE, and that is the
+	// load-bearing omission — DELETE would let an outstanding wagering
+	// obligation be made to disappear, which is exactly what the record exists
+	// to prevent. A grant is discharged by being wagered, never by being removed.
+	"sc_playthrough": {"INSERT", "SELECT", "UPDATE"},
+	// promo_grants (000014): SELECT and INSERT only — stricter than
+	// sc_playthrough, and deliberately so. sc_playthrough needs UPDATE because
+	// its counter advances as the player wagers; a promo grant has no counter.
+	// It is a statement about something that happened, so the only legitimate
+	// operations are reading it and adding another.
+	//
+	// The omission of UPDATE is the load-bearing one here: it is what stops a
+	// BONUS being relabelled AMOE after the fact, which would manufacture
+	// evidence of a free-entry route that was never offered — the precise fraud
+	// this record exists to make impossible.
+	"promo_grants": {"INSERT", "SELECT"},
 }
 
 func integrationURL(t *testing.T) string {
@@ -152,7 +191,14 @@ func TestLedgerGrants_ForbiddenPrivilegesNeverGranted(t *testing.T) {
 	defer cancel()
 	conn, _ := migrateAndConnect(ctx, t)
 
-	for _, table := range []string{"ledger_entries", "ledger_transactions"} {
+	// player_status_transitions (000009) is append-only for the same reason the
+	// ledger is — it is the evidence file for self-exclusion and for operator and
+	// regulator actions — so the prohibition is stated for it here too, not left
+	// to wantGrants alone.
+	for _, table := range []string{
+		"ledger_entries", "ledger_transactions",
+		"player_status_transitions", "player_limit_changes",
+	} {
 		for _, priv := range []string{"UPDATE", "DELETE", "TRUNCATE"} {
 			var n int
 			if err := conn.QueryRow(ctx, `

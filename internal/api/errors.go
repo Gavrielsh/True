@@ -57,6 +57,33 @@ func httpStatusFor(code errors.Code) int {
 		// 503 — transient infrastructure failure; the spin was NOT settled
 		// and the same key is safe to retry.
 		return http.StatusServiceUnavailable
+	case errors.CodeStatusUnchanged:
+		// 409, matching the other "you are colliding with existing state"
+		// codes. Zone 2 reads this as "already applied" when replaying a
+		// transition, so a retried compliance action is safe rather than noisy.
+		return http.StatusConflict
+	case errors.CodePlaythroughOutstanding:
+		// 403 alongside the other "this player may not do this" answers. The
+		// balance exists; the wagering attached to a promotional grant has not
+		// been discharged. Never 400 INSUFFICIENT_FUNDS — a cashier that told
+		// the player to earn more would be describing the wrong problem.
+		return http.StatusForbidden
+	case errors.CodeLimitExceeded:
+		// 403, alongside CodePlayerNotActive: the request is well-formed and the
+		// funds exist, but this player may not make it. A retry of the identical
+		// wager is refused identically until the period rolls over — it is a
+		// permission answer, not a balance answer, and must never be mistaken
+		// for INSUFFICIENT_FUNDS by a client deciding what to show.
+		return http.StatusForbidden
+	case errors.CodeStatusTransitionInvalid,
+		errors.CodeSelfExclusionActive,
+		errors.CodeSelfExclusionTooShort,
+		errors.CodeSelfExclusionNotExtended:
+		// 422 like CodeWinExceedsCeiling: the request is well-formed and was
+		// refused by policy. Retrying the identical request never helps — an
+		// illegal move stays illegal, and an active exclusion is not waited out
+		// by a retry loop.
+		return http.StatusUnprocessableEntity
 	default:
 		return http.StatusInternalServerError
 	}
@@ -126,6 +153,23 @@ func publicMessageFor(code errors.Code) string {
 		return "idempotency key already used for a different request"
 	case errors.CodeRNGUnavailable:
 		return "game temporarily unavailable"
+	case errors.CodeStatusUnchanged:
+		return "player already holds the requested status"
+	case errors.CodeStatusTransitionInvalid:
+		return "status transition not permitted"
+	case errors.CodeSelfExclusionActive:
+		// Deliberately does not disclose the expiry date: this response goes to
+		// an operator integration, and the term belongs in the player-facing
+		// surface the gateway renders, not in a generic engine error body.
+		return "self-exclusion is in force and cannot be lifted"
+	case errors.CodeSelfExclusionTooShort:
+		return "self-exclusion term is below the permitted minimum"
+	case errors.CodeSelfExclusionNotExtended:
+		return "a self-exclusion may be extended, never shortened"
+	case errors.CodeLimitExceeded:
+		return "the wager exceeds a limit set on this account"
+	case errors.CodePlaythroughOutstanding:
+		return "promotional sweeps coins must be played through before redemption"
 	default:
 		return "internal error"
 	}

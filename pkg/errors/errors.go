@@ -38,6 +38,48 @@ var (
 	// configured absolute ceiling. Signals a provider bug or a compromised
 	// webhook secret — always alert, never auto-raise the ceiling.
 	ErrWinExceedsCeiling = stderrors.New("win exceeds configured ceiling")
+
+	// ─── Player status transitions (migration 000009/000010) ────────────────
+	// Each of these names a DISTINCT rule the caller violated. They are kept
+	// separate rather than folded into one "bad transition" error because the
+	// caller's correct response differs for each: retry never helps for an
+	// illegal transition, helps only after a date for an active exclusion, and
+	// is already unnecessary for an unchanged status.
+
+	// ErrStatusUnchanged: the player already holds the requested status. The
+	// audit trail records CHANGES, so a no-op is refused rather than written.
+	// Zone 2 should treat this as an idempotent success when replaying a
+	// transition it may already have applied.
+	ErrStatusUnchanged = stderrors.New("player already holds the requested status")
+	// ErrStatusTransitionInvalid: the move is not permitted from the player's
+	// current status (e.g. anything out of CLOSED, which is terminal).
+	ErrStatusTransitionInvalid = stderrors.New("status transition not permitted")
+	// ErrSelfExclusionActive: the player is self-excluded and the term has not
+	// expired. A self-exclusion is IRREVOCABLE before its expiry — no operator,
+	// and no request from the player themselves, may lift it. Returned for every
+	// move that would restore play, and for every move to another liftable
+	// status, which would otherwise launder an exclusion into something an
+	// operator can clear.
+	ErrSelfExclusionActive = stderrors.New("self-exclusion is in force")
+	// ErrSelfExclusionTooShort: the requested term is below the regulatory
+	// minimum. Named separately from generic validation because the caller must
+	// be told WHICH rule to satisfy in order to resubmit.
+	ErrSelfExclusionTooShort = stderrors.New("self-exclusion term is below the minimum")
+	// ErrSelfExclusionNotExtended: a self-excluded player asked to change their
+	// term to one that does not extend it. Refused as an attempt to shorten an
+	// exclusion, which is the same act as lifting it early.
+	ErrSelfExclusionNotExtended = stderrors.New("self-exclusion term must be extended, not shortened")
+
+	// ErrLimitExceeded: the wager would take the player past a limit they set
+	// themselves. Distinct from ErrInsufficientFunds — the money is there, and
+	// the player asked us not to let them spend it.
+	ErrLimitExceeded = stderrors.New("player limit exceeded")
+
+	// ErrPlaythroughOutstanding: the player holds promotional SC they have not
+	// yet wagered through, so redemption is refused. Distinct from
+	// ErrInsufficientFunds — the redeemable balance is there; the sweepstakes
+	// wagering requirement attached to a grant has not been discharged.
+	ErrPlaythroughOutstanding = stderrors.New("sweeps playthrough requirement outstanding")
 )
 
 // Code is the stable identifier surfaced to operators (e.g. in webhook
@@ -61,6 +103,14 @@ const (
 	CodeRNGUnavailable      Code = "RNG_UNAVAILABLE"
 	CodeIdempotencyMismatch Code = "IDEMPOTENCY_KEY_REUSED"
 	CodeWinExceedsCeiling   Code = "WIN_EXCEEDS_CEILING"
+
+	CodeStatusUnchanged          Code = "STATUS_UNCHANGED"
+	CodeStatusTransitionInvalid  Code = "STATUS_TRANSITION_INVALID"
+	CodeSelfExclusionActive      Code = "SELF_EXCLUSION_ACTIVE"
+	CodeSelfExclusionTooShort    Code = "SELF_EXCLUSION_TOO_SHORT"
+	CodeSelfExclusionNotExtended Code = "SELF_EXCLUSION_NOT_EXTENDED"
+	CodeLimitExceeded            Code = "PLAYER_LIMIT_EXCEEDED"
+	CodePlaythroughOutstanding   Code = "PLAYTHROUGH_OUTSTANDING"
 	// CodeGeoBlocked is returned by the jurisdiction fence (no sentinel error:
 	// the middleware rejects before any domain call).
 	CodeGeoBlocked Code = "GEO_BLOCKED"
@@ -101,6 +151,20 @@ func CodeFor(err error) Code {
 		return CodeIdempotencyMismatch
 	case stderrors.Is(err, ErrWinExceedsCeiling):
 		return CodeWinExceedsCeiling
+	case stderrors.Is(err, ErrStatusUnchanged):
+		return CodeStatusUnchanged
+	case stderrors.Is(err, ErrStatusTransitionInvalid):
+		return CodeStatusTransitionInvalid
+	case stderrors.Is(err, ErrSelfExclusionActive):
+		return CodeSelfExclusionActive
+	case stderrors.Is(err, ErrSelfExclusionTooShort):
+		return CodeSelfExclusionTooShort
+	case stderrors.Is(err, ErrSelfExclusionNotExtended):
+		return CodeSelfExclusionNotExtended
+	case stderrors.Is(err, ErrLimitExceeded):
+		return CodeLimitExceeded
+	case stderrors.Is(err, ErrPlaythroughOutstanding):
+		return CodePlaythroughOutstanding
 	default:
 		return CodeInternal
 	}

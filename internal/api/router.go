@@ -85,6 +85,34 @@ func NewRouter(cfg Config) *gin.Engine {
 		v1.Use(cfg.RateLimiter.OperatorMiddleware())
 	}
 	v1.Use(replayMW)
+
+	// ── Compliance group: the full zero-trust chain, MINUS the fence ─────────
+	//
+	// Captured here, before the geo-fence is added to v1, so the routes mounted
+	// on it inherit HMAC + operator rate limiting + replay protection and
+	// nothing more. A gin group snapshots its parent's middleware at creation,
+	// which is what makes this explicit rather than dependent on registration
+	// order further down.
+	//
+	// WHY THE FENCE IS EXCLUDED, DELIBERATELY:
+	//
+	//	A player must ALWAYS be able to exclude themselves, and an operator must
+	//	always be able to suspend or close an account. Both are protective acts
+	//	and neither moves money. Refusing a self-exclusion because the request
+	//	appeared to originate in a prohibited state would be the exact inversion
+	//	of what the fence is for — it would use a player-protection control to
+	//	deny a player protection.
+	//
+	//	This is latent rather than theoretical today: the engine is called
+	//	server-to-server, so the fence currently resolves the gateway's own
+	//	address. The moment a trusted upstream starts forwarding the player's IP
+	//	— which the fence is explicitly designed to support — a fenced
+	//	/player/status would start rejecting self-exclusions from blocked
+	//	jurisdictions. Structuring it correctly now costs one group.
+	//
+	// Every other /api/v1 route stays behind the fence.
+	compliance := v1.Group("")
+
 	// Geo-fence runs AFTER HMAC + replay: only authenticated, non-replayed
 	// operator traffic reaches the jurisdiction check, so the fence can never
 	// be used as an unauthenticated region-probing oracle.
@@ -123,6 +151,24 @@ func NewRouter(cfg Config) *gin.Engine {
 			v1.POST("/player/create", casino.CreatePlayer)
 			v1.POST("/store/purchase", casino.Purchase)
 			v1.POST("/store/redeem", casino.Redeem)
+			// The AMOE free-entry route: coins issued with no purchase behind
+			// them, recorded as PROMO_CREDIT against HOUSE_PROMO_POOL. Inside
+			// the fence — a free entry is still an entry, and offering one into
+			// a jurisdiction where sweepstakes are prohibited is the offence
+			// rather than a way around it.
+			v1.POST("/store/promo-grant", casino.PromoGrant)
+			// The compensating credit for a redemption that was debited and never
+			// paid. Inside the fence with the other money routes.
+			v1.POST("/store/redeem/refund", casino.RedemptionRefund)
+
+			// The status write path, on the unfenced compliance group above.
+			// Signed, rate-limited and replay-protected like everything else —
+			// only the jurisdiction check is omitted, and only because a
+			// protective action must never be geo-denied.
+			compliance.POST("/player/status", casino.UpdateStatus)
+			// Player-set wagering limits, unfenced for the same reason: lowering
+			// a limit is a protective act.
+			compliance.POST("/player/limits", casino.SetPlayerLimit)
 		}
 	}
 

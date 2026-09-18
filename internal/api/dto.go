@@ -8,6 +8,7 @@ package api
 import (
 	"encoding/json"
 
+	"github.com/Gavrielsh/True/internal/domain"
 	"github.com/Gavrielsh/True/internal/repository"
 	"github.com/Gavrielsh/True/pkg/errors"
 )
@@ -100,8 +101,22 @@ type errorResponse struct {
 }
 
 // balancesResponse is the POST /api/v1/session payload.
+//
+// `status` and `playthrough_outstanding` are here so a gateway can refuse a
+// doomed money operation before spending a signed round trip on it. They are
+// ADVISORY: this endpoint takes no lock, so both are true as of the read and
+// may be stale by the time the caller acts. The engine re-checks each of them
+// under the wallet lock on every money path, and that check — not this one —
+// is what actually protects a suspended or self-excluded player.
 type balancesResponse struct {
 	Code     errors.Code               `json:"code"`
 	PlayerID string                    `json:"player_id"`
 	Balances repository.BalanceSummary `json:"balances"`
+	// Status is the player's lifecycle status: ACTIVE, SUSPENDED,
+	// SELF_EXCLUDED, KYC_PENDING or CLOSED.
+	Status string `json:"status"`
+	// PlaythroughOutstanding is the SC still owed to the 1x wagering
+	// requirement, as a decimal string. "0.0000" means redemption will not be
+	// refused on playthrough grounds.
+	PlaythroughOutstanding domain.Money `json:"playthrough_outstanding"`
 }
