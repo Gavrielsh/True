@@ -22,12 +22,14 @@ type fakeCasino struct {
 	status   func(context.Context, repository.StatusTransitionRequest) (repository.StatusTransitionResult, error)
 	setLimit func(context.Context, repository.SetPlayerLimitRequest) (repository.SetPlayerLimitResult, error)
 	refund   func(context.Context, repository.RedemptionRefundRequest) (repository.TxResult, error)
+	promo    func(context.Context, repository.PromoGrantRequest) (repository.TxResult, error)
 
 	lastPurchase repository.PurchaseRequest
 	lastRedeem   repository.RedeemRequest
 	lastStatus   repository.StatusTransitionRequest
 	lastLimit    repository.SetPlayerLimitRequest
 	lastRefund   repository.RedemptionRefundRequest
+	lastPromo    repository.PromoGrantRequest
 }
 
 func (f *fakeCasino) CreatePlayer(ctx context.Context, req repository.CreatePlayerRequest) (repository.CreatePlayerResult, error) {
@@ -47,6 +49,13 @@ func (f *fakeCasino) ProcessRedemptionRefund(ctx context.Context, req repository
 		return repository.TxResult{}, nil
 	}
 	return f.refund(ctx, req)
+}
+func (f *fakeCasino) ProcessPromoGrant(ctx context.Context, req repository.PromoGrantRequest) (repository.TxResult, error) {
+	f.lastPromo = req
+	if f.promo == nil {
+		return repository.TxResult{}, nil
+	}
+	return f.promo(ctx, req)
 }
 func (f *fakeCasino) ProcessStatusTransition(ctx context.Context, req repository.StatusTransitionRequest) (repository.StatusTransitionResult, error) {
 	f.lastStatus = req
@@ -72,6 +81,7 @@ func casinoRouter(c repository.CasinoEngine) *gin.Engine {
 	g.POST("/store/purchase", h.Purchase)
 	g.POST("/store/redeem", h.Redeem)
 	g.POST("/store/redeem/refund", h.RedemptionRefund)
+	g.POST("/store/promo-grant", h.PromoGrant)
 	g.POST("/player/status", h.UpdateStatus)
 	g.POST("/player/limits", h.SetPlayerLimit)
 	return r
@@ -635,5 +645,174 @@ func TestRedemptionRefundHandler_RejectsMalformedInput(t *testing.T) {
 				t.Errorf("a malformed request reached the engine: %+v", eng.lastRefund)
 			}
 		})
+	}
+}
+
+// ----------------------------------------------------------------------------
+// store/promo-grant — the AMOE free-entry route
+// ----------------------------------------------------------------------------
+
+func TestPromoGrantHandler_ForwardsAMOEGrantVerbatim(t *testing.T) {
+	t.Parallel()
+	playerID := uuid.New()
+	eng := &fakeCasino{promo: func(_ context.Context, req repository.PromoGrantRequest) (repository.TxResult, error) {
+		return repository.TxResult{
+			OperatorCode:          req.OperatorCode,
+			OperatorTransactionID: req.OperatorTransactionID,
+			LedgerTransactionID:   uuid.New(),
+			PlayerID:              req.PlayerID,
+			TransactionType:       "PROMO_CREDIT",
+			Amount:                req.SCAmount,
+			Status:                repository.StatusProcessed,
+		}, nil
+	}}
+	r := casinoRouter(eng)
+
+	body := `{"operator_transaction_id":"amoe-1","player_id":"` + playerID.String() +
+		`","sc_amount":"5.0000","channel":"AMOE","channel_reference":"MAIL-2026-000123"}`
+	w := doJSON(r, http.MethodPost, "/api/v1/store/promo-grant", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	got := eng.lastPromo
+	if got.PlayerID != playerID {
+		t.Errorf("player_id: got %s want %s", got.PlayerID, playerID)
+	}
+	if got.Channel != repository.PromoChannelAMOE {
+		t.Errorf("channel: got %q want AMOE", got.Channel)
+	}
+	if got.ChannelReference != "MAIL-2026-000123" {
+		t.Errorf("channel_reference: got %q want MAIL-2026-000123", got.ChannelReference)
+	}
+	if got.SCAmount.String() != "5.0000" {
+		t.Errorf("sc_amount: got %s want 5.0000", got.SCAmount)
+	}
+	// An omitted gc_amount is a zero grant leg, not a parse failure.
+	if got.GCAmount.String() != "0.0000" {
+		t.Errorf("gc_amount: got %s want 0.0000 for an omitted leg", got.GCAmount)
+	}
+	if got.OperatorCode != "OP1" {
+		t.Errorf("operator_code: got %q want the VERIFIED OP1, never a client-supplied value", got.OperatorCode)
+	}
+}
+
+// The DTO has no field that could carry an SC_REDEEMABLE grant. A caller that
+// tries anyway is ignored rather than obeyed — asserted here at the wire edge so
+// the guarantee is proven where an attacker actually reaches it, not only in the
+// allocator.
+func TestPromoGrantHandler_HasNoRouteToRedeemableBalance(t *testing.T) {
+	t.Parallel()
+	playerID := uuid.New()
+	eng := &fakeCasino{}
+	r := casinoRouter(eng)
+
+	body := `{"operator_transaction_id":"amoe-2","player_id":"` + playerID.String() +
+		`","sc_amount":"1.0000","channel":"AMOE","channel_reference":"MAIL-1",` +
+		`"sc_redeemable_amount":"999999.0000","sc_redeemable":"999999.0000"}`
+	w := doJSON(r, http.MethodPost, "/api/v1/store/promo-grant", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	// The request the engine receives carries only the two legs the type has.
+	if eng.lastPromo.SCAmount.String() != "1.0000" {
+		t.Errorf("sc_amount: got %s want 1.0000", eng.lastPromo.SCAmount)
+	}
+	if eng.lastPromo.GCAmount.String() != "0.0000" {
+		t.Errorf("gc_amount: got %s want 0.0000", eng.lastPromo.GCAmount)
+	}
+}
+
+// Money crosses this boundary as decimal strings. A JSON number is refused at
+// the bind step — the same rule every other money route on this API enforces,
+// and the one that keeps float rounding out of the ledger.
+func TestPromoGrantHandler_RejectsNativeJSONNumbers(t *testing.T) {
+	t.Parallel()
+	playerID := uuid.New()
+	eng := &fakeCasino{}
+	r := casinoRouter(eng)
+
+	body := `{"operator_transaction_id":"amoe-3","player_id":"` + playerID.String() +
+		`","sc_amount":5.0,"channel":"AMOE","channel_reference":"MAIL-1"}`
+	w := doJSON(r, http.MethodPost, "/api/v1/store/promo-grant", body)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status: got %d want 400 for a native JSON number; body=%s", w.Code, w.Body.String())
+	}
+	if eng.lastPromo.OperatorTransactionID != "" {
+		t.Error("engine was called with a float-bearing payload")
+	}
+}
+
+func TestPromoGrantHandler_RejectsMissingChannel(t *testing.T) {
+	t.Parallel()
+	playerID := uuid.New()
+	eng := &fakeCasino{}
+	r := casinoRouter(eng)
+
+	body := `{"operator_transaction_id":"amoe-4","player_id":"` + playerID.String() + `","sc_amount":"1.0000"}`
+	w := doJSON(r, http.MethodPost, "/api/v1/store/promo-grant", body)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status: got %d want 400; body=%s", w.Code, w.Body.String())
+	}
+	if eng.lastPromo.OperatorTransactionID != "" {
+		t.Error("engine was called for a channel-less grant")
+	}
+}
+
+func TestPromoGrantHandler_RejectsMalformedAmount(t *testing.T) {
+	t.Parallel()
+	playerID := uuid.New()
+	eng := &fakeCasino{}
+	r := casinoRouter(eng)
+
+	body := `{"operator_transaction_id":"amoe-5","player_id":"` + playerID.String() +
+		`","sc_amount":"1.00005","channel":"BONUS"}`
+	w := doJSON(r, http.MethodPost, "/api/v1/store/promo-grant", body)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status: got %d want 400 for sub-scale precision; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// A blocked player is refused by the ENGINE, not the handler — the guard lives
+// inside the wallet lock where it is serialized against concurrent traffic. This
+// asserts the handler maps that refusal to the right status rather than masking
+// it as a 500.
+func TestPromoGrantHandler_MapsBlockedPlayerRefusal(t *testing.T) {
+	t.Parallel()
+	playerID := uuid.New()
+	eng := &fakeCasino{promo: func(_ context.Context, _ repository.PromoGrantRequest) (repository.TxResult, error) {
+		return repository.TxResult{}, errs.ErrPlayerNotActive
+	}}
+	r := casinoRouter(eng)
+
+	body := `{"operator_transaction_id":"amoe-6","player_id":"` + playerID.String() +
+		`","sc_amount":"5.0000","channel":"AMOE","channel_reference":"MAIL-1"}`
+	w := doJSON(r, http.MethodPost, "/api/v1/store/promo-grant", body)
+	if w.Code == http.StatusOK || w.Code >= http.StatusInternalServerError {
+		t.Fatalf("status: got %d, want a 4xx refusal; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// The channel string reaches the engine unmangled, including a lowercase one the
+// engine will normalize. The handler must not silently "fix" or drop it — a
+// grant whose channel was rewritten in transit is exactly the evidence problem
+// the typed column exists to prevent.
+func TestPromoGrantHandler_ForwardsChannelUnmangled(t *testing.T) {
+	t.Parallel()
+	playerID := uuid.New()
+
+	for _, channel := range []string{"AMOE", "BONUS", "COMPENSATION", "amoe", "NOT_A_CHANNEL"} {
+		eng := &fakeCasino{}
+		r := casinoRouter(eng)
+		body := `{"operator_transaction_id":"amoe-7","player_id":"` + playerID.String() +
+			`","sc_amount":"1.0000","channel":"` + channel + `","channel_reference":"MAIL-1"}`
+		w := doJSON(r, http.MethodPost, "/api/v1/store/promo-grant", body)
+		if w.Code != http.StatusOK {
+			t.Fatalf("channel %q: status %d; body=%s", channel, w.Code, w.Body.String())
+		}
+		if string(eng.lastPromo.Channel) != channel {
+			t.Errorf("channel %q arrived as %q", channel, eng.lastPromo.Channel)
+		}
 	}
 }

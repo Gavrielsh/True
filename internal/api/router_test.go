@@ -284,3 +284,181 @@ func TestRouter_ComplianceRouteIsNotGeoFenced(t *testing.T) {
 		}
 	})
 }
+
+// TestRouter_PromoGrantIsFullyPerimetered pins the security posture of the AMOE
+// free-entry route.
+//
+// This endpoint is a pure CREDIT bounded by nothing the player owns. A forged
+// redemption is capped by the balance available to take; a forged grant is
+// capped by nothing at all, so an unsigned caller reaching it could mint the
+// casino's own currency without limit. Every layer below is therefore asserted
+// rather than assumed — including the geo-fence, which this route sits INSIDE,
+// unlike /player/status and /player/limits. Those are protective acts that must
+// never be geo-denied; handing someone a free entry into a sweepstakes is not a
+// protective act, and offering one where sweepstakes are prohibited is the
+// offence rather than a way around it.
+func TestRouter_PromoGrantIsFullyPerimetered(t *testing.T) {
+	t.Parallel()
+
+	const secret = "shared-secret"
+	const (
+		blockedIP  = "203.0.113.9"
+		remoteAddr = blockedIP + ":51000"
+		allowedIP  = "198.51.100.4"
+		allowedTo  = allowedIP + ":51000"
+	)
+
+	resolver := &fakeResolver{regions: map[string]string{
+		blockedIP: "US-WA", // blocked jurisdiction
+		allowedIP: "US-NY",
+	}}
+	gf := newFence(t, resolver, nil, nil)
+
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+
+	var granted int
+	casino := &fakeCasino{
+		promo: func(_ context.Context, req repository.PromoGrantRequest) (repository.TxResult, error) {
+			granted++
+			return repository.TxResult{
+				OperatorCode: req.OperatorCode, PlayerID: req.PlayerID,
+				TransactionType: "PROMO_CREDIT", Amount: req.SCAmount,
+				PostBalances: repository.BalanceSummary{GC: mzero(t), SCUnplayed: m(t, "5.0000"), SCRedeemable: mzero(t)},
+				Status:       repository.StatusProcessed,
+			}, nil
+		},
+	}
+
+	r := NewRouter(Config{
+		Casino:   casino,
+		Redis:    client,
+		Secrets:  map[string]string{"OP1": secret},
+		GeoFence: gf,
+		Logger:   discardLogger(),
+	})
+
+	playerID := uuid.New().String()
+	grantBody := func() string {
+		return `{"operator_transaction_id":"amoe-` + uuid.NewString() + `","player_id":"` + playerID +
+			`","sc_amount":"5.0000","channel":"AMOE","channel_reference":"MAIL-2026-000123"}`
+	}
+
+	t.Run("a correctly signed grant from an allowed region succeeds", func(t *testing.T) {
+		req := signedRequest(http.MethodPost, "/api/v1/store/promo-grant", grantBody(), secret, uuid.NewString())
+		req.RemoteAddr = allowedTo
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status: got %d want 200; body=%s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("an unsigned grant is refused", func(t *testing.T) {
+		before := granted
+		body := grantBody()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/store/promo-grant", strings.NewReader(body))
+		req.RemoteAddr = allowedTo
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("unsigned: got %d want 401; body=%s", w.Code, w.Body.String())
+		}
+		if granted != before {
+			t.Error("the engine issued coins for an UNSIGNED grant request")
+		}
+	})
+
+	t.Run("a wrongly signed grant is refused", func(t *testing.T) {
+		before := granted
+		req := signedRequest(http.MethodPost, "/api/v1/store/promo-grant", grantBody(), "the-wrong-secret", uuid.NewString())
+		req.RemoteAddr = allowedTo
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("bad signature: got %d want 401; body=%s", w.Code, w.Body.String())
+		}
+		if granted != before {
+			t.Error("the engine issued coins for a BADLY SIGNED grant request")
+		}
+	})
+
+	// A signature covers the body, so tampering with the amount after signing
+	// must fail. The interesting attack on this route is not forging a grant
+	// from nothing but inflating one the operator legitimately authorised.
+	t.Run("a tampered amount invalidates the signature", func(t *testing.T) {
+		before := granted
+		body := grantBody()
+		req := signedRequest(http.MethodPost, "/api/v1/store/promo-grant", body, secret, uuid.NewString())
+		// Re-point the body at an inflated grant, leaving the signature alone.
+		tampered := strings.Replace(body, `"sc_amount":"5.0000"`, `"sc_amount":"5000000.0000"`, 1)
+		req.Body = io.NopCloser(strings.NewReader(tampered))
+		req.ContentLength = int64(len(tampered))
+		req.RemoteAddr = allowedTo
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("tampered amount: got %d want 401; body=%s", w.Code, w.Body.String())
+		}
+		if granted != before {
+			t.Error("the engine issued coins for a request whose amount was altered after signing")
+		}
+	})
+
+	t.Run("a replayed nonce is refused", func(t *testing.T) {
+		body := grantBody()
+		nonce := uuid.NewString()
+
+		first := signedRequest(http.MethodPost, "/api/v1/store/promo-grant", body, secret, nonce)
+		first.RemoteAddr = allowedTo
+		w1 := httptest.NewRecorder()
+		r.ServeHTTP(w1, first)
+		if w1.Code != http.StatusOK {
+			t.Fatalf("first grant: got %d want 200; body=%s", w1.Code, w1.Body.String())
+		}
+
+		before := granted
+		second := signedRequest(http.MethodPost, "/api/v1/store/promo-grant", body, secret, nonce)
+		second.RemoteAddr = allowedTo
+		w2 := httptest.NewRecorder()
+		r.ServeHTTP(w2, second)
+
+		if w2.Code == http.StatusOK {
+			t.Fatalf("a replayed nonce was accepted: got %d; body=%s", w2.Code, w2.Body.String())
+		}
+		if granted != before {
+			t.Error("the engine issued coins a second time for a REPLAYED grant request")
+		}
+	})
+
+	// The fence. Asserted because the route's placement is invisible at the call
+	// site: moving it onto the unfenced `compliance` group alongside
+	// /player/status would silently open a free-coin channel into prohibited
+	// jurisdictions, and nothing else would notice.
+	t.Run("a grant from a blocked jurisdiction is fenced", func(t *testing.T) {
+		before := granted
+		req := signedRequest(http.MethodPost, "/api/v1/store/promo-grant", grantBody(), secret, uuid.NewString())
+		req.RemoteAddr = remoteAddr
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("blocked region: got %d want 403; body=%s", w.Code, w.Body.String())
+		}
+		var resp errorResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp.Code != errs.CodeGeoBlocked {
+			t.Errorf("code: got %s want %s", resp.Code, errs.CodeGeoBlocked)
+		}
+		if granted != before {
+			t.Error("the engine issued coins into a BLOCKED jurisdiction")
+		}
+	})
+}

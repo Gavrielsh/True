@@ -151,6 +151,12 @@ func NewRouter(cfg Config) *gin.Engine {
 			v1.POST("/player/create", casino.CreatePlayer)
 			v1.POST("/store/purchase", casino.Purchase)
 			v1.POST("/store/redeem", casino.Redeem)
+			// The AMOE free-entry route: coins issued with no purchase behind
+			// them, recorded as PROMO_CREDIT against HOUSE_PROMO_POOL. Inside
+			// the fence — a free entry is still an entry, and offering one into
+			// a jurisdiction where sweepstakes are prohibited is the offence
+			// rather than a way around it.
+			v1.POST("/store/promo-grant", casino.PromoGrant)
 			// The compensating credit for a redemption that was debited and never
 			// paid. Inside the fence with the other money routes.
 			v1.POST("/store/redeem/refund", casino.RedemptionRefund)

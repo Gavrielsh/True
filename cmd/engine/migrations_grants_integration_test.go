@@ -94,6 +94,17 @@ var wantGrants = map[string][]string{
 	// obligation be made to disappear, which is exactly what the record exists
 	// to prevent. A grant is discharged by being wagered, never by being removed.
 	"sc_playthrough": {"INSERT", "SELECT", "UPDATE"},
+	// promo_grants (000014): SELECT and INSERT only — stricter than
+	// sc_playthrough, and deliberately so. sc_playthrough needs UPDATE because
+	// its counter advances as the player wagers; a promo grant has no counter.
+	// It is a statement about something that happened, so the only legitimate
+	// operations are reading it and adding another.
+	//
+	// The omission of UPDATE is the load-bearing one here: it is what stops a
+	// BONUS being relabelled AMOE after the fact, which would manufacture
+	// evidence of a free-entry route that was never offered — the precise fraud
+	// this record exists to make impossible.
+	"promo_grants": {"INSERT", "SELECT"},
 }
 
 func integrationURL(t *testing.T) string {

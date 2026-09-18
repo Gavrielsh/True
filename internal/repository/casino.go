@@ -58,6 +58,14 @@ type CasinoEngine interface {
 	// for a fiat redemption. Idempotent + Ghost-Spin safe.
 	ProcessRedeem(ctx context.Context, req RedeemRequest) (TxResult, error)
 
+	// ProcessPromoGrant issues GC and/or SC_UNPLAYED against HOUSE_PROMO_POOL
+	// with NO purchase behind it — the AMOE free-entry route and its siblings.
+	// Recorded as PROMO_CREDIT, so "issued for payment" and "issued for free"
+	// are separable in the ledger by type AND by counterparty account. Unlike
+	// the refund path it DOES refuse a blocked player: a grant offers new coins,
+	// and a self-excluded player must not be offered any. See promo.go.
+	ProcessPromoGrant(ctx context.Context, req PromoGrantRequest) (TxResult, error)
+
 	// ProcessRedemptionRefund returns SC_REDEEMABLE a redemption debited but
 	// never paid out, debiting HOUSE_REDEMPTION_POOL. It is the ONE money path
 	// that deliberately does NOT refuse a blocked player — see refund.go.

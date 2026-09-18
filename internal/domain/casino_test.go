@@ -262,3 +262,158 @@ func TestAllocateRedemptionRefund_RejectsNonPositive(t *testing.T) {
 		}
 	}
 }
+
+// ----------------------------------------------------------------------------
+// Promotional grant allocation (AMOE)
+// ----------------------------------------------------------------------------
+
+func TestAllocatePromoGrant_CreditsGCAndSCUnplayed(t *testing.T) {
+	t.Parallel()
+	w := Wallet{
+		GC:           mustMoney(t, "10.0000"),
+		SCUnplayed:   mustMoney(t, "2.0000"),
+		SCRedeemable: mustMoney(t, "5.0000"),
+	}
+
+	alloc, err := w.AllocatePromoGrant(mustMoney(t, "1000.0000"), mustMoney(t, "1.0000"))
+	if err != nil {
+		t.Fatalf("AllocatePromoGrant: %v", err)
+	}
+	if len(alloc.Credits) != 2 {
+		t.Fatalf("credits: got %d want 2 (%+v)", len(alloc.Credits), alloc.Credits)
+	}
+
+	post := w.ApplyPromoGrant(alloc)
+	if post.GC.String() != "1010.0000" {
+		t.Errorf("GC: got %s want 1010.0000", post.GC)
+	}
+	if post.SCUnplayed.String() != "3.0000" {
+		t.Errorf("SCUnplayed: got %s want 3.0000", post.SCUnplayed)
+	}
+	// The line that matters: a free entry must not move the cashable bucket.
+	if post.SCRedeemable.String() != "5.0000" {
+		t.Errorf("SCRedeemable moved to %s; a promo grant must never touch it", post.SCRedeemable)
+	}
+}
+
+// A grant of SC alone is the ordinary AMOE shape: a mail-in entry yields Sweeps
+// Coins, not a Gold Coin package.
+func TestAllocatePromoGrant_SCOnlyIsTheAMOEShape(t *testing.T) {
+	t.Parallel()
+	w := Wallet{}
+
+	alloc, err := w.AllocatePromoGrant(mustMoney(t, "0.0000"), mustMoney(t, "5.0000"))
+	if err != nil {
+		t.Fatalf("AllocatePromoGrant: %v", err)
+	}
+	if len(alloc.Credits) != 1 {
+		t.Fatalf("credits: got %d want 1 (%+v)", len(alloc.Credits), alloc.Credits)
+	}
+	if alloc.Credits[0].Currency != CurrencySCUnplayed {
+		t.Errorf("currency: got %s want SC_UNPLAYED", alloc.Credits[0].Currency)
+	}
+
+	post := w.ApplyPromoGrant(alloc)
+	if post.SCUnplayed.String() != "5.0000" {
+		t.Errorf("SCUnplayed: got %s want 5.0000", post.SCUnplayed)
+	}
+	if post.GC.String() != "0.0000" {
+		t.Errorf("GC moved to %s on an SC-only grant", post.GC)
+	}
+}
+
+// AllocatePromoGrant cannot express an SC_REDEEMABLE credit. This asserts the
+// property directly rather than trusting the two call sites above to have
+// covered every shape.
+func TestAllocatePromoGrant_NeverEmitsRedeemable(t *testing.T) {
+	t.Parallel()
+	w := Wallet{}
+
+	for _, tc := range []struct{ gc, sc string }{
+		{"1.0000", "0.0000"},
+		{"0.0000", "1.0000"},
+		{"1.0000", "1.0000"},
+		{"999999999999.9999", "999999999999.9999"},
+	} {
+		alloc, err := w.AllocatePromoGrant(mustMoney(t, tc.gc), mustMoney(t, tc.sc))
+		if err != nil {
+			t.Fatalf("AllocatePromoGrant(%s,%s): %v", tc.gc, tc.sc, err)
+		}
+		for _, c := range alloc.Credits {
+			if c.Currency == CurrencySCRedeemable {
+				t.Fatalf("grant(%s,%s) emitted an SC_REDEEMABLE credit — a no-purchase path must never mint cashable tokens", tc.gc, tc.sc)
+			}
+			if !c.Amount.IsPositive() {
+				t.Errorf("grant(%s,%s) emitted a non-positive %s credit %s", tc.gc, tc.sc, c.Currency, c.Amount)
+			}
+		}
+	}
+}
+
+// ApplyPromoGrant is the second line of defence: even handed an allocation that
+// AllocatePromoGrant could not have produced, it must not credit SC_REDEEMABLE.
+// This is the difference from ApplyPurchase, which adds that currency.
+func TestApplyPromoGrant_DropsAHandBuiltRedeemableCredit(t *testing.T) {
+	t.Parallel()
+	w := Wallet{SCRedeemable: mustMoney(t, "7.0000")}
+
+	forged := PromoGrantAllocation{
+		Credits: []Credit{{Currency: CurrencySCRedeemable, Amount: mustMoney(t, "1000000.0000")}},
+	}
+	post := w.ApplyPromoGrant(forged)
+
+	if post.SCRedeemable.String() != "7.0000" {
+		t.Fatalf("SCRedeemable became %s; ApplyPromoGrant must drop a redeemable credit, not apply it", post.SCRedeemable)
+	}
+}
+
+func TestAllocatePromoGrant_RejectsEmptyAndNegativeGrants(t *testing.T) {
+	t.Parallel()
+	w := Wallet{}
+
+	// A grant of nothing is not a grant.
+	if _, err := w.AllocatePromoGrant(mustMoney(t, "0.0000"), mustMoney(t, "0.0000")); !errors.Is(err, errs.ErrInvalidAmount) {
+		t.Errorf("zero grant: got %v, want ErrInvalidAmount", err)
+	}
+	// A negative component would post a ledger entry the amount > 0 CHECK
+	// refuses; caught here so the failure is a clean 400, not a 500 from the DB.
+	neg := ZeroMoney().Sub(mustMoney(t, "1.0000"))
+	if _, err := w.AllocatePromoGrant(neg, mustMoney(t, "1.0000")); !errors.Is(err, errs.ErrInvalidAmount) {
+		t.Errorf("negative gc: got %v, want ErrInvalidAmount", err)
+	}
+	if _, err := w.AllocatePromoGrant(mustMoney(t, "1.0000"), neg); !errors.Is(err, errs.ErrInvalidAmount) {
+		t.Errorf("negative sc: got %v, want ErrInvalidAmount", err)
+	}
+}
+
+// Equal dignity at the allocator level: the free route and the paid route must
+// put the same coins in the same buckets. If these ever diverge, an AMOE entrant
+// is getting a materially different product from a purchaser — which is the
+// condition that separates a lawful sweepstakes from a lottery.
+func TestPromoGrantAndPurchase_CreditIdenticalBuckets(t *testing.T) {
+	t.Parallel()
+	w := Wallet{}
+	gc, sc := mustMoney(t, "5000.0000"), mustMoney(t, "5.0000")
+
+	purchaseAlloc, err := w.AllocatePurchase(gc, sc)
+	if err != nil {
+		t.Fatalf("AllocatePurchase: %v", err)
+	}
+	promoAlloc, err := w.AllocatePromoGrant(gc, sc)
+	if err != nil {
+		t.Fatalf("AllocatePromoGrant: %v", err)
+	}
+
+	bought := w.ApplyPurchase(purchaseAlloc)
+	granted := w.ApplyPromoGrant(promoAlloc)
+
+	if bought.GC.String() != granted.GC.String() {
+		t.Errorf("GC: purchase gave %s, AMOE gave %s", bought.GC, granted.GC)
+	}
+	if bought.SCUnplayed.String() != granted.SCUnplayed.String() {
+		t.Errorf("SC_UNPLAYED: purchase gave %s, AMOE gave %s", bought.SCUnplayed, granted.SCUnplayed)
+	}
+	if bought.SCRedeemable.String() != granted.SCRedeemable.String() {
+		t.Errorf("SC_REDEEMABLE: purchase gave %s, AMOE gave %s", bought.SCRedeemable, granted.SCRedeemable)
+	}
+}

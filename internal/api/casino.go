@@ -74,6 +74,30 @@ type redemptionRefundDTO struct {
 	Metadata               json.RawMessage `json:"metadata,omitempty"`
 }
 
+// promoGrantDTO is the POST /api/v1/store/promo-grant wire format — the AMOE
+// free-entry route and its siblings.
+//
+// gc_amount and sc_amount are decimal STRINGS like every other money field on
+// this API, and both are optional individually ("" → 0) provided at least one is
+// positive. There is no sc_redeemable field and there cannot be one: a
+// no-purchase path that could mint cashable tokens would be a withdrawal channel
+// with neither payment nor gameplay behind it. sc_amount is credited to
+// SC_UNPLAYED under the same 1x wagering requirement a purchaser's promotional
+// SC carries.
+//
+// channel_reference is REQUIRED when channel is AMOE — it is the operator's
+// identifier for the mail-in entry this grant answers, and an AMOE record that
+// cannot be tied back to a received entry is an assertion rather than evidence.
+type promoGrantDTO struct {
+	OperatorTransactionID string          `json:"operator_transaction_id" binding:"required"`
+	PlayerID              string          `json:"player_id"               binding:"required"`
+	GCAmount              string          `json:"gc_amount,omitempty"`
+	SCAmount              string          `json:"sc_amount,omitempty"`
+	Channel               string          `json:"channel"                 binding:"required"`
+	ChannelReference      string          `json:"channel_reference,omitempty"`
+	Metadata              json.RawMessage `json:"metadata,omitempty"`
+}
+
 // statusTransitionDTO is the POST /api/v1/player/status wire format.
 //
 // self_exclusion_days is a whole-day COUNT, required when to_status is
@@ -237,6 +261,66 @@ func (h *CasinoHandlers) Redeem(c *gin.Context) {
 		OperatorTransactionID: dto.OperatorTransactionID,
 		PlayerID:              playerID,
 		Amount:                amount,
+		Metadata:              dto.Metadata,
+		BodyHash:              BodyHashFromContext(c.Request.Context()),
+	})
+	telemetry.EndSpan(span, err)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, successResponse{Code: errors.CodeOK, Result: result})
+}
+
+// PromoGrant handles POST /api/v1/store/promo-grant — issuing coins with no
+// purchase behind them.
+//
+// Behind the same HMAC + replay perimeter as every other money route, and for
+// the sharpest version of the usual reason: this is a pure CREDIT bounded by
+// nothing the player owns. A redemption an attacker forged is capped by the
+// balance available to take; a grant an attacker forged is capped by nothing at
+// all. An unsigned caller reaching this route could mint the casino's own
+// currency without limit.
+//
+// Inside the geo-fence, unlike /player/status and /player/limits. Those are
+// protective acts that must never be geo-denied; this one hands a player new
+// entries, which is exactly what a blocked jurisdiction must not receive —
+// offering a free entry into a sweepstakes where sweepstakes are prohibited is
+// the offence, not a workaround for it.
+func (h *CasinoHandlers) PromoGrant(c *gin.Context) {
+	var dto promoGrantDTO
+	if err := c.ShouldBindJSON(&dto); err != nil {
+		respondErrorCode(c, http.StatusBadRequest, errors.CodeInvalidAmount, "invalid request body")
+		return
+	}
+
+	playerID, ok := parsePlayerID(c, dto.PlayerID)
+	if !ok {
+		return
+	}
+	// Both optional individually; the engine refuses a grant of nothing. Parsed
+	// with parseOptionalAmount so an omitted leg is 0 rather than a 400 — a
+	// GC-only bonus and an SC-only AMOE entry are both ordinary shapes here.
+	gcAmount, ok := parseOptionalAmount(c, dto.GCAmount)
+	if !ok {
+		return
+	}
+	scAmount, ok := parseOptionalAmount(c, dto.SCAmount)
+	if !ok {
+		return
+	}
+
+	operatorCode := OperatorCodeFromContext(c.Request.Context())
+	ctx, span := moneySpan(c, "http.promo_grant", operatorCode, dto.OperatorTransactionID, playerID)
+
+	result, err := h.casino.ProcessPromoGrant(ctx, repository.PromoGrantRequest{
+		OperatorCode:          operatorCode,
+		OperatorTransactionID: dto.OperatorTransactionID,
+		PlayerID:              playerID,
+		GCAmount:              gcAmount,
+		SCAmount:              scAmount,
+		Channel:               repository.PromoChannel(dto.Channel),
+		ChannelReference:      dto.ChannelReference,
 		Metadata:              dto.Metadata,
 		BodyHash:              BodyHashFromContext(c.Request.Context()),
 	})
