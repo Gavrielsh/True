@@ -32,7 +32,11 @@ type Config struct {
 	// Game wires the SERVER-AUTHORITATIVE /spin endpoint, where the engine
 	// draws the outcome and derives the win itself. Optional: when nil the
 	// route is not registered.
-	Game   repository.GameEngine
+	Game repository.GameEngine
+	// KYC wires the Zone 1 ingestion route (Task C4) that receives
+	// identity-verification decisions relayed by the Gateway. Optional:
+	// when nil the route is not registered.
+	KYC    repository.KYCEngine
 	Logger *slog.Logger
 }
 
@@ -85,6 +89,16 @@ func NewRouter(cfg Config) *gin.Engine {
 		v1.Use(cfg.RateLimiter.OperatorMiddleware())
 	}
 	v1.Use(replayMW)
+
+	// KYC ingestion (Task C4) is registered BEFORE the GeoFence mount below,
+	// so it inherits HMAC + rate-limit + replay-guard but deliberately
+	// bypasses jurisdiction checking: this is Gateway-to-engine service
+	// traffic relaying a provider's decision, not a player action tied to
+	// their current region.
+	if cfg.KYC != nil {
+		v1.POST("/kyc/decision", NewKYCHandlers(cfg.KYC).Decision)
+	}
+
 	// Geo-fence runs AFTER HMAC + replay: only authenticated, non-replayed
 	// operator traffic reaches the jurisdiction check, so the fence can never
 	// be used as an unauthenticated region-probing oracle.

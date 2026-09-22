@@ -125,6 +125,7 @@ func run() error {
 
 	eng := repository.New(pool, idem, logger, repository.WithMaxWinAmount(maxWin))
 	casinoEng := repository.NewCasino(pool, idem, logger)
+	kycEng := repository.NewKYC(pool, idem, logger)
 	// Server-authoritative game engine. Passing a nil RNG selects crypto/rand
 	// — there is deliberately no config knob for a weaker entropy source.
 	gameEng := repository.NewGame(pool, idem, nil, logger)
@@ -153,6 +154,7 @@ func run() error {
 		Engine:      eng,
 		Casino:      casinoEng,
 		Game:        gameEng,
+		KYC:         kycEng,
 		DB:          pool,
 		Redis:       rdb,
 		Secrets:     cfg.OperatorSecrets,
