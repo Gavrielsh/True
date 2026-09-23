@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -18,9 +19,11 @@ type fakeCasino struct {
 	create   func(context.Context, repository.CreatePlayerRequest) (repository.CreatePlayerResult, error)
 	purchase func(context.Context, repository.PurchaseRequest) (repository.TxResult, error)
 	redeem   func(context.Context, repository.RedeemRequest) (repository.TxResult, error)
+	promo    func(context.Context, repository.PromoGrantRequest) (repository.TxResult, error)
 
 	lastPurchase repository.PurchaseRequest
 	lastRedeem   repository.RedeemRequest
+	lastPromo    repository.PromoGrantRequest
 }
 
 func (f *fakeCasino) CreatePlayer(ctx context.Context, req repository.CreatePlayerRequest) (repository.CreatePlayerResult, error) {
@@ -33,6 +36,10 @@ func (f *fakeCasino) ProcessPurchase(ctx context.Context, req repository.Purchas
 func (f *fakeCasino) ProcessRedeem(ctx context.Context, req repository.RedeemRequest) (repository.TxResult, error) {
 	f.lastRedeem = req
 	return f.redeem(ctx, req)
+}
+func (f *fakeCasino) ProcessPromoGrant(ctx context.Context, req repository.PromoGrantRequest) (repository.TxResult, error) {
+	f.lastPromo = req
+	return f.promo(ctx, req)
 }
 
 // casinoRouter mounts the casino handlers behind a stub middleware that injects
@@ -49,6 +56,7 @@ func casinoRouter(c repository.CasinoEngine) *gin.Engine {
 	g.POST("/player/create", h.CreatePlayer)
 	g.POST("/store/purchase", h.Purchase)
 	g.POST("/store/redeem", h.Redeem)
+	g.POST("/store/promo-grant", h.PromoGrant)
 	return r
 }
 
@@ -236,5 +244,84 @@ func TestRedeemHandler_InsufficientMaps400(t *testing.T) {
 	}
 	if got := decodeErr(t, w).Code; got != errs.CodeInsufficientFunds {
 		t.Errorf("code: got %s want %s", got, errs.CodeInsufficientFunds)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// store/promo-grant
+// ----------------------------------------------------------------------------
+
+func TestPromoGrantHandler_BonusSCOnly(t *testing.T) {
+	t.Parallel()
+	playerID := uuid.New()
+	eng := &fakeCasino{promo: func(_ context.Context, req repository.PromoGrantRequest) (repository.TxResult, error) {
+		return repository.TxResult{PlayerID: req.PlayerID, TransactionType: "PROMO_CREDIT", Amount: req.SCAmount,
+			Status: repository.StatusProcessed}, nil
+	}}
+	body := `{"operator_transaction_id":"bonus:daily:u1:2026-09-23","player_id":"` + playerID.String() +
+		`","sc_amount":"0.2000","channel":"BONUS"}`
+	w := doJSON(casinoRouter(eng), http.MethodPost, "/api/v1/store/promo-grant", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d want 200; body=%s", w.Code, w.Body.String())
+	}
+	got := eng.lastPromo
+	if got.OperatorCode != "OP1" || got.Channel != repository.PromoChannelBonus {
+		t.Errorf("operator/channel: got %q/%q", got.OperatorCode, got.Channel)
+	}
+	if !got.GCAmount.IsZero() || got.SCAmount.String() != "0.2000" {
+		t.Errorf("amounts: gc=%s sc=%s (an omitted gc_amount must default to zero)", got.GCAmount, got.SCAmount)
+	}
+	var env struct {
+		Code   string `json:"code"`
+		Result struct {
+			TransactionType string `json:"transaction_type"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil || env.Result.TransactionType != "PROMO_CREDIT" {
+		t.Errorf("envelope: %+v err=%v", env, err)
+	}
+}
+
+func TestPromoGrantHandler_InvalidInput(t *testing.T) {
+	t.Parallel()
+	validID := uuid.New().String()
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"missing_channel", `{"operator_transaction_id":"op","player_id":"` + validID + `","gc_amount":"1.0000"}`},
+		{"unknown_channel", `{"operator_transaction_id":"op","player_id":"` + validID + `","gc_amount":"1.0000","channel":"FREE_MONEY"}`},
+		{"bad_player_id", `{"operator_transaction_id":"op","player_id":"nope","gc_amount":"1.0000","channel":"BONUS"}`},
+		{"too_precise_sc", `{"operator_transaction_id":"op","player_id":"` + validID + `","sc_amount":"0.00001","channel":"BONUS"}`},
+		{"no_redeemable_field_exists", `{"operator_transaction_id":"op","player_id":"` + validID + `","channel":"BONUS","sc_amount":"abc"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			eng := &fakeCasino{promo: func(_ context.Context, _ repository.PromoGrantRequest) (repository.TxResult, error) {
+				t.Error("engine must not be called on invalid input")
+				return repository.TxResult{}, nil
+			}}
+			w := doJSON(casinoRouter(eng), http.MethodPost, "/api/v1/store/promo-grant", tc.body)
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("status: got %d want 400; body=%s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestPromoGrantHandler_EngineRefusalIsMapped(t *testing.T) {
+	t.Parallel()
+	eng := &fakeCasino{promo: func(_ context.Context, _ repository.PromoGrantRequest) (repository.TxResult, error) {
+		return repository.TxResult{}, errs.ErrPlayerNotActive
+	}}
+	body := `{"operator_transaction_id":"amoe:1","player_id":"` + uuid.New().String() +
+		`","sc_amount":"1.0000","channel":"AMOE","channel_reference":"AMOE-1"}`
+	w := doJSON(casinoRouter(eng), http.MethodPost, "/api/v1/store/promo-grant", body)
+	if w.Code == http.StatusOK {
+		t.Fatalf("a refused grant must not be 200; body=%s", w.Body.String())
+	}
+	if !json.Valid(w.Body.Bytes()) || !strings.Contains(w.Body.String(), "PLAYER_NOT_ACTIVE") {
+		t.Errorf("body: %s", w.Body.String())
 	}
 }

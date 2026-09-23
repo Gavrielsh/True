@@ -131,3 +131,36 @@ func (w Wallet) ApplyRedeem(a RedeemAllocation) Wallet {
 	out.SCRedeemable = out.SCRedeemable.Sub(a.Debit.Amount)
 	return out
 }
+
+// ----------------------------------------------------------------------------
+// Promo grant allocation (no purchase behind it)
+// ----------------------------------------------------------------------------
+
+// AllocatePromoGrant computes the credit plan for a no-purchase grant (AMOE,
+// marketing bonus, goodwill compensation) of `gc` Gold Coins plus `sc`
+// Sweeps Coins, without mutating the wallet.
+//
+// The SC is issued as SC_UNPLAYED, exactly like a purchaser's promotional SC:
+// it must be played through before any winnings become SC_REDEEMABLE. A
+// no-purchase path that could mint redeemable tokens would be a withdrawal
+// channel with neither payment nor gameplay behind it, so the plan type
+// (shared with purchases) cannot express one.
+//
+// Errors:
+//   - ErrInvalidAmount — a negative component, or a zero-value grant.
+func (w Wallet) AllocatePromoGrant(gc, sc Money) (PurchaseAllocation, error) {
+	if gc.IsNegative() || sc.IsNegative() {
+		return PurchaseAllocation{}, fmt.Errorf(
+			"%w: promo grant amounts must be >= 0 (gc=%s, sc=%s)",
+			errs.ErrInvalidAmount, gc, sc,
+		)
+	}
+	if !gc.IsPositive() && !sc.IsPositive() {
+		return PurchaseAllocation{}, fmt.Errorf(
+			"%w: promo grant must issue a positive GC and/or SC_UNPLAYED amount",
+			errs.ErrInvalidAmount,
+		)
+	}
+	// Same credit shape as a purchase: GC and/or SC_UNPLAYED, never SC_REDEEMABLE.
+	return w.AllocatePurchase(gc, sc)
+}

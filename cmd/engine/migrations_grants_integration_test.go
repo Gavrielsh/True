@@ -72,6 +72,9 @@ var wantGrants = map[string][]string{
 	// kyc_decisions: append-only audit trail (000009) — same shape as the
 	// ledger tables, INSERT + SELECT only, enforced further by a DB trigger.
 	"kyc_decisions": {"INSERT", "SELECT"},
+	// promo_grants: typed companion to PROMO_CREDIT ledger rows (000010) —
+	// financial history, INSERT + SELECT only, append-only trigger on top.
+	"promo_grants": {"INSERT", "SELECT"},
 }
 
 func integrationURL(t *testing.T) string {

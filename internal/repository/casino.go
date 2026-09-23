@@ -57,6 +57,12 @@ type CasinoEngine interface {
 	// ProcessRedeem deducts SC_REDEEMABLE (only) against HOUSE_REDEMPTION_POOL
 	// for a fiat redemption. Idempotent + Ghost-Spin safe.
 	ProcessRedeem(ctx context.Context, req RedeemRequest) (TxResult, error)
+
+	// ProcessPromoGrant issues GC and/or SC_UNPLAYED with NO purchase behind
+	// it (AMOE / BONUS / COMPENSATION) against HOUSE_PROMO_POOL, recording the
+	// channel in promo_grants. Idempotent + Ghost-Spin safe. Uncapped by
+	// design: frequency caps belong to the operator (promo.go).
+	ProcessPromoGrant(ctx context.Context, req PromoGrantRequest) (TxResult, error)
 }
 
 // NewCasino builds the casino wrapper from the same dependencies as New. The

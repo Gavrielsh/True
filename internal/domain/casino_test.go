@@ -205,3 +205,42 @@ func TestApplyRedeem_OnlyReducesRedeemable(t *testing.T) {
 		t.Errorf("GC/SCUnplayed must be untouched; got GC=%s SCU=%s", post.GC, post.SCUnplayed)
 	}
 }
+
+func TestAllocatePromoGrant(t *testing.T) {
+	t.Parallel()
+	w := Wallet{}
+	gc, _ := MoneyFromString("5000.0000")
+	sc, _ := MoneyFromString("0.2000")
+	zero := ZeroMoney()
+	neg, _ := MoneyFromString("-1.0000")
+
+	t.Run("sc only is issued as SC_UNPLAYED, never SC_REDEEMABLE", func(t *testing.T) {
+		a, err := w.AllocatePromoGrant(zero, sc)
+		if err != nil {
+			t.Fatalf("AllocatePromoGrant: %v", err)
+		}
+		if len(a.Credits) != 1 || a.Credits[0].Currency != CurrencySCUnplayed {
+			t.Fatalf("credits: got %+v want one SC_UNPLAYED credit", a.Credits)
+		}
+		post := w.ApplyPurchase(a)
+		if !post.SCRedeemable.IsZero() || post.SCUnplayed.String() != "0.2000" {
+			t.Errorf("post: SCU=%s SCR=%s", post.SCUnplayed, post.SCRedeemable)
+		}
+	})
+	t.Run("gc and sc together", func(t *testing.T) {
+		a, err := w.AllocatePromoGrant(gc, sc)
+		if err != nil || len(a.Credits) != 2 {
+			t.Fatalf("got %+v, %v", a, err)
+		}
+	})
+	t.Run("zero grant is refused", func(t *testing.T) {
+		if _, err := w.AllocatePromoGrant(zero, zero); !errors.Is(err, errs.ErrInvalidAmount) {
+			t.Fatalf("got %v want ErrInvalidAmount", err)
+		}
+	})
+	t.Run("negative component is refused", func(t *testing.T) {
+		if _, err := w.AllocatePromoGrant(neg, sc); !errors.Is(err, errs.ErrInvalidAmount) {
+			t.Fatalf("got %v want ErrInvalidAmount", err)
+		}
+	})
+}
