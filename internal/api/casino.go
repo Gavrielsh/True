@@ -46,6 +46,12 @@ type purchaseDTO struct {
 	GCAmount              string          `json:"gc_amount"               binding:"required"`
 	SCPromoAmount         string          `json:"sc_promo_amount,omitempty"`
 	Metadata              json.RawMessage `json:"metadata,omitempty"`
+	// USDAmount is the fiat amount charged, for the deposit-limit counter.
+	// OPTIONAL FOR NOW: nil until the gateway sends it on every call — see
+	// repository.PurchaseRequest.USDAmount. The gateway should already have
+	// called /player/limits/check-purchase before charging the card; this
+	// is only the in-transaction backstop.
+	USDAmount string `json:"usd_amount,omitempty"`
 }
 
 // redeemDTO is the POST /api/v1/store/redeem wire format. Amount is drawn from
@@ -137,6 +143,14 @@ func (h *CasinoHandlers) Purchase(c *gin.Context) {
 	if !ok {
 		return
 	}
+	var usdAmount *domain.Money
+	if dto.USDAmount != "" {
+		a, ok := parseAmount(c, dto.USDAmount)
+		if !ok {
+			return
+		}
+		usdAmount = &a
+	}
 
 	operatorCode := OperatorCodeFromContext(c.Request.Context())
 	ctx, span := moneySpan(c, "http.purchase", operatorCode, dto.OperatorTransactionID, playerID)
@@ -148,6 +162,7 @@ func (h *CasinoHandlers) Purchase(c *gin.Context) {
 		GCAmount:              gcAmount,
 		SCPromoAmount:         scPromo,
 		Metadata:              dto.Metadata,
+		USDAmount:             usdAmount,
 		BodyHash:              BodyHashFromContext(c.Request.Context()),
 	})
 	telemetry.EndSpan(span, err)
