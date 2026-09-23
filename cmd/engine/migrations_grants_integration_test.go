@@ -63,9 +63,15 @@ var wantGrants = map[string][]string{
 	"ledger_transactions":      {"INSERT", "SELECT"},
 	"ledger_transaction_dedup": {"DELETE", "INSERT", "SELECT"}, // retention-pruned, not financial history
 	"wallets":                  {"INSERT", "SELECT", "UPDATE"}, // balances mutate under SELECT ... FOR UPDATE
-	"users":                    {"INSERT", "SELECT"},
-	"daily_ggr":                {"INSERT", "SELECT", "UPDATE"}, // written by an UPSERT
-	"ggr_aggregator_state":     {"SELECT", "UPDATE"},           // watermark row
+	// INSERT: casino wrapper provisions players. UPDATE added in 000009:
+	// RecordDecision applies a VERIFIED KYC decision via status='ACTIVE' +
+	// kyc_verified_at (internal/repository/kyc.go).
+	"users":                {"INSERT", "SELECT", "UPDATE"},
+	"daily_ggr":            {"INSERT", "SELECT", "UPDATE"}, // written by an UPSERT
+	"ggr_aggregator_state": {"SELECT", "UPDATE"},           // watermark row
+	// kyc_decisions: append-only audit trail (000009) — same shape as the
+	// ledger tables, INSERT + SELECT only, enforced further by a DB trigger.
+	"kyc_decisions": {"INSERT", "SELECT"},
 }
 
 func integrationURL(t *testing.T) string {
