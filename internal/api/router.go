@@ -137,6 +137,7 @@ func NewRouter(cfg Config) *gin.Engine {
 			v1.POST("/player/create", casino.CreatePlayer)
 			v1.POST("/store/purchase", casino.Purchase)
 			v1.POST("/store/redeem", casino.Redeem)
+			v1.POST("/store/promo-grant", casino.PromoGrant)
 		}
 	}
 

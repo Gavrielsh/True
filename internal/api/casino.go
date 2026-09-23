@@ -57,6 +57,20 @@ type redeemDTO struct {
 	Metadata              json.RawMessage `json:"metadata,omitempty"`
 }
 
+// promoGrantDTO is the POST /api/v1/store/promo-grant wire format: coins
+// issued with NO purchase behind them. Both amounts are optional ("" → 0) but
+// at least one must be positive. There is no redeemable-SC field and there
+// cannot be one: sc_amount is credited as SC_UNPLAYED.
+type promoGrantDTO struct {
+	OperatorTransactionID string          `json:"operator_transaction_id" binding:"required"`
+	PlayerID              string          `json:"player_id"               binding:"required"`
+	GCAmount              string          `json:"gc_amount,omitempty"`
+	SCAmount              string          `json:"sc_amount,omitempty"`
+	Channel               string          `json:"channel"                 binding:"required"`
+	ChannelReference      string          `json:"channel_reference,omitempty"`
+	Metadata              json.RawMessage `json:"metadata,omitempty"`
+}
+
 // createPlayerResponse is the POST /api/v1/player/create 2xx payload.
 type createPlayerResponse struct {
 	Code     errors.Code               `json:"code"`
@@ -169,6 +183,56 @@ func (h *CasinoHandlers) Redeem(c *gin.Context) {
 		OperatorTransactionID: dto.OperatorTransactionID,
 		PlayerID:              playerID,
 		Amount:                amount,
+		Metadata:              dto.Metadata,
+		BodyHash:              BodyHashFromContext(c.Request.Context()),
+	})
+	telemetry.EndSpan(span, err)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, successResponse{Code: errors.CodeOK, Result: result})
+}
+
+// PromoGrant handles POST /api/v1/store/promo-grant (AMOE / BONUS /
+// COMPENSATION). The engine records the grant; it does not cap it — see
+// repository/promo.go.
+func (h *CasinoHandlers) PromoGrant(c *gin.Context) {
+	var dto promoGrantDTO
+	if err := c.ShouldBindJSON(&dto); err != nil {
+		respondErrorCode(c, http.StatusBadRequest, errors.CodeInvalidAmount, "invalid request body")
+		return
+	}
+
+	playerID, ok := parsePlayerID(c, dto.PlayerID)
+	if !ok {
+		return
+	}
+	gcAmount, ok := parseOptionalAmount(c, dto.GCAmount)
+	if !ok {
+		return
+	}
+	scAmount, ok := parseOptionalAmount(c, dto.SCAmount)
+	if !ok {
+		return
+	}
+	channel := repository.PromoChannel(dto.Channel)
+	if !channel.Valid() {
+		respondErrorCode(c, http.StatusBadRequest, errors.CodeInvalidAmount, "channel must be AMOE, BONUS or COMPENSATION")
+		return
+	}
+
+	operatorCode := OperatorCodeFromContext(c.Request.Context())
+	ctx, span := moneySpan(c, "http.promo_grant", operatorCode, dto.OperatorTransactionID, playerID)
+
+	result, err := h.casino.ProcessPromoGrant(ctx, repository.PromoGrantRequest{
+		OperatorCode:          operatorCode,
+		OperatorTransactionID: dto.OperatorTransactionID,
+		PlayerID:              playerID,
+		GCAmount:              gcAmount,
+		SCAmount:              scAmount,
+		Channel:               channel,
+		ChannelReference:      dto.ChannelReference,
 		Metadata:              dto.Metadata,
 		BodyHash:              BodyHashFromContext(c.Request.Context()),
 	})
