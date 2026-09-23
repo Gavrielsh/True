@@ -218,6 +218,16 @@ func (e *engine) processBetTx(ctx context.Context, req BetRequest) (result TxRes
 		return TxResult{}, err
 	}
 
+	// 1c. Responsible-gaming guards — same tx handle, so a concurrent limit
+	// change or spin cannot slip past. The refusal never depends on any
+	// outcome/RNG: it is checked BEFORE any stake is drawn.
+	if err := guardNotExcluded(ctx, tx, req.PlayerID); err != nil {
+		return TxResult{}, err
+	}
+	if err := guardLossLimit(ctx, tx, req.PlayerID, req.Amount); err != nil {
+		return TxResult{}, err
+	}
+
 	// 2. Pure domain math — runs entirely in CPU, no I/O. The lock window
 	//    therefore stays bounded by the surrounding SQL roundtrips, not by
 	//    any allocator or formatting code.
@@ -271,6 +281,12 @@ func (e *engine) processBetTx(ctx context.Context, req BetRequest) (result TxRes
 		if err := insertHouseEntry(ctx, tx, ledgerTxID, "HOUSE_BET_POOL", d.Currency, "CREDIT", d.Amount); err != nil {
 			return TxResult{}, err
 		}
+	}
+
+	// 5b. Bump the loss counter by this stake — a stake with no offsetting
+	// win yet. /win subtracts its own credit when it settles.
+	if err := adjustLossCounters(ctx, tx, req.PlayerID, req.Amount); err != nil {
+		return TxResult{}, err
 	}
 
 	// 6. COMMIT — releases the FOR UPDATE lock and durably persists everything.
@@ -391,6 +407,12 @@ func (e *engine) processWinTx(ctx context.Context, req WinRequest) (result TxRes
 		return TxResult{}, err
 	}
 	if err := insertHouseEntry(ctx, tx, ledgerTxID, "HOUSE_WIN_POOL", credit.Credit.Currency, "DEBIT", credit.Credit.Amount); err != nil {
+		return TxResult{}, err
+	}
+
+	// A win offsets the loss counter — never gates the payout itself (a
+	// player's already-earned win is never refused for a loss limit).
+	if err := adjustLossCounters(ctx, tx, req.PlayerID, domain.ZeroMoney().Sub(req.Amount)); err != nil {
 		return TxResult{}, err
 	}
 
@@ -582,14 +604,21 @@ func (e *engine) processRollbackTx(ctx context.Context, req RollbackRequest) (re
 		}
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return TxResult{}, fmt.Errorf("commit: %w", err)
-	}
-
-	// Compute total reversed amount for the response.
+	// Compute total reversed amount for the response and the loss counter.
 	total := domain.ZeroMoney()
 	for _, e := range entries {
 		total = total.Add(e.Amount)
+	}
+
+	// A rollback reverses its own contribution — the original BET's stake —
+	// from the loss counter. It never had an offsetting win (a rolled-back
+	// BET was never settled), so this is simply -stake.
+	if err := adjustLossCounters(ctx, tx, req.PlayerID, domain.ZeroMoney().Sub(total)); err != nil {
+		return TxResult{}, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return TxResult{}, fmt.Errorf("commit: %w", err)
 	}
 
 	return TxResult{
@@ -781,6 +810,11 @@ type ledgerTxParams struct {
 	RoundID               string
 	Reference             uuid.UUID
 	Metadata              json.RawMessage
+	// UsdAmount is the fiat amount behind a DEPOSIT, for the deposit-limit
+	// counter (internal/repository/rg.go). nil -> NULL for every non-DEPOSIT
+	// type, and for a DEPOSIT whose caller didn't supply one (see
+	// PurchaseRequest.USDAmount).
+	UsdAmount *domain.Money
 }
 
 func insertLedgerTx(ctx context.Context, tx pgx.Tx, p ledgerTxParams) (uuid.UUID, error) {
@@ -788,6 +822,11 @@ func insertLedgerTx(ctx context.Context, tx pgx.Tx, p ledgerTxParams) (uuid.UUID
 	if len(metadata) == 0 {
 		metadata = json.RawMessage("{}")
 	}
+	var usdAmount any
+	if p.UsdAmount != nil {
+		usdAmount = p.UsdAmount.Decimal()
+	}
+
 	var id uuid.UUID
 	err := tx.QueryRow(ctx, sqlInsertLedgerTx,
 		p.OperatorCode,
@@ -798,6 +837,7 @@ func insertLedgerTx(ctx context.Context, tx pgx.Tx, p ledgerTxParams) (uuid.UUID
 		nullableString(p.RoundID),
 		nullableUUID(p.Reference),
 		metadata,
+		usdAmount,
 	).Scan(&id)
 	if err != nil {
 		// May still be 23505 from the partition-LOCAL composite unique on a

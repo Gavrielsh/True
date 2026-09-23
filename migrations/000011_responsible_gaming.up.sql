@@ -98,7 +98,7 @@ CREATE TABLE player_limits (
         (limit_type IN ('LOSS_LIMIT', 'DEPOSIT_LIMIT') AND ends_at IS NULL)
         OR (limit_type = 'COOL_OFF' AND active AND ends_at IS NOT NULL)
         OR (limit_type = 'COOL_OFF' AND NOT active AND ends_at IS NULL)
-        OR (limit_type = 'SELF_EXCLUSION' AND active)
+        OR (limit_type = 'SELF_EXCLUSION' AND active AND ends_at IS NOT NULL)
         OR (limit_type = 'SELF_EXCLUSION' AND NOT active AND ends_at IS NULL)
     )
 );

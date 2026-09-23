@@ -31,12 +31,13 @@ func TestProcessPromoGrant_BonusSCOnly(t *testing.T) {
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("10.0000", "1.0000", "2.0000"))
 	expectPlayerStatus(mock, playerID, "ACTIVE")
+	expectNoExclusion(mock, playerID)
 	// Post: SC_UNPLAYED +0.2; GC and SC_REDEEMABLE untouched.
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("10.0000"), dec("1.2000"), dec("2.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectQuery(rxInsertLedgerTx).
-		WithArgs(operatorCode, "bonus:daily:1", playerID, "PROMO_CREDIT", nil, nil, nil, json.RawMessage("{}")).
+		WithArgs(operatorCode, "bonus:daily:1", playerID, "PROMO_CREDIT", nil, nil, nil, json.RawMessage("{}"), nil).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(ledgerTxID))
 	mock.ExpectExec(rxInsertDedup).
 		WithArgs(operatorCode, "bonus:daily:1", ledgerTxID).
@@ -88,11 +89,12 @@ func TestProcessPromoGrant_AMOEWithReference(t *testing.T) {
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("0.0000", "0.0000", "0.0000"))
 	expectPlayerStatus(mock, playerID, "ACTIVE")
+	expectNoExclusion(mock, playerID)
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("100.0000"), dec("1.0000"), dec("0.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectQuery(rxInsertLedgerTx).
-		WithArgs(operatorCode, "amoe:g1", playerID, "PROMO_CREDIT", nil, nil, nil, json.RawMessage("{}")).
+		WithArgs(operatorCode, "amoe:g1", playerID, "PROMO_CREDIT", nil, nil, nil, json.RawMessage("{}"), nil).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(ledgerTxID))
 	mock.ExpectExec(rxInsertDedup).
 		WithArgs(operatorCode, "amoe:g1", ledgerTxID).
@@ -139,11 +141,12 @@ func TestProcessPromoGrant_GhostSpinRecovery(t *testing.T) {
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("0.0000", "0.0000", "0.0000"))
 	expectPlayerStatus(mock, playerID, "ACTIVE")
+	expectNoExclusion(mock, playerID)
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("0.0000"), dec("0.5000"), dec("0.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectQuery(rxInsertLedgerTx).
-		WithArgs(operatorCode, "bonus:ghost", playerID, "PROMO_CREDIT", nil, nil, nil, json.RawMessage("{}")).
+		WithArgs(operatorCode, "bonus:ghost", playerID, "PROMO_CREDIT", nil, nil, nil, json.RawMessage("{}"), nil).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(uuid.New()))
 	mock.ExpectExec(rxInsertDedup).
 		WithArgs(operatorCode, "bonus:ghost", pgxmock.AnyArg()).
@@ -181,8 +184,9 @@ func TestProcessPromoGrant_GhostSpin_RejectsTypeMismatch(t *testing.T) {
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("0.0000", "0.0000", "0.0000"))
 	expectPlayerStatus(mock, playerID, "ACTIVE")
+	expectNoExclusion(mock, playerID)
 	mock.ExpectExec(rxUpdateWallet).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
-	mock.ExpectQuery(rxInsertLedgerTx).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+	mock.ExpectQuery(rxInsertLedgerTx).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(uuid.New()))
 	mock.ExpectExec(rxInsertDedup).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnError(&pgconn.PgError{Code: pgerrcode.UniqueViolation})

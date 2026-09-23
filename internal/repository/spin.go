@@ -174,38 +174,24 @@ func (g *gameEngine) ProcessSpin(ctx context.Context, req SpinRequest) (SpinResu
 		return decodeCachedSpin(payload)
 	}
 
-	// ---- Phase 2: draw the outcome OUTSIDE the transaction ----
-	// The RNG reads the OS entropy pool. Drawing here rather than inside the
-	// tx keeps that read out of the wallet-lock window.
-	//
-	// Safe under retry: if the tx below fails, a retry redraws — but that
-	// retry can only commit if the original never did. If the original DID
-	// commit, the dedup anchor raises 23505 and ghost recovery replays the
-	// ORIGINAL outcome from the ledger, discarding the redraw. A player can
-	// never re-roll a settled spin.
-	outcome, err := game.Spin(paytable, g.rng)
-	if err != nil {
-		e.releaseQuietly(ctx, idemKey)
-		//nolint:errorlint // The SENTINEL is wrapped with %w so errors.Is classifies this
-		// failure; the cause is rendered with %v deliberately, so a caller's errors.Is
-		// cannot match on the cause's identity. Promoting it to %w would widen error
-		// classification on a money path.
-		return SpinResult{}, fmt.Errorf("%w: %v", errs.ErrRNGUnavailable, err)
-	}
-	winAmount, err := domain.NewMoney(game.WinFor(req.BetAmount.Decimal(), outcome, domain.MoneyScale))
-	if err != nil {
-		e.releaseQuietly(ctx, idemKey)
-		return SpinResult{}, fmt.Errorf("spin: derive win: %w", err)
-	}
-
-	// ---- Phase 3: settle both legs atomically ----
-	result, err := g.settleSpinTx(ctx, req, paytable, outcome, winAmount)
+	// ---- Phase 2: lock, guard, draw, and settle — all inside one tx ----
+	// The RNG draw moved INSIDE the wallet-locked transaction (a deliberate
+	// deviation from the previous design, which drew outside the lock to keep
+	// the entropy read off the critical path). Responsible-gaming point 3
+	// requires the loss-limit refusal to NEVER depend on the RNG result: the
+	// only way to guarantee that is to check the limit, using the caller's
+	// stake alone, BEFORE any outcome exists — which means the draw itself
+	// must happen after the guard, inside the same locked, serialized
+	// transaction. The cost is a crypto/rand read added to the lock-hold
+	// time, which is a handful of microseconds (getrandom() is a single
+	// syscall) — negligible next to the surrounding SQL round-trips.
+	result, err := g.settleSpinTx(ctx, req, paytable)
 	if err != nil {
 		e.releaseQuietly(ctx, idemKey)
 		return SpinResult{}, err
 	}
 
-	// ---- Phase 4: cache the response ----
+	// ---- Phase 3: cache the response ----
 	e.cacheSpinQuietly(ctx, idemKey, fp, result)
 	return result, nil
 }
@@ -214,8 +200,6 @@ func (g *gameEngine) settleSpinTx(
 	ctx context.Context,
 	req SpinRequest,
 	paytable game.Paytable,
-	outcome game.Outcome,
-	winAmount domain.Money,
 ) (result SpinResult, err error) {
 	e := g.core
 	defer metrics.ObserveDBLockDuration(metrics.OpSpin, time.Now())
@@ -250,6 +234,32 @@ func (g *gameEngine) settleSpinTx(
 	}
 	if status != "ACTIVE" {
 		return SpinResult{}, fmt.Errorf("%w: player status is %s", errs.ErrPlayerNotActive, status)
+	}
+
+	// ── Responsible-gaming guards — same tx handle, so a concurrent limit
+	// change or a queued spin cannot slip past. Checked using ONLY the
+	// caller's stake, before the outcome is drawn: the refusal never depends
+	// on the RNG result.
+	if err := guardNotExcluded(ctx, tx, req.PlayerID); err != nil {
+		return SpinResult{}, err
+	}
+	if err := guardLossLimit(ctx, tx, req.PlayerID, req.BetAmount); err != nil {
+		return SpinResult{}, err
+	}
+
+	// ── Draw the outcome and derive the win — see the Phase 2 comment in
+	// ProcessSpin for why this now happens inside the locked transaction. ──
+	outcome, err := game.Spin(paytable, g.rng)
+	if err != nil {
+		//nolint:errorlint // The SENTINEL is wrapped with %w so errors.Is classifies this
+		// failure; the cause is rendered with %v deliberately, so a caller's errors.Is
+		// cannot match on the cause's identity. Promoting it to %w would widen error
+		// classification on a money path.
+		return SpinResult{}, fmt.Errorf("%w: %v", errs.ErrRNGUnavailable, err)
+	}
+	winAmount, err := domain.NewMoney(game.WinFor(req.BetAmount.Decimal(), outcome, domain.MoneyScale))
+	if err != nil {
+		return SpinResult{}, fmt.Errorf("spin: derive win: %w", err)
 	}
 
 	// ── Pure domain math — UNCHANGED, still the only place money is computed ──
@@ -313,6 +323,13 @@ func (g *gameEngine) settleSpinTx(
 	var winLedgerIDPtr *uuid.UUID
 	if hasWin {
 		winLedgerIDPtr = &winLedgerID
+	}
+
+	// Bump the loss counter by the round's net contribution — stake minus win
+	// — after settlement, so it reflects the ACTUAL outcome, not the stake
+	// alone (point 3: the refusal check above never sees this value).
+	if err := adjustLossCounters(ctx, tx, req.PlayerID, req.BetAmount.Sub(winAmount)); err != nil {
+		return SpinResult{}, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {

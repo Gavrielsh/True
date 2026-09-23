@@ -193,6 +193,58 @@ func expectPlayerStatus(mock pgxmock.PgxPoolIface, playerID uuid.UUID, status st
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow(status))
 }
 
+// rxRGActiveExclusion/rxRGLatestEffectiveLimit match the two RG guard
+// queries (rg.go: guardNotExcluded / latestEffectiveLimit) that now run
+// inside every money-moving flow.
+var (
+	rxRGActiveExclusion      = `SELECT limit_type, ends_at FROM latest`
+	rxRGLatestEffectiveLimit = `SELECT active, period, amount, ends_at`
+)
+
+// expectNoExclusion registers guardNotExcluded's query returning zero rows:
+// no active SELF_EXCLUSION/COOL_OFF for playerID.
+func expectNoExclusion(mock pgxmock.PgxPoolIface, playerID uuid.UUID) {
+	mock.ExpectQuery(rxRGActiveExclusion).
+		WithArgs(playerID).
+		WillReturnRows(pgxmock.NewRows([]string{"limit_type", "ends_at"}))
+}
+
+// expectNoActiveLimit registers latestEffectiveLimit's query returning no
+// rows: no active row of limitType (LOSS_LIMIT/DEPOSIT_LIMIT) for playerID.
+func expectNoActiveLimit(mock pgxmock.PgxPoolIface, playerID uuid.UUID, limitType string) {
+	mock.ExpectQuery(rxRGLatestEffectiveLimit).
+		WithArgs(playerID, limitType).
+		WillReturnError(pgx.ErrNoRows)
+}
+
+// expectRGBetGuards registers the two pre-outcome guard reads that
+// processBetTx/settleSpinTx run right after the player-status check: no
+// exclusion, no active LOSS_LIMIT.
+func expectRGBetGuards(mock pgxmock.PgxPoolIface, playerID uuid.UUID) {
+	expectNoExclusion(mock, playerID)
+	expectNoActiveLimit(mock, playerID, "LOSS_LIMIT")
+}
+
+// expectRGLossCounterNoop registers adjustLossCounters' post-settlement read
+// for a player with no active LOSS_LIMIT — a no-op, nothing is written.
+func expectRGLossCounterNoop(mock pgxmock.PgxPoolIface, playerID uuid.UUID) {
+	expectNoActiveLimit(mock, playerID, "LOSS_LIMIT")
+}
+
+// expectRGPurchaseGuards registers the two pre-settlement guard reads that
+// processPurchaseTx runs right after the player-status check: no exclusion,
+// no active DEPOSIT_LIMIT.
+func expectRGPurchaseGuards(mock pgxmock.PgxPoolIface, playerID uuid.UUID) {
+	expectNoExclusion(mock, playerID)
+	expectNoActiveLimit(mock, playerID, "DEPOSIT_LIMIT")
+}
+
+// expectRGDepositCounterNoop registers adjustDepositCounter's post-settlement
+// read for a player with no active DEPOSIT_LIMIT — a no-op, nothing written.
+func expectRGDepositCounterNoop(mock pgxmock.PgxPoolIface, playerID uuid.UUID) {
+	expectNoActiveLimit(mock, playerID, "DEPOSIT_LIMIT")
+}
+
 // ----------------------------------------------------------------------------
 // Happy path: GC bet (single debit, no SC split)
 // ----------------------------------------------------------------------------
@@ -208,11 +260,12 @@ func TestProcessBet_GC_HappyPath(t *testing.T) {
 		WithArgs(playerID).
 		WillReturnRows(walletRows("100.0000", "0.0000", "0.0000"))
 	expectPlayerStatus(mock, playerID, "ACTIVE")
+	expectRGBetGuards(mock, playerID)
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("90.0000"), dec("0.0000"), dec("0.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectQuery(rxInsertLedgerTx).
-		WithArgs(operatorCode, "op-bet-1", playerID, "BET", gameID, roundID, nil, json.RawMessage("{}")).
+		WithArgs(operatorCode, "op-bet-1", playerID, "BET", gameID, roundID, nil, json.RawMessage("{}"), nil).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(ledgerTxID))
 	// Global idempotency anchor (migration 000005), same tx.
 	mock.ExpectExec(rxInsertDedup).
@@ -226,6 +279,7 @@ func TestProcessBet_GC_HappyPath(t *testing.T) {
 	mock.ExpectExec(rxInsertLedgerEntry).
 		WithArgs(ledgerTxID, nil, "HOUSE_BET_POOL", "GC", "CREDIT", dec("10.0000"), nil).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	expectRGLossCounterNoop(mock, playerID)
 	mock.ExpectCommit()
 
 	got, err := e.ProcessBet(context.Background(), BetRequest{
@@ -278,12 +332,13 @@ func TestProcessBet_SC_SplitsUnplayedThenRedeemable(t *testing.T) {
 		WithArgs(playerID).
 		WillReturnRows(walletRows("0.0000", "30.0000", "100.0000"))
 	expectPlayerStatus(mock, playerID, "ACTIVE")
+	expectRGBetGuards(mock, playerID)
 	// Post-state: 0/0/80 — debit 30 from unplayed, 20 from redeemable.
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("0.0000"), dec("0.0000"), dec("80.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectQuery(rxInsertLedgerTx).
-		WithArgs(operatorCode, "op-bet-2", playerID, "BET", nil, nil, nil, json.RawMessage("{}")).
+		WithArgs(operatorCode, "op-bet-2", playerID, "BET", nil, nil, nil, json.RawMessage("{}"), nil).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(ledgerTxID))
 	mock.ExpectExec(rxInsertDedup).
 		WithArgs(operatorCode, "op-bet-2", ledgerTxID).
@@ -303,6 +358,7 @@ func TestProcessBet_SC_SplitsUnplayedThenRedeemable(t *testing.T) {
 	mock.ExpectExec(rxInsertLedgerEntry).
 		WithArgs(ledgerTxID, nil, "HOUSE_BET_POOL", "SC_REDEEMABLE", "CREDIT", dec("20.0000"), nil).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	expectRGLossCounterNoop(mock, playerID)
 	mock.ExpectCommit()
 
 	got, err := e.ProcessBet(context.Background(), BetRequest{
@@ -343,7 +399,7 @@ func TestProcessWin_SC_AlwaysRoutesToRedeemable(t *testing.T) {
 		WithArgs(dec("0.0000"), dec("5.0000"), dec("17.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectQuery(rxInsertLedgerTx).
-		WithArgs(operatorCode, "op-win-1", playerID, "WIN", gameID, roundID, nil, json.RawMessage("{}")).
+		WithArgs(operatorCode, "op-win-1", playerID, "WIN", gameID, roundID, nil, json.RawMessage("{}"), nil).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(ledgerTxID))
 	mock.ExpectExec(rxInsertDedup).
 		WithArgs(operatorCode, "op-win-1", ledgerTxID).
@@ -354,6 +410,7 @@ func TestProcessWin_SC_AlwaysRoutesToRedeemable(t *testing.T) {
 	mock.ExpectExec(rxInsertLedgerEntry).
 		WithArgs(ledgerTxID, nil, "HOUSE_WIN_POOL", "SC_REDEEMABLE", "DEBIT", dec("7.0000"), nil).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	expectRGLossCounterNoop(mock, playerID)
 	mock.ExpectCommit()
 
 	got, err := e.ProcessWin(context.Background(), WinRequest{
@@ -390,6 +447,7 @@ func TestProcessBet_InsufficientFunds_ReleasesLockAndRollsBack(t *testing.T) {
 		WithArgs(playerID).
 		WillReturnRows(walletRows("5.0000", "0.0000", "0.0000"))
 	expectPlayerStatus(mock, playerID, "ACTIVE")
+	expectRGBetGuards(mock, playerID)
 	// No UPDATE, no INSERTs — the allocator rejects before any mutating SQL.
 	mock.ExpectRollback()
 
@@ -527,13 +585,14 @@ func TestProcessBet_GhostSpinRecovery_OnUniqueViolation(t *testing.T) {
 		WithArgs(playerID).
 		WillReturnRows(walletRows("90.0000", "0.0000", "0.0000")) // post-state of original commit
 	expectPlayerStatus(mock, playerID, "ACTIVE")
+	expectRGBetGuards(mock, playerID)
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("80.0000"), dec("0.0000"), dec("0.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	// ledger_transactions insert succeeds (its unique is only partition-local);
 	// the GLOBAL dedup insert is what raises 23505 on the duplicate.
 	mock.ExpectQuery(rxInsertLedgerTx).
-		WithArgs(operatorCode, "op-ghost", playerID, "BET", nil, nil, nil, json.RawMessage("{}")).
+		WithArgs(operatorCode, "op-ghost", playerID, "BET", nil, nil, nil, json.RawMessage("{}"), nil).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(uuid.New()))
 	mock.ExpectExec(rxInsertDedup).
 		WithArgs(operatorCode, "op-ghost", pgxmock.AnyArg()).
@@ -600,11 +659,12 @@ func TestProcessBet_GhostSpin_RejectsTxIDReuseAcrossPlayers(t *testing.T) {
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerA).
 		WillReturnRows(walletRows("100.0000", "0.0000", "0.0000"))
 	expectPlayerStatus(mock, playerA, "ACTIVE")
+	expectRGBetGuards(mock, playerA)
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("90.0000"), dec("0.0000"), dec("0.0000"), playerA).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectQuery(rxInsertLedgerTx).
-		WithArgs(operatorCode, "op-reuse", playerA, "BET", nil, nil, nil, json.RawMessage("{}")).
+		WithArgs(operatorCode, "op-reuse", playerA, "BET", nil, nil, nil, json.RawMessage("{}"), nil).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(uuid.New()))
 	mock.ExpectExec(rxInsertDedup).
 		WithArgs(operatorCode, "op-reuse", pgxmock.AnyArg()).
@@ -884,7 +944,7 @@ func TestProcessWin_GhostSpinRecovery(t *testing.T) {
 		WithArgs(dec("0.0000"), dec("0.0000"), dec("15.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectQuery(rxInsertLedgerTx).
-		WithArgs(operatorCode, "op-win-ghost", playerID, "WIN", nil, nil, referenceID, json.RawMessage("{}")).
+		WithArgs(operatorCode, "op-win-ghost", playerID, "WIN", nil, nil, referenceID, json.RawMessage("{}"), nil).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(uuid.New()))
 	mock.ExpectExec(rxInsertDedup).
 		WithArgs(operatorCode, "op-win-ghost", pgxmock.AnyArg()).
@@ -947,11 +1007,12 @@ func TestProcessBet_CommitFails(t *testing.T) {
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("100.0000", "0.0000", "0.0000"))
 	expectPlayerStatus(mock, playerID, "ACTIVE")
+	expectRGBetGuards(mock, playerID)
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("90.0000"), dec("0.0000"), dec("0.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectQuery(rxInsertLedgerTx).
-		WithArgs(operatorCode, "op-cf", playerID, "BET", nil, nil, nil, json.RawMessage("{}")).
+		WithArgs(operatorCode, "op-cf", playerID, "BET", nil, nil, nil, json.RawMessage("{}"), nil).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(ledgerTxID))
 	mock.ExpectExec(rxInsertDedup).
 		WithArgs(operatorCode, "op-cf", ledgerTxID).
@@ -962,6 +1023,7 @@ func TestProcessBet_CommitFails(t *testing.T) {
 	mock.ExpectExec(rxInsertLedgerEntry).
 		WithArgs(ledgerTxID, nil, "HOUSE_BET_POOL", "GC", "CREDIT", dec("10.0000"), nil).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	expectRGLossCounterNoop(mock, playerID)
 	mock.ExpectCommit().WillReturnError(errors.New("commit failed"))
 
 	_, err := e.ProcessBet(context.Background(), BetRequest{
@@ -987,6 +1049,7 @@ func TestProcessBet_UpdateZeroRowsAffected_FailsClosed(t *testing.T) {
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("100.0000", "0.0000", "0.0000"))
 	expectPlayerStatus(mock, playerID, "ACTIVE")
+	expectRGBetGuards(mock, playerID)
 	// UPDATE returns 0 rows: schema corruption / bad routing — engine must reject.
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("90.0000"), dec("0.0000"), dec("0.0000"), playerID).
@@ -1010,11 +1073,12 @@ func TestProcessBet_GhostSpin_LedgerLookupMisses(t *testing.T) {
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("100.0000", "0.0000", "0.0000"))
 	expectPlayerStatus(mock, playerID, "ACTIVE")
+	expectRGBetGuards(mock, playerID)
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("90.0000"), dec("0.0000"), dec("0.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectQuery(rxInsertLedgerTx).
-		WithArgs(operatorCode, "op-gone", playerID, "BET", nil, nil, nil, json.RawMessage("{}")).
+		WithArgs(operatorCode, "op-gone", playerID, "BET", nil, nil, nil, json.RawMessage("{}"), nil).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(uuid.New()))
 	mock.ExpectExec(rxInsertDedup).
 		WithArgs(operatorCode, "op-gone", pgxmock.AnyArg()).
@@ -1078,7 +1142,7 @@ func TestProcessRollback_HappyPath_RestoresFunds(t *testing.T) {
 	// NOTE: no UPDATE of ledger_transactions — the ledger is strictly append-only.
 	// INSERT rollback header.
 	mock.ExpectQuery(rxInsertLedgerTx).
-		WithArgs(operatorCode, "op-rb-1", playerID, "ROLLBACK", nil, nil, originalTxID, json.RawMessage("{}")).
+		WithArgs(operatorCode, "op-rb-1", playerID, "ROLLBACK", nil, nil, originalTxID, json.RawMessage("{}"), nil).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(rollbackTxID))
 	mock.ExpectExec(rxInsertDedup).
 		WithArgs(operatorCode, "op-rb-1", rollbackTxID).
@@ -1090,6 +1154,7 @@ func TestProcessRollback_HappyPath_RestoresFunds(t *testing.T) {
 	mock.ExpectExec(rxInsertLedgerEntry).
 		WithArgs(rollbackTxID, nil, "HOUSE_BET_POOL", "SC_REDEEMABLE", "DEBIT", dec("30.0000"), nil).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	expectRGLossCounterNoop(mock, playerID)
 	mock.ExpectCommit()
 
 	got, err := e.ProcessRollback(context.Background(), RollbackRequest{
@@ -1248,7 +1313,7 @@ func TestProcessRollback_SameOpTxRetry_GhostRecovers(t *testing.T) {
 		WithArgs(dec("0.0000"), dec("0.0000"), dec("100.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectQuery(rxInsertLedgerTx).
-		WithArgs(operatorCode, "op-rb-retry", playerID, "ROLLBACK", nil, nil, originalTxID, json.RawMessage("{}")).
+		WithArgs(operatorCode, "op-rb-retry", playerID, "ROLLBACK", nil, nil, originalTxID, json.RawMessage("{}"), nil).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(uuid.New()))
 	// The GLOBAL dedup anchor is what collides on the duplicate rollback.
 	mock.ExpectExec(rxInsertDedup).
@@ -1340,11 +1405,12 @@ func TestProcessBet_PlayerStatusGuard(t *testing.T) {
 				// Guard aborts BEFORE any UPDATE/INSERT — only the rollback follows.
 				mock.ExpectRollback()
 			} else {
+				expectRGBetGuards(mock, playerID)
 				mock.ExpectExec(rxUpdateWallet).
 					WithArgs(dec("90.0000"), dec("0.0000"), dec("0.0000"), playerID).
 					WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 				mock.ExpectQuery(rxInsertLedgerTx).
-					WithArgs(operatorCode, opTxID, playerID, "BET", nil, nil, nil, json.RawMessage("{}")).
+					WithArgs(operatorCode, opTxID, playerID, "BET", nil, nil, nil, json.RawMessage("{}"), nil).
 					WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(ledgerTxID))
 				mock.ExpectExec(rxInsertDedup).
 					WithArgs(operatorCode, opTxID, ledgerTxID).
@@ -1355,6 +1421,7 @@ func TestProcessBet_PlayerStatusGuard(t *testing.T) {
 				mock.ExpectExec(rxInsertLedgerEntry).
 					WithArgs(ledgerTxID, nil, "HOUSE_BET_POOL", "GC", "CREDIT", dec("10.0000"), nil).
 					WillReturnResult(pgxmock.NewResult("INSERT", 1))
+				expectRGLossCounterNoop(mock, playerID)
 				mock.ExpectCommit()
 			}
 
