@@ -7,6 +7,7 @@ package api
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/Gavrielsh/True/internal/repository"
 	"github.com/Gavrielsh/True/pkg/errors"
@@ -97,6 +98,11 @@ type errorResponse struct {
 	Code    errors.Code `json:"code"`
 	Message string      `json:"message"`
 	TraceID string      `json:"trace_id,omitempty"`
+	// Reason and Until are populated only for CodeRGRestricted: the specific
+	// restriction (SELF_EXCLUSION / COOL_OFF / LOSS_LIMIT / DEPOSIT_LIMIT) and,
+	// when time-bound, its expiry. Empty/nil for every other error code.
+	Reason string     `json:"reason,omitempty"`
+	Until  *time.Time `json:"until,omitempty"`
 }
 
 // balancesResponse is the POST /api/v1/session payload.

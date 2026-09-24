@@ -36,8 +36,13 @@ type Config struct {
 	// KYC wires the Zone 1 ingestion route (Task C4) that receives
 	// identity-verification decisions relayed by the Gateway. Optional:
 	// when nil the route is not registered.
-	KYC    repository.KYCEngine
-	Logger *slog.Logger
+	KYC repository.KYCEngine
+	// ResponsibleGaming wires the player limits endpoints (PLAN.md item 6):
+	// set/lift a limit, query current limits, and the pre-charge deposit
+	// check the gateway must call before charging a card. Optional: when
+	// nil the routes are not registered.
+	ResponsibleGaming repository.ResponsibleGamingEngine
+	Logger            *slog.Logger
 }
 
 // NewRouter assembles the gin.Engine with the full middleware stack.
@@ -138,6 +143,16 @@ func NewRouter(cfg Config) *gin.Engine {
 			v1.POST("/store/purchase", casino.Purchase)
 			v1.POST("/store/redeem", casino.Redeem)
 			v1.POST("/store/promo-grant", casino.PromoGrant)
+		}
+
+		// Responsible-gaming limits (PLAN.md item 6). check-purchase is the
+		// PRE-CHARGE check: the gateway must call it before charging the
+		// card, not only rely on /store/purchase's backstop guard.
+		if cfg.ResponsibleGaming != nil {
+			rg := NewRGHandlers(cfg.ResponsibleGaming)
+			v1.POST("/player/limits", rg.SetLimit)
+			v1.POST("/player/limits/query", rg.QueryLimits)
+			v1.POST("/player/limits/check-purchase", rg.CheckPurchase)
 		}
 	}
 

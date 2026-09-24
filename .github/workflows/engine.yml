@@ -383,8 +383,9 @@ jobs:
             'TestLedgerGrants|TestAssertLedgerAppendOnly|TestRunMigrations_Integration' 7
 
           # internal/repository: the 5 settlement tests (including both concurrency proofs)
-          # and the 4 promo-grant ledger tests (000010).
-          check "internal/repository" repo.log 'TestIntegration_' 9
+          # the 4 promo-grant ledger tests (000010), and the loss-limit concurrency
+          # proof (000011).
+          check "internal/repository" repo.log 'TestIntegration_' 10
 
           exit "$fail"
 

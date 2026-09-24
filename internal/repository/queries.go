@@ -168,6 +168,10 @@ const (
 	//
 	// status is COMMITTED inline — for /bet and /win the entire flow is
 	// atomic, so the row only materialises if the surrounding tx commits.
+	// usd_amount (migration 000011) carries the fiat amount behind a DEPOSIT,
+	// for the responsible-gaming deposit-limit counter (internal/repository/
+	// rg.go). NULL for every other transaction type and, for now, optionally
+	// NULL on DEPOSIT too — see ledgerTxParams.UsdAmount.
 	sqlInsertLedgerTx = `
 		INSERT INTO ledger_transactions (
 			operator_code,
@@ -179,9 +183,10 @@ const (
 			round_id,
 			reference_transaction_id,
 			request_metadata,
+			usd_amount,
 			completed_at
 		)
-		VALUES ($1, $2, $3, $4, 'COMPLETED', $5, $6, $7, $8, now())
+		VALUES ($1, $2, $3, $4, 'COMPLETED', $5, $6, $7, $8, $9, now())
 		RETURNING id
 	`
 

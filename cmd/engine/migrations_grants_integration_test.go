@@ -75,6 +75,12 @@ var wantGrants = map[string][]string{
 	// promo_grants: typed companion to PROMO_CREDIT ledger rows (000010) —
 	// financial history, INSERT + SELECT only, append-only trigger on top.
 	"promo_grants": {"INSERT", "SELECT"},
+	// player_limits: append-only responsible-gaming event log (000011) —
+	// INSERT + SELECT only, append-only trigger on top.
+	"player_limits": {"INSERT", "SELECT"},
+	// player_rg_counters: running loss/deposit window totals (000011),
+	// upserted in the same transaction as the ledger write.
+	"player_rg_counters": {"INSERT", "SELECT", "UPDATE"},
 }
 
 func integrationURL(t *testing.T) string {

@@ -138,6 +138,11 @@ func (e *engine) processPromoGrantTx(ctx context.Context, req PromoGrantRequest)
 	if err := requirePlayerActive(ctx, tx, req.PlayerID); err != nil {
 		return TxResult{}, err
 	}
+	// Exclusion only — a promo grant is not a loss/deposit, so no loss- or
+	// deposit-limit check applies here.
+	if err := guardNotExcluded(ctx, tx, req.PlayerID); err != nil {
+		return TxResult{}, err
+	}
 
 	alloc, err := wallet.AllocatePromoGrant(req.GCAmount, req.SCAmount)
 	if err != nil {

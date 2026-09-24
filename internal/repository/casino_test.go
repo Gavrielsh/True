@@ -141,12 +141,13 @@ func TestProcessPurchase_GCWithPromo(t *testing.T) {
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("0.0000", "0.0000", "0.0000"))
 	expectPlayerStatus(mock, playerID, "ACTIVE")
+	expectRGPurchaseGuards(mock, playerID)
 	// Post: GC 100, SC_UNPLAYED 5, SC_REDEEMABLE untouched.
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("100.0000"), dec("5.0000"), dec("0.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectQuery(rxInsertLedgerTx).
-		WithArgs(operatorCode, "op-pur-1", playerID, "DEPOSIT", nil, nil, nil, json.RawMessage("{}")).
+		WithArgs(operatorCode, "op-pur-1", playerID, "DEPOSIT", nil, nil, nil, json.RawMessage("{}"), nil).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(ledgerTxID))
 	mock.ExpectExec(rxInsertDedup).
 		WithArgs(operatorCode, "op-pur-1", ledgerTxID).
@@ -165,6 +166,8 @@ func TestProcessPurchase_GCWithPromo(t *testing.T) {
 	mock.ExpectExec(rxInsertLedgerEntry).
 		WithArgs(ledgerTxID, nil, "HOUSE_ISSUANCE_POOL", "SC_UNPLAYED", "DEBIT", dec("5.0000"), nil).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	// req.USDAmount is nil here: adjustDepositCounter short-circuits with no
+	// DB query at all (only guardDepositLimit's pre-check always queries).
 	mock.ExpectCommit()
 
 	got, err := e.ProcessPurchase(context.Background(), PurchaseRequest{
@@ -198,11 +201,12 @@ func TestProcessPurchase_GhostSpinRecovery(t *testing.T) {
 	mock.ExpectQuery(rxSelectForUpdate).WithArgs(playerID).
 		WillReturnRows(walletRows("0.0000", "0.0000", "0.0000"))
 	expectPlayerStatus(mock, playerID, "ACTIVE")
+	expectRGPurchaseGuards(mock, playerID)
 	mock.ExpectExec(rxUpdateWallet).
 		WithArgs(dec("100.0000"), dec("0.0000"), dec("0.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectQuery(rxInsertLedgerTx).
-		WithArgs(operatorCode, "op-pur-ghost", playerID, "DEPOSIT", nil, nil, nil, json.RawMessage("{}")).
+		WithArgs(operatorCode, "op-pur-ghost", playerID, "DEPOSIT", nil, nil, nil, json.RawMessage("{}"), nil).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(uuid.New()))
 	mock.ExpectExec(rxInsertDedup).
 		WithArgs(operatorCode, "op-pur-ghost", pgxmock.AnyArg()).
@@ -279,7 +283,7 @@ func TestProcessRedeem_HappyPath_DrawsRedeemableOnly(t *testing.T) {
 		WithArgs(dec("0.0000"), dec("0.0000"), dec("30.0000"), playerID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectQuery(rxInsertLedgerTx).
-		WithArgs(operatorCode, "op-red-1", playerID, "WITHDRAWAL", nil, nil, nil, json.RawMessage("{}")).
+		WithArgs(operatorCode, "op-red-1", playerID, "WITHDRAWAL", nil, nil, nil, json.RawMessage("{}"), nil).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(ledgerTxID))
 	mock.ExpectExec(rxInsertDedup).
 		WithArgs(operatorCode, "op-red-1", ledgerTxID).

@@ -107,6 +107,12 @@ type PurchaseRequest struct {
 	GCAmount              domain.Money    // > 0 (the purchased package)
 	SCPromoAmount         domain.Money    // >= 0 (promotional SC_UNPLAYED)
 	Metadata              json.RawMessage // <= 512 bytes (DB-enforced)
+	// USDAmount is the fiat amount charged, for the deposit-limit counter.
+	// OPTIONAL FOR NOW: nil until the gateway sends it on every call. When a
+	// DEPOSIT_LIMIT is active for the player, a nil USDAmount fails closed
+	// (guardDepositLimit refuses rather than under-counting) — see rg.go.
+	// Becomes required once the gateway integrates the check-purchase flow.
+	USDAmount *domain.Money
 	// BodyHash — see BetRequest.BodyHash.
 	BodyHash string
 }
@@ -281,6 +287,18 @@ func (e *engine) processPurchaseTx(ctx context.Context, req PurchaseRequest) (re
 		return TxResult{}, err
 	}
 
+	// Responsible-gaming guards — same tx handle. This is the BACKSTOP: the
+	// gateway is expected to call POST /player/limits/check-purchase BEFORE
+	// charging the card, and to refund if this backstop ever refuses (it
+	// should only fire on a race between the pre-charge check and this
+	// commit, or a gateway that skipped the pre-check).
+	if err := guardNotExcluded(ctx, tx, req.PlayerID); err != nil {
+		return TxResult{}, err
+	}
+	if err := guardDepositLimit(ctx, tx, req.PlayerID, req.USDAmount); err != nil {
+		return TxResult{}, err
+	}
+
 	alloc, err := wallet.AllocatePurchase(req.GCAmount, req.SCPromoAmount)
 	if err != nil {
 		return TxResult{}, err
@@ -297,6 +315,7 @@ func (e *engine) processPurchaseTx(ctx context.Context, req PurchaseRequest) (re
 		PlayerID:              req.PlayerID,
 		Type:                  "DEPOSIT",
 		Metadata:              req.Metadata,
+		UsdAmount:             req.USDAmount,
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -318,6 +337,12 @@ func (e *engine) processPurchaseTx(ctx context.Context, req PurchaseRequest) (re
 		if err := insertHouseEntry(ctx, tx, ledgerTxID, accountHouseIssuancePool, c.Currency, "DEBIT", c.Amount); err != nil {
 			return TxResult{}, err
 		}
+	}
+
+	// Bump the deposit counter — a no-op (checks for an active limit itself)
+	// when the caller didn't supply a USD amount.
+	if err := adjustDepositCounter(ctx, tx, req.PlayerID, req.USDAmount); err != nil {
+		return TxResult{}, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -503,6 +528,9 @@ func (r PurchaseRequest) validate() error {
 	}
 	if !r.GCAmount.IsPositive() && !r.SCPromoAmount.IsPositive() {
 		return fmt.Errorf("%w: purchase must issue a positive GC and/or SC_UNPLAYED amount", errs.ErrInvalidAmount)
+	}
+	if r.USDAmount != nil && !r.USDAmount.IsPositive() {
+		return fmt.Errorf("%w: usd_amount must be > 0 when present", errs.ErrInvalidAmount)
 	}
 	return nil
 }

@@ -1,6 +1,7 @@
 package api
 
 import (
+	stderrors "errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -57,6 +58,10 @@ func httpStatusFor(code errors.Code) int {
 		// 503 — transient infrastructure failure; the spin was NOT settled
 		// and the same key is safe to retry.
 		return http.StatusServiceUnavailable
+	case errors.CodeRGRestricted:
+		// 403 like CodePlayerNotActive: a responsible-gaming restriction is a
+		// standing refusal to transact, not a malformed request.
+		return http.StatusForbidden
 	default:
 		return http.StatusInternalServerError
 	}
@@ -77,6 +82,14 @@ func respondError(c *gin.Context, err error) {
 		Code:    code,
 		Message: msg,
 		TraceID: traceIDFrom(c),
+	}
+	// A responsible-gaming refusal carries the specific reason and (when
+	// time-bound) its expiry, so the gateway can show the player something
+	// more useful than "forbidden" — never leaked for any other code.
+	var rgErr *errors.RGRestrictionError
+	if stderrors.As(err, &rgErr) {
+		body.Reason = rgErr.Reason
+		body.Until = rgErr.Until
 	}
 	c.AbortWithStatusJSON(status, body)
 }
@@ -126,6 +139,8 @@ func publicMessageFor(code errors.Code) string {
 		return "idempotency key already used for a different request"
 	case errors.CodeRNGUnavailable:
 		return "game temporarily unavailable"
+	case errors.CodeRGRestricted:
+		return "responsible gaming restriction in effect"
 	default:
 		return "internal error"
 	}

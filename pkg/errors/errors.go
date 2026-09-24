@@ -8,6 +8,7 @@ package errors
 
 import (
 	stderrors "errors"
+	"time"
 )
 
 // Sentinel domain errors. Wrap with fmt.Errorf("%w: ...", Err...) to attach
@@ -38,7 +39,34 @@ var (
 	// configured absolute ceiling. Signals a provider bug or a compromised
 	// webhook secret — always alert, never auto-raise the ceiling.
 	ErrWinExceedsCeiling = stderrors.New("win exceeds configured ceiling")
+	// ErrResponsibleGamingRestricted: a money-moving call was refused because
+	// the player is self-excluded, in cool-off, or over a loss/deposit limit.
+	// Always carries an *RGRestrictionError in the wrap chain — callers that
+	// need the reason/expiry use stderrors.As, not string matching.
+	ErrResponsibleGamingRestricted = stderrors.New("responsible gaming restriction")
 )
+
+// RGRestrictionError carries the specific reason a responsible-gaming
+// restriction refused a call, and (for time-bound restrictions) when it
+// lifts. Always wraps ErrResponsibleGamingRestricted — use stderrors.As to
+// retrieve it after a CodeFor/Is check.
+type RGRestrictionError struct {
+	// Reason is one of SELF_EXCLUSION, COOL_OFF, LOSS_LIMIT, DEPOSIT_LIMIT.
+	Reason string
+	// Until is the restriction's expiry, when it has one (COOL_OFF, dated
+	// SELF_EXCLUSION). nil for LOSS_LIMIT/DEPOSIT_LIMIT, which lift only when
+	// the window rolls over or the limit is explicitly raised/removed.
+	Until *time.Time
+}
+
+func (e *RGRestrictionError) Error() string {
+	if e.Until != nil {
+		return "responsible gaming restriction: " + e.Reason + " until " + e.Until.Format(time.RFC3339)
+	}
+	return "responsible gaming restriction: " + e.Reason
+}
+
+func (e *RGRestrictionError) Unwrap() error { return ErrResponsibleGamingRestricted }
 
 // Code is the stable identifier surfaced to operators (e.g. in webhook
 // responses and audit logs). These strings are part of the public API
@@ -63,8 +91,9 @@ const (
 	CodeWinExceedsCeiling   Code = "WIN_EXCEEDS_CEILING"
 	// CodeGeoBlocked is returned by the jurisdiction fence (no sentinel error:
 	// the middleware rejects before any domain call).
-	CodeGeoBlocked Code = "GEO_BLOCKED"
-	CodeInternal   Code = "INTERNAL_ERROR"
+	CodeGeoBlocked   Code = "GEO_BLOCKED"
+	CodeRGRestricted Code = "RG_RESTRICTED"
+	CodeInternal     Code = "INTERNAL_ERROR"
 )
 
 // CodeFor maps any error to its public code. Returns CodeOK for nil and
@@ -101,6 +130,8 @@ func CodeFor(err error) Code {
 		return CodeIdempotencyMismatch
 	case stderrors.Is(err, ErrWinExceedsCeiling):
 		return CodeWinExceedsCeiling
+	case stderrors.Is(err, ErrResponsibleGamingRestricted):
+		return CodeRGRestricted
 	default:
 		return CodeInternal
 	}
