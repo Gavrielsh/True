@@ -8,7 +8,7 @@
 > date: it still lists redemption, AMOE, engine CI, the suspended-player check and the
 > Daily Wheel as open, and they are built.
 
-Last updated: 2026-09-23
+Last updated: 2026-09-24
 
 ## Who owns what
 
@@ -20,7 +20,8 @@ Last updated: 2026-09-23
 
 Engine routes today (`True/internal/api/router.go`): `/api/v1/spin`, `/bet`, `/win`,
 `/rollback`, `/session`, `/player/create`, `/store/purchase`, `/store/redeem`,
-`/store/promo-grant`, `/kyc/decision`, plus `/healthz` and `/metrics`.
+`/store/promo-grant`, `/kyc/decision`, `/player/limits`, `/player/limits/query`,
+`/player/limits/check-purchase`, plus `/healthz` and `/metrics`.
 
 ### Rules that never bend
 - **queenroyal:** `.claude-instructions` (G1–G4). The gateway holds no balances; money is a
@@ -55,11 +56,11 @@ Engine routes today (`True/internal/api/router.go`): `/api/v1/spin`, `/bet`, `/w
 | # | Item | Layers | Exists | Missing |
 |---|---|---|---|---|
 | 1 | Login & registration | G W | Register/login/refresh/logout, sign-up with 18+, state and terms checks (queenroyal#17) | `[x]` done. Only the Step 0 deploy items remain. |
-| 2 | **Legal pages** | W | Nothing. The sign-up checkbox and footer link to pages that don't exist. | Terms of Service, Official Sweepstakes Rules, Privacy Policy, Responsible Gaming page. Static, versioned, linked from footer and sign-up. |
-| 3 | **Redemption (cash out SC)** | E G W | Engine `/store/redeem`, gateway service + worker, admin approve/reject | Player redemption screen (eligibility, min amount, daily cap, status history). A real payout provider behind the `PaymentProvider` seam; only a fake one exists. |
+| 2 | **Legal pages** | W | Terms of Service, Official Sweepstakes Rules, Privacy Policy, Responsible Gaming page (`/terms`, `/rules`, `/privacy`, `/responsible-gaming`) rendered from versioned `content/legal/*.md`; footer and sign-up checkbox link to them; a gateway test fails if `TERMS_VERSION` drifts from the markdown. | `[x]` done. |
+| 3 | **Redemption (cash out SC)** | E G W | Engine `/store/redeem`, gateway service + worker, admin approve/reject, `GET /api/store/redemptions` (policy + history), player redemption screen (`/redeem`: eligibility, min/per-request/daily/monthly caps, remaining today/this month, KYC gate, status history) | A real payout provider behind the `PaymentProvider` seam; only a fake one exists. |
 | 4 | **Free entry (AMOE)** | W | Gateway `/api/amoe` | Public page with the free-entry rules and the request form. |
 | 5 | **KYC** | G W | Data model, webhook, fake provider, engine `/kyc/decision` | Real provider adapter (Persona / Veriff / Jumio) and a player document-upload flow. |
-| 6 | **Responsible gaming** | E G W | `[x]` **E**: migration `000011_responsible_gaming`, engine guards self-exclusion / cool-off / loss limit / deposit limit inside the wallet-locked transaction for `/spin`, `/bet`, `/win`, `/rollback`, `/store/purchase`; signed `POST /player/limits` (set/lift), `/player/limits/query`, and the pre-charge `/player/limits/check-purchase` (branch `feat/responsible-gaming`). | Session limits, reality-check reminders. Gateway: store settings, call `/player/limits/check-purchase` before charging a card, refund if `/store/purchase`'s backstop ever refuses. Web: `/account/limits` page. |
+| 6 | **Responsible gaming** | E G W | `[x]` **E**: migration `000011_responsible_gaming`, engine guards self-exclusion / cool-off / loss limit / deposit limit inside the wallet-locked transaction for `/spin`, `/bet`, `/win`, `/rollback`, `/store/purchase`; signed `POST /player/limits` (set/lift), `/player/limits/query`, and the pre-charge `/player/limits/check-purchase` (True#21). Known gap: the loss limit also counts GC; it must count SC only. | Session limits, reality-check reminders. Gateway: store settings, call `/player/limits/check-purchase` before charging a card, refund if `/store/purchase`'s backstop ever refuses. Web: `/account/limits` page. |
 | 7 | **Fraud & AML** | E G | Nothing | Velocity rules, device & IP fingerprinting, multi-account detection, bonus-abuse checks, redemption reporting. |
 
 ## Step 2 — The product players see
