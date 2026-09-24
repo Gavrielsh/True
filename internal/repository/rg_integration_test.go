@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -124,6 +125,104 @@ func TestIntegration_ConcurrentSpinsCannotExceedLossLimit(t *testing.T) {
 	}
 	if summary.LossLimit.Used.Decimal().GreaterThan(mustMoney(t, lossLimit).Decimal()) {
 		t.Errorf("LOSS LIMIT BREACHED: accumulated %s exceeds limit %s", summary.LossLimit.Used, lossLimit)
+	}
+
+	assertLedgerReconciles(t, pool, playerID)
+	assertDoubleEntryBalanced(t, pool)
+}
+
+// TestIntegration_GCExemptFromSCLossLimitAndSelfExclusion proves the two
+// halves of the SC-only LOSS_LIMIT fix that pgxmock cannot validate on its
+// own (it never runs the real SQL currency filter — see sqlRGLossAggregate):
+//
+//  1. A GC spin is allowed even after an SC LOSS_LIMIT is fully exhausted —
+//     GC has no real value, so it must never be gated by, or count toward,
+//     a real-money loss limit.
+//  2. A GC spin is still refused once the player is self-excluded — that
+//     guard is currency-family agnostic and must never be skipped.
+func TestIntegration_GCExemptFromSCLossLimitAndSelfExclusion(t *testing.T) {
+	pool := integrationPool(t)
+	ctx := context.Background()
+
+	const (
+		scBetAmount = "10.0000"
+		lossLimit   = "10.0000" // admits exactly one 10.0000 SC bet per DAY window
+		gcBetAmount = "500.0000"
+	)
+
+	playerID := seedPlayer(t, pool, scBetAmount)
+	creditOpeningBalance(t, pool, playerID, "GC", "10000.0000")
+
+	rg := NewResponsibleGaming(pool, openIdem{}, discardLoggerRepo())
+	if _, err := rg.SetLimit(ctx, SetLimitRequest{
+		PlayerID:  playerID,
+		LimitType: "LOSS_LIMIT",
+		Active:    true,
+		Period:    "DAY",
+		Amount:    moneyPtr(t, lossLimit),
+		EventID:   "rg-gc-exempt-" + uuid.NewString(),
+	}); err != nil {
+		t.Fatalf("SetLimit LOSS_LIMIT: %v", err)
+	}
+
+	eng := newIntegrationGame(pool)
+
+	// Exhaust the SC loss limit with one losing SC spin.
+	if _, err := eng.ProcessSpin(ctx, SpinRequest{
+		OperatorCode:          "OP1",
+		OperatorTransactionID: "rg-gc-exempt-sc-" + uuid.NewString(),
+		PlayerID:              playerID,
+		Family:                domain.FamilySC,
+		BetAmount:             mustMoney(t, scBetAmount),
+	}); err != nil {
+		t.Fatalf("initial SC spin: %v", err)
+	}
+
+	// A second SC spin must now be refused: the limit is exhausted.
+	_, err := eng.ProcessSpin(ctx, SpinRequest{
+		OperatorCode:          "OP1",
+		OperatorTransactionID: "rg-gc-exempt-sc2-" + uuid.NewString(),
+		PlayerID:              playerID,
+		Family:                domain.FamilySC,
+		BetAmount:             mustMoney(t, scBetAmount),
+	})
+	if !errors.Is(err, errs.ErrResponsibleGamingRestricted) {
+		t.Fatalf("SC spin after exhausting LOSS_LIMIT: got %v, want ErrResponsibleGamingRestricted", err)
+	}
+
+	// A GC spin, in contrast, must succeed — GC never counts toward, or is
+	// gated by, an SC LOSS_LIMIT, however exhausted.
+	if _, err := eng.ProcessSpin(ctx, SpinRequest{
+		OperatorCode:          "OP1",
+		OperatorTransactionID: "rg-gc-exempt-gc-" + uuid.NewString(),
+		PlayerID:              playerID,
+		Family:                domain.FamilyGC,
+		BetAmount:             mustMoney(t, gcBetAmount),
+	}); err != nil {
+		t.Fatalf("GC spin must be exempt from the SC LOSS_LIMIT: %v", err)
+	}
+
+	// Now self-exclude the player — a currency-agnostic guard that must
+	// still catch a GC spin even though the LOSS_LIMIT guard skips it.
+	if _, err := rg.SetLimit(ctx, SetLimitRequest{
+		PlayerID:  playerID,
+		LimitType: "SELF_EXCLUSION",
+		Active:    true,
+		EndsAt:    ptrTime(time.Now().Add(24 * time.Hour)),
+		EventID:   "rg-gc-exempt-excl-" + uuid.NewString(),
+	}); err != nil {
+		t.Fatalf("SetLimit SELF_EXCLUSION: %v", err)
+	}
+
+	_, err = eng.ProcessSpin(ctx, SpinRequest{
+		OperatorCode:          "OP1",
+		OperatorTransactionID: "rg-gc-exempt-gc2-" + uuid.NewString(),
+		PlayerID:              playerID,
+		Family:                domain.FamilyGC,
+		BetAmount:             mustMoney(t, gcBetAmount),
+	})
+	if !errors.Is(err, errs.ErrResponsibleGamingRestricted) {
+		t.Fatalf("GC spin during self-exclusion: got %v, want ErrResponsibleGamingRestricted", err)
 	}
 
 	assertLedgerReconciles(t, pool, playerID)

@@ -26,6 +26,28 @@ func TestCurrencyValid(t *testing.T) {
 	}
 }
 
+func TestCurrencyIsSC(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		c    Currency
+		want bool
+	}{
+		{CurrencyGC, false},
+		{CurrencySCUnplayed, true},
+		{CurrencySCRedeemable, true},
+		{Currency(""), false},
+		{Currency("USD"), false},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.c), func(t *testing.T) {
+			t.Parallel()
+			if got := tt.c.IsSC(); got != tt.want {
+				t.Errorf("%q.IsSC() = %v, want %v", tt.c, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestCurrencyFamily(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

@@ -224,8 +224,11 @@ func (e *engine) processBetTx(ctx context.Context, req BetRequest) (result TxRes
 	if err := guardNotExcluded(ctx, tx, req.PlayerID); err != nil {
 		return TxResult{}, err
 	}
-	if err := guardLossLimit(ctx, tx, req.PlayerID, req.Amount); err != nil {
-		return TxResult{}, err
+	// LOSS_LIMIT counts SC play only — GC has no real value (see rg.go).
+	if req.Family == domain.FamilySC {
+		if err := guardLossLimit(ctx, tx, req.PlayerID, req.Amount); err != nil {
+			return TxResult{}, err
+		}
 	}
 
 	// 2. Pure domain math — runs entirely in CPU, no I/O. The lock window
@@ -285,8 +288,10 @@ func (e *engine) processBetTx(ctx context.Context, req BetRequest) (result TxRes
 
 	// 5b. Bump the loss counter by this stake — a stake with no offsetting
 	// win yet. /win subtracts its own credit when it settles.
-	if err := adjustLossCounters(ctx, tx, req.PlayerID, req.Amount); err != nil {
-		return TxResult{}, err
+	if req.Family == domain.FamilySC {
+		if err := adjustLossCounters(ctx, tx, req.PlayerID, req.Amount); err != nil {
+			return TxResult{}, err
+		}
 	}
 
 	// 6. COMMIT — releases the FOR UPDATE lock and durably persists everything.
@@ -412,8 +417,11 @@ func (e *engine) processWinTx(ctx context.Context, req WinRequest) (result TxRes
 
 	// A win offsets the loss counter — never gates the payout itself (a
 	// player's already-earned win is never refused for a loss limit).
-	if err := adjustLossCounters(ctx, tx, req.PlayerID, domain.ZeroMoney().Sub(req.Amount)); err != nil {
-		return TxResult{}, err
+	// LOSS_LIMIT counts SC play only — GC has no real value (see rg.go).
+	if req.Family == domain.FamilySC {
+		if err := adjustLossCounters(ctx, tx, req.PlayerID, domain.ZeroMoney().Sub(req.Amount)); err != nil {
+			return TxResult{}, err
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -604,17 +612,29 @@ func (e *engine) processRollbackTx(ctx context.Context, req RollbackRequest) (re
 		}
 	}
 
-	// Compute total reversed amount for the response and the loss counter.
+	// Compute the total reversed amount for the response (all currencies) and,
+	// separately, the SC-only portion for the loss counter — a single BET's
+	// entries are always homogeneous by family (AllocateBet routes per-family),
+	// but RollbackRequest carries no Family field, so it's derived per-entry
+	// from domain.SCCurrencies — the same allowlist sqlRGLossAggregate filters
+	// on — rather than an ad hoc "currency != GC" check.
 	total := domain.ZeroMoney()
+	scTotal := domain.ZeroMoney()
 	for _, e := range entries {
 		total = total.Add(e.Amount)
+		if e.Currency.IsSC() {
+			scTotal = scTotal.Add(e.Amount)
+		}
 	}
 
 	// A rollback reverses its own contribution — the original BET's stake —
 	// from the loss counter. It never had an offsetting win (a rolled-back
-	// BET was never settled), so this is simply -stake.
-	if err := adjustLossCounters(ctx, tx, req.PlayerID, domain.ZeroMoney().Sub(total)); err != nil {
-		return TxResult{}, err
+	// BET was never settled), so this is simply -stake. LOSS_LIMIT counts SC
+	// play only, so a GC-only rollback (scTotal == 0) leaves the counter alone.
+	if scTotal.IsPositive() {
+		if err := adjustLossCounters(ctx, tx, req.PlayerID, domain.ZeroMoney().Sub(scTotal)); err != nil {
+			return TxResult{}, err
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {

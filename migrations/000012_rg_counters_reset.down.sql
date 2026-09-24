@@ -1,0 +1,5 @@
+-- 000012_rg_counters_reset.down.sql
+--
+-- No-op. The up migration deletes cached counter rows, which are re-derived
+-- from the ledger on next read (see 000012_rg_counters_reset.up.sql) —
+-- there is no prior state to restore, and the ledger itself is untouched.

@@ -20,6 +20,24 @@ func (c Currency) Valid() bool {
 	return false
 }
 
+// SCCurrencies is the single source of truth for "which currency_type values
+// belong to the SC family" — a LOSS_LIMIT counts SC play only (GC has no real
+// value; see rg.go's SetLimit design). Both the Go-side rollback filter
+// (repository.ProcessRollback) and the ledger re-aggregation query
+// (repository.sqlRGLossAggregate) are built from this slice so the two can
+// never drift apart.
+var SCCurrencies = []Currency{CurrencySCUnplayed, CurrencySCRedeemable}
+
+// IsSC reports whether c is one of SCCurrencies.
+func (c Currency) IsSC() bool {
+	for _, sc := range SCCurrencies {
+		if c == sc {
+			return true
+		}
+	}
+	return false
+}
+
 // CurrencyFamily is the high-level wagering bucket the operator addresses
 // at the API surface (GC or SC). Routing within a family is engine-enforced:
 //

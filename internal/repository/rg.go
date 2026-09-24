@@ -41,6 +41,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -251,31 +252,6 @@ const (
 		DO UPDATE SET window_start = EXCLUDED.window_start, amount = EXCLUDED.amount, updated_at = now()
 	`
 
-	// sqlRGLossAggregate re-derives the LOSS counter for a window straight
-	// from the ledger: stakes from BET (spins write a BET row too — see
-	// file header) minus wins from WIN, minus a rolled-back BET's own stake
-	// (a ROLLBACK entry is a CREDIT back to the player, so summing it in
-	// with the same sign as WIN reverses the original BET correctly).
-	// ledger_transactions/ledger_entries have no FK (dropped for daily
-	// partitioning — see queries.go); the join is by id AND created_at,
-	// which are guaranteed equal for rows written in the same transaction
-	// (transaction_timestamp() is constant within a transaction) and keeps
-	// the join partition-pruned. Driven by ledger_tx_player_id_idx
-	// (player_id, created_at DESC); a single indexed query, as required.
-	sqlRGLossAggregate = `
-		SELECT COALESCE(SUM(
-			CASE WHEN t.transaction_type = 'BET' THEN e.amount ELSE -e.amount END
-		), 0)
-		FROM ledger_transactions t
-		JOIN ledger_entries e
-			ON e.ledger_transaction_id = t.id AND e.created_at = t.created_at
-		WHERE t.player_id = $1
-		  AND t.transaction_type IN ('BET', 'WIN', 'ROLLBACK')
-		  AND t.created_at >= $2
-		  AND t.created_at < $3
-		  AND e.account_type = 'PLAYER_WALLET'
-	`
-
 	// sqlRGDepositAggregate re-derives the DEPOSIT counter for a window
 	// straight from the ledger. usd_amount lives directly on
 	// ledger_transactions (migration 000011), so no join is needed.
@@ -289,6 +265,50 @@ const (
 		  AND t.created_at < $3
 	`
 )
+
+// sqlRGLossAggregate re-derives the LOSS counter for a window straight from
+// the ledger: stakes from BET (spins write a BET row too — see file header)
+// minus wins from WIN, minus a rolled-back BET's own stake (a ROLLBACK entry
+// is a CREDIT back to the player, so summing it in with the same sign as WIN
+// reverses the original BET correctly).
+// ledger_transactions/ledger_entries have no FK (dropped for daily
+// partitioning — see queries.go); the join is by id AND created_at, which
+// are guaranteed equal for rows written in the same transaction
+// (transaction_timestamp() is constant within a transaction) and keeps the
+// join partition-pruned. Driven by ledger_tx_player_id_idx
+// (player_id, created_at DESC); a single indexed query, as required.
+//
+// A LOSS_LIMIT counts SC play only (GC has no real value) — the currency
+// filter below is built from domain.SCCurrencies, the same slice
+// ProcessRollback filters its own SC-only counter delta against, so the two
+// can never drift apart. It is a var (not a const) because of that.
+var sqlRGLossAggregate = fmt.Sprintf(`
+	SELECT COALESCE(SUM(
+		CASE WHEN t.transaction_type = 'BET' THEN e.amount ELSE -e.amount END
+	), 0)
+	FROM ledger_transactions t
+	JOIN ledger_entries e
+		ON e.ledger_transaction_id = t.id AND e.created_at = t.created_at
+	WHERE t.player_id = $1
+	  AND t.transaction_type IN ('BET', 'WIN', 'ROLLBACK')
+	  AND t.created_at >= $2
+	  AND t.created_at < $3
+	  AND e.account_type = 'PLAYER_WALLET'
+	  AND e.currency IN (%s)
+`, scCurrencySQLList())
+
+// scCurrencySQLList renders domain.SCCurrencies as a quoted, comma-separated
+// SQL literal list, e.g. "'SC_UNPLAYED', 'SC_REDEEMABLE'". The values come
+// from a fixed, compile-time enum (never user input), so string formatting
+// rather than parameter binding is safe here — this builds a query template
+// at package init, not a per-call query.
+func scCurrencySQLList() string {
+	quoted := make([]string, len(domain.SCCurrencies))
+	for i, c := range domain.SCCurrencies {
+		quoted[i] = "'" + string(c) + "'"
+	}
+	return strings.Join(quoted, ", ")
+}
 
 // ----------------------------------------------------------------------------
 // SetLimit

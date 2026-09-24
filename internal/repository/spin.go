@@ -243,8 +243,11 @@ func (g *gameEngine) settleSpinTx(
 	if err := guardNotExcluded(ctx, tx, req.PlayerID); err != nil {
 		return SpinResult{}, err
 	}
-	if err := guardLossLimit(ctx, tx, req.PlayerID, req.BetAmount); err != nil {
-		return SpinResult{}, err
+	// LOSS_LIMIT counts SC play only — GC has no real value (see rg.go).
+	if req.Family == domain.FamilySC {
+		if err := guardLossLimit(ctx, tx, req.PlayerID, req.BetAmount); err != nil {
+			return SpinResult{}, err
+		}
 	}
 
 	// ── Draw the outcome and derive the win — see the Phase 2 comment in
@@ -328,8 +331,10 @@ func (g *gameEngine) settleSpinTx(
 	// Bump the loss counter by the round's net contribution — stake minus win
 	// — after settlement, so it reflects the ACTUAL outcome, not the stake
 	// alone (point 3: the refusal check above never sees this value).
-	if err := adjustLossCounters(ctx, tx, req.PlayerID, req.BetAmount.Sub(winAmount)); err != nil {
-		return SpinResult{}, err
+	if req.Family == domain.FamilySC {
+		if err := adjustLossCounters(ctx, tx, req.PlayerID, req.BetAmount.Sub(winAmount)); err != nil {
+			return SpinResult{}, err
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
