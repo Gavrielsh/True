@@ -239,12 +239,6 @@ func expectRGPurchaseGuards(mock pgxmock.PgxPoolIface, playerID uuid.UUID) {
 	expectNoActiveLimit(mock, playerID, "DEPOSIT_LIMIT")
 }
 
-// expectRGDepositCounterNoop registers adjustDepositCounter's post-settlement
-// read for a player with no active DEPOSIT_LIMIT — a no-op, nothing written.
-func expectRGDepositCounterNoop(mock pgxmock.PgxPoolIface, playerID uuid.UUID) {
-	expectNoActiveLimit(mock, playerID, "DEPOSIT_LIMIT")
-}
-
 // ----------------------------------------------------------------------------
 // Happy path: GC bet (single debit, no SC split)
 // ----------------------------------------------------------------------------

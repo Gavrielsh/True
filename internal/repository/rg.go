@@ -607,7 +607,8 @@ func guardNotExcluded(ctx context.Context, tx pgx.Tx, playerID uuid.UUID) error 
 	}
 	defer rows.Close()
 
-	for rows.Next() {
+	// Any active row restricts; the first one is enough to name the reason.
+	if rows.Next() {
 		var (
 			limitType string
 			endsAt    time.Time
@@ -615,8 +616,7 @@ func guardNotExcluded(ctx context.Context, tx pgx.Tx, playerID uuid.UUID) error 
 		if err := rows.Scan(&limitType, &endsAt); err != nil {
 			return fmt.Errorf("scan exclusion state: %w", err)
 		}
-		until := endsAt
-		return &errs.RGRestrictionError{Reason: limitType, Until: &until}
+		return &errs.RGRestrictionError{Reason: limitType, Until: &endsAt}
 	}
 	return rows.Err()
 }
@@ -706,15 +706,20 @@ func adjustDepositCounter(ctx context.Context, tx pgx.Tx, playerID uuid.UUID, us
 	return bumpCounter(ctx, tx, playerID, "DEPOSIT", *l.Period, usdAmount.Decimal())
 }
 
-// bumpCounter reads the current (seeded-if-needed) total and writes back
-// current+delta, floored at zero, as the new authoritative row for this
-// window.
+// bumpCounter writes the new authoritative total for this window, floored at
+// zero. Every caller runs AFTER its ledger rows are inserted in the same tx,
+// so when the counter row is missing or stale the ledger re-derivation
+// already includes this transaction — adding delta on top of it would count
+// the transaction twice. delta is applied only to a fresh counter row.
 func bumpCounter(ctx context.Context, tx pgx.Tx, playerID uuid.UUID, counterType, period string, delta decimal.Decimal) error {
-	current, err := getOrSeedCounter(ctx, tx, playerID, counterType, period)
+	current, fresh, err := readCounter(ctx, tx, playerID, counterType, period)
 	if err != nil {
 		return err
 	}
-	updated := current.Add(delta)
+	updated := current
+	if fresh {
+		updated = current.Add(delta)
+	}
 	if updated.IsNegative() {
 		// A win/rollback can exceed the still-outstanding stake portion of
 		// the window (e.g. a big win shortly after the window rolled over)
@@ -735,6 +740,14 @@ func bumpCounter(ctx context.Context, tx pgx.Tx, playerID uuid.UUID, counterType
 // and only then sets a limit must see X counted immediately. This function
 // never writes; only bumpCounter persists a value.
 func getOrSeedCounter(ctx context.Context, tx pgx.Tx, playerID uuid.UUID, counterType, period string) (decimal.Decimal, error) {
+	total, _, err := readCounter(ctx, tx, playerID, counterType, period)
+	return total, err
+}
+
+// readCounter is getOrSeedCounter that also reports whether the value came
+// from a counter row for the current window (fresh) or was re-derived from
+// the ledger.
+func readCounter(ctx context.Context, tx pgx.Tx, playerID uuid.UUID, counterType, period string) (decimal.Decimal, bool, error) {
 	start, end := windowBounds(period, time.Now())
 
 	var (
@@ -743,12 +756,13 @@ func getOrSeedCounter(ctx context.Context, tx pgx.Tx, playerID uuid.UUID, counte
 	)
 	err := tx.QueryRow(ctx, sqlRGSelectCounter, playerID, counterType, period).Scan(&rowStart, &amount)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return decimal.Decimal{}, fmt.Errorf("select rg counter: %w", err)
+		return decimal.Decimal{}, false, fmt.Errorf("select rg counter: %w", err)
 	}
 	if err == nil && rowStart.Valid && rowStart.Time.Equal(start) {
-		return amount, nil
+		return amount, true, nil
 	}
-	return ledgerAggregate(ctx, tx, playerID, counterType, start, end)
+	total, err := ledgerAggregate(ctx, tx, playerID, counterType, start, end)
+	return total, false, err
 }
 
 // ledgerAggregate re-derives a counter total directly from
